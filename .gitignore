@@ -39,4 +39,4 @@ Thumbs.db
 *.swp
 
 # Data
-/weights/
+uni/weights/
