@@ -1,0 +1,42 @@
+# Compiled output and build artifacts
+/build/
+/dist/
+/target/
+*.o
+*.pyc
+*.class
+
+# Dependency directories
+/node_modules/
+/vendor/
+/venv/
+.bundle/
+
+# Log files and temporary files
+*.log
+*.tmp
+*.bak
+npm-debug.log*
+yarn-debug.log*
+__pycache__/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# Sensitive information
+.env
+.env.local
+*.env.production
+secrets.txt
+credentials.json
+
+# OS-specific files
+.DS_Store
+Thumbs.db
+
+# IDE and Editor files
+.idea/
+.vscode/           
+*.swp
+
+# Data
+/weights/
