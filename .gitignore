@@ -6,6 +6,7 @@
 *.pyc
 *.class
 
+
 # Dependency directories
 /node_modules/
 /vendor/
@@ -38,5 +39,7 @@ Thumbs.db
 .vscode/           
 *.swp
 
-# Data
+# Data and results
 uni/weights/
+data/
+uni/UNI_Results
