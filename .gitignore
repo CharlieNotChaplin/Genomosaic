@@ -40,6 +40,8 @@ Thumbs.db
 *.swp
 
 # Data and results
-uni/weights/
-data/
-uni/UNI_Results
+**/data/
+**/Data/
+**/UNI_Results/ 
+**/weights/
+**/patches/
