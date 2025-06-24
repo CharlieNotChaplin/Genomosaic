@@ -33,22 +33,31 @@ def main(args):
 
     # Read full image
     img = imread(args.image)
+    print("Image loaded.")
 
     # crop and save if coordinates exist
     if args.rmax is not None:
         cropped_img = img[args.rmin : args.rmax, args.cmin : args.cmax]
+        print(f"Image cropped to: {args.rmin}:{args.rmax}, {args.cmin}:{args.cmax}")
         save_tiff_imagej_compatible(args.out+'/img_Stardist.tif', cropped_img, axes='YXC')
 
     # Load the pretrained model
     model = StarDist2D.from_pretrained('2D_versatile_he')
+    print("Model loaded.")
 
     # Percentile normalization of the image
     min_percentile = 5
     max_percentile = 95
     img = normalize(img, min_percentile, max_percentile)
+    print(f"Image normalized using percentiles {min_percentile} and {max_percentile}.")
 
     # Run segmentation for the full image (we will select and crop later)
-    labels, polys = model.predict_instances_big(img, axes='YXC', block_size=4096, prob_thresh=0.01,nms_thresh=0.001, min_overlap=128, context=128, normalizer=None, n_tiles=(4,4,1))
+    labels, polys = model.predict_instances_big(img, axes='YXC', block_size=2048, prob_thresh=0.01,nms_thresh=0.001, min_overlap=128, context=128, normalizer=None, n_tiles=(4,4,1))
+    
+    # Try this if we find image with bigger resolution than the one provided by 10X
+    #labels, polys = model.predict_instances_big(img, axes='YXC', block_size=4096, prob_thresh=0.01,nms_thresh=0.001, min_overlap=128, context=128, normalizer=None, n_tiles=(4,4,1))
+   
+    print(f"Detected objects: {np.max(labels)}")
 
      # Save the results to save time if required later.
     f1 = open(args.out+'/labels_FullSection.pckl', 'wb')
@@ -63,6 +72,7 @@ def main(args):
         polys2 = polys
         index = []
         for nuclei in range(len(polys2['coord'])):
+            print("Cooord type: ", type(polys2['coord'][nuclei][0]), "Args Type: " , type(args.rmin))
             if np.all(polys2['coord'][nuclei][0] > args.rmin) and np.all(polys2['coord'][nuclei][0] < args.rmax) and np.all(polys2['coord'][nuclei][1] > args.cmin) and np.all(polys2['coord'][nuclei][1] < args.cmax) :
                 polys2['coord'][nuclei][0] = polys2['coord'][nuclei][0] - args.rmin
                 polys2['coord'][nuclei][1] = polys2['coord'][nuclei][1] - args.cmin
@@ -89,6 +99,10 @@ def main(args):
     # Load Visium HD data
     raw_h5_file = args.srdir + "/filtered_feature_bc_matrix.h5"
     adata = sc.read_10x_h5(raw_h5_file)
+    adata.var_names_make_unique() 
+    if adata.raw is not None:
+        adata.raw.var_names_make_unique()
+
 
     # Load the Spatial Coordinates
     tissue_position_file = args.srdir + "/spatial/tissue_positions.parquet"
@@ -120,6 +134,12 @@ def main(args):
     result_spatial_join["is_overlap"] = result_spatial_join["index"].isin(barcodes_in_overlaping_polygons)
 
     Result = result_spatial_join.loc[result_spatial_join['is_within_polygon']]
+
+    print("Total barcodes:", len(gdf_coordinates))
+    print("Total nuclei:", len(gdf))
+    print("Matches found (within):", result_spatial_join['is_within_polygon'].sum())
+    print("Result shape:", Result.shape)
+
 
     Result[['index','id','is_within_polygon','is_overlap']].to_csv(args.out+"/Nuclei_Barcode_Map.csv")
 
