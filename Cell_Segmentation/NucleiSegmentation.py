@@ -28,7 +28,7 @@ from stardist import export_imagej_rois
 
 def main(args):
 
-    Path("output").mkdir(parents=True, exist_ok=True)
+    Path("output_with_png").mkdir(parents=True, exist_ok=True)
 
     # Load image (supports .png, .jpg, .tif)
     img = iio.imread(args.image)
