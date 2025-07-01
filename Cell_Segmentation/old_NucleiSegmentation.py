@@ -16,6 +16,7 @@ import scanpy as sc
 import anndata
 import polars as pl
 import pickle
+from pathlib import Path
 
 from tifffile import imread, imwrite
 from csbdeep.utils import normalize
@@ -30,6 +31,8 @@ from stardist import export_imagej_rois
 
 
 def main(args):
+
+    Path("/output").mkdir(parents=True, exist_ok=True)
 
     # Read full image
     img = imread(args.image)
