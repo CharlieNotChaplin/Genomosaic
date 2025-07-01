@@ -27,12 +27,12 @@ from stardist import export_imagej_rois
 
 
 def main(args):
+    print("Started script")	
+    # SCRIPT_DIR = Path(__file__).resolve().parent      # folder that holds this .py file
+    # OUTPUT_DIR = SCRIPT_DIR / "output_with_png"       # anchor new path here
+    # OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    SCRIPT_DIR = Path(__file__).resolve().parent      # folder that holds this .py file
-    OUTPUT_DIR = SCRIPT_DIR / "output_with_png"       # anchor new path here
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-    Path("output_with_png").mkdir(parents=True, exist_ok=True)
+    # Path("output_with_png").mkdir(parents=True, exist_ok=True)
 
     # Load image (supports .png, .jpg, .tif)
     img = iio.imread(args.image)
