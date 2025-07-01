@@ -12,6 +12,8 @@ import scanpy as sc
 import polars as pl
 import pickle
 import imageio.v3 as iio
+from pathlib import Path
+
 
 from csbdeep.utils import normalize
 from stardist.models import StarDist2D
@@ -130,7 +132,9 @@ def main(args):
     barcodes_in_overlapping = pd.unique(result_spatial_join[result_spatial_join.duplicated(subset=["index"])]["index"])
     result_spatial_join["is_overlap"] = result_spatial_join["index"].isin(barcodes_in_overlapping)
 
-    # Save result
+    Result = result_spatial_join.loc[result_spatial_join['is_within_polygon']]
+
+    # Save result as csv
     result_spatial_join.loc[result_spatial_join['is_within_polygon']][['index', 'id', 'is_within_polygon', 'is_overlap']].to_csv(
         args.out + "/Nuclei_Barcode_Map.csv"
     )
