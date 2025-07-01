@@ -25,28 +25,37 @@ from stardist import export_imagej_rois
 
 
 def main(args):
+
+    Path("output").mkdir(parents=True, exist_ok=True)
+
     # Load image (supports .png, .jpg, .tif)
     img = iio.imread(args.image)
+    print("Image loaded.")
 
     # Crop and save if coordinates exist
     if args.rmax is not None:
         cropped_img = img[args.rmin:args.rmax, args.cmin:args.cmax]
+        print(f"Image cropped to: {args.rmin}:{args.rmax}, {args.cmin}:{args.cmax}")
         save_tiff_imagej_compatible(args.out + '/img_Stardist.tif', cropped_img, axes='YXC')
 
     # Load pretrained StarDist model
     model = StarDist2D.from_pretrained('2D_versatile_he')
+    print("Model loaded.")
 
     # Normalize image
     img = normalize(img, 5, 95)
 
     # Dynamically adjust block size
-    h, w = img.shape[:2]
-    block_size = (
-        min(4096, h),
-        min(4096, w),
-        img.shape[2] if img.ndim == 3 else 1
-    )
+    # h, w = img.shape[:2]
+    # block_size = (
+    #     min(4096, h),
+    #     min(4096, w),
+    #     img.shape[2] if img.ndim == 3 else 1
+    #)
 
+    # outcomment the following if block size is adjusted dynamically (see above)
+    block_size =4096
+   
     # Run segmentation
     labels, polys = model.predict_instances_big(
         img,
@@ -57,8 +66,10 @@ def main(args):
         min_overlap=128,
         context=128,
         normalizer=None,
-        n_tiles=(1, 1, 1)
+        n_tiles=(4, 4, 1)
     )
+
+    print(f"Detected objects: {np.max(labels)}")
 
     # Save raw segmentation results
     with open(args.out + '/labels_FullSection.pckl', 'wb') as f:
@@ -75,22 +86,33 @@ def main(args):
                 polys2['coord'][nuclei][0] -= args.rmin
                 polys2['coord'][nuclei][1] -= args.cmin
                 index.append(nuclei)
+        
+        # Save masks for Subset
         export_imagej_rois(args.out + '/img_rois_Stardist_Subset.zip', polys2['coord'][index])
 
     # Convert polygons to GeoDataFrame
     geometries = []
+
+    # Iterating through each nuclei in the 'polys' DataFrame 
     for nuclei in range(len(polys['coord'])):
         coords = [(y, x) for x, y in zip(polys['coord'][nuclei][0], polys['coord'][nuclei][1])]
         geometries.append(Polygon(coords))
+
+    # Creating a GeoDataFrame using the Polygon geometries 
     gdf = gpd.GeoDataFrame(geometry=geometries)
     gdf["id"] = [f"ID_{i+1}" for i in gdf.index]
 
     # Load Visium HD spatial data
     raw_h5_file = args.srdir + "/filtered_feature_bc_matrix.h5"
     adata = sc.read_10x_h5(raw_h5_file)
+    
+    # Load spatial coordinates   
     tissue_position_file = args.srdir + "/spatial/tissue_positions.parquet"
+  
     df_tissue_positions = pd.read_parquet(tissue_position_file).set_index("barcode")
     df_tissue_positions["index"] = df_tissue_positions.index
+    
+    # Adding the tissue positions to the Metadata
     adata.obs = pd.merge(adata.obs, df_tissue_positions, left_index=True, right_index=True)
 
     # Convert tissue coordinates to GeoDataFrame
@@ -112,6 +134,11 @@ def main(args):
     result_spatial_join.loc[result_spatial_join['is_within_polygon']][['index', 'id', 'is_within_polygon', 'is_overlap']].to_csv(
         args.out + "/Nuclei_Barcode_Map.csv"
     )
+
+    print("Total barcodes:", len(gdf_coordinates))
+    print("Total nuclei:", len(gdf))
+    print("Matches found (within):", result_spatial_join['is_within_polygon'].sum())
+    print("Result shape:", Result.shape)
 
 
 if __name__ == "__main__":
