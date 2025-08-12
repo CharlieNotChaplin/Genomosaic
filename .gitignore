@@ -46,3 +46,5 @@ Thumbs.db
 **/weights/
 **/patches/
 **/output/
+**/metadata/
+*.h5ad
