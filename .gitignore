@@ -45,6 +45,8 @@ Thumbs.db
 **/UNI_Results/ 
 **/weights/
 **/patches/
+**/results/
 **/output/
 **/metadata/
 *.h5ad
+
