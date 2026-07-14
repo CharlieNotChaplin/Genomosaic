@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -c 60
 #SBATCH --mem=100G
-#SBATCH --output=svg-5.out
-#SBATCH --error=svg-5.err
+#SBATCH --output=%x.out
+#SBATCH --error=%x.err
 #SBATCH --job-name=svg_CRC5
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
