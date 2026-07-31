@@ -88,7 +88,6 @@ _run_tag = CONFIG["sample"] if isinstance(CONFIG["sample"], str) else "combined"
 dir_output = basedir / _run_tag / "03_integration/autoencoders" / CONFIG["bin_size"]
 dir_output.mkdir(parents=True, exist_ok=True)
 
-
 def finish_note():
     from plyer import notification
     notification.notify(
@@ -113,6 +112,7 @@ def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delauna
         # Delaunay triangulation within each library slide
         sq.gr.spatial_neighbors_delaunay(
             trans_adata,
+            spatial_key="spatial",
             library_key=library_key,
             percentile=percentile,  # Prunes long Delaunay edges beyond 95th percentile distance
         )
@@ -120,6 +120,7 @@ def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delauna
         # KNN graph within each library slide
         sq.gr.spatial_neighbors_knn(
             trans_adata,
+            spatial_key="spatial",
             library_key=library_key,
             n_neighs=n_neighs,
         )
@@ -610,7 +611,7 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda"):
             "z_patch_trans_full": z_patch_trans_full.cpu().numpy()}
 
 
-
+########################################################################
 class SVGGraphEncoder_SAGE(nn.Module):
     """GraphSAGE encoder for SVG features + spatial neighborhood context. Produces
     one latent vector per CELL -- this is the object the reconstruction loss
@@ -620,8 +621,8 @@ class SVGGraphEncoder_SAGE(nn.Module):
         super().__init__()
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
-        self.bn1 = nn.LayerNorm(hidden_dim)
-        self.bn2 = nn.LayerNorm(hidden_dim)
+        self.bn1 = nn.BatchNorm1d(hidden_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim)
         self.dropout = dropout
         self.out = nn.Linear(hidden_dim, latent_dim)
  
@@ -745,6 +746,7 @@ class DualAutoencoder(nn.Module):
 
 
 
+###########################################################################
 import anndata as ad
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -754,7 +756,7 @@ f_hist_adata = sc.read_h5ad(dir_histology / "filtered_WSI_patch_embeddings.h5ad"
 f_trans_adata = ad.read_h5ad(dir_transcriptomics / "count_area_filtered_adata.h5ad")
 f_trans_coord = gpd.read_parquet(dir_transcriptomics / "nuclei_geometry.parquet")
 
-if CONFIG["sample"] == "all":
+if CONFIG["sample"] == "combined":
     # keep every slide already in the loaded (combined) anndata objects -- no filtering
     pass
 elif isinstance(CONFIG["sample"], str):
@@ -796,7 +798,7 @@ print("Observation (nuclei) count:", trans_obs, "| feature length:", trans_featu
 if xpca_col_trans in f_trans_adata.obsm.keys():
     print("NOTE: PCA already performed on transcriptomic embeddings:", f_trans_adata.obsm[xpca_col_trans].shape[1])
     xpca_trans = True
-
+########################################################################## 
 
 # 1. SVG mask
 print("1. SVG mask")
@@ -915,39 +917,20 @@ notification.notify(
     app_name='Jupyter',
     timeout=5 # Notification disappears after 5 seconds
 )
+################################################################
 
 import scanpy as sc
 
 # Load the AnnData file created at the end of your script
 adata = sc.read_h5ad(dir_output / "trans_with_dae_latents.h5ad")
 
-# 1. Compute neighborhood graph on the joint patch representation
-sc.pp.neighbors(adata, use_rep="X_dae_joint_patch")
+x_hist_patch = adata.obsm["X_dae_hist_patch"] # shape: array
+x_trans_cell  = adata.obsm["X_dae_trans_cell"]   
 
-# 2. Run Leiden clustering (adjust resolution to get more/fewer clusters)
-sc.tl.leiden(
-    adata,
-    resolution=0.5,
-    key_added="leiden_joint",
-    flavor="igraph",
-    n_iterations=2,
-    directed=False
-)
-
-# 3. Check how many clusters were found
-n_clusters = adata.obs["leiden_joint"].nunique()
-print(f"Number of clusters found: {n_clusters}")
-finish_note()
-
-# CLUSTERING FOR CONCAT   cell_emb||patch_emb (x_dae_trans_cell||x_dae_hist_patch) 
-# 2. Extract the patch-level histology and cell-level transcriptomic latents
-x_hist_patch = adata.obsm["X_dae_hist_patch"]  # Shape: (N_cells, D_hist)
-x_trans_cell  = adata.obsm["X_dae_trans_cell"]   # Shape: (N_cells, D_trans)
-
-# 3. Concatenate both latent arrays along columns (features)
+# concat both latent arrays along columns (features)
 adata.obsm["X_dae_hist_trans_concat"] = np.concatenate([x_trans_cell, x_hist_patch], axis=1)
 
-# 4. Compute neighbor graph on the concatenated embedding space
+print("caulcating neighbor graph")
 sc.pp.neighbors(
     adata, 
     use_rep="X_dae_hist_trans_concat", 
@@ -955,7 +938,7 @@ sc.pp.neighbors(
     key_added="concat_neighbors"
 )
 
-# 5. Run Leiden clustering
+print("runing leiden")
 sc.tl.leiden(
     adata, 
     resolution=0.5,
@@ -966,10 +949,111 @@ sc.tl.leiden(
     directed=False
 )
 
-# 6. (Optional) Visualize results using UMAP
+print(f"Number of clusters found: {adata.obs["leiden_concat"].nunique()}")
+
 sc.tl.umap(adata, neighbors_key="concat_neighbors")
 sc.pl.umap(adata, color=["leiden_concat", "Slide_ID"])
 
 
-n_clusters = adata.obs["leiden_concat"].nunique()
-print(f"Number of clusters found: {n_clusters}")
+fig, ax = plt.subplots(figsize=(10, 10))
+sq.pl.spatial_scatter(
+    adata,
+    library_key="Slide_ID",   
+    library_id="CRC_P2",  
+    color="leiden_concat",
+    size=2,   
+    shape=None,           
+    spatial_key="spatial",
+    title="CRC_P2: (Cell || Hist)-based clustering with resolution 0.5",
+    ax=ax,
+)
+
+
+# LEIDEN JUST ON CELLS
+# Use cell-level representations (which are unique per cell)
+sc.pp.neighbors(adata, use_rep="X_dae_trans_cell", n_neighbors=15)
+sc.tl.leiden(adata, 
+             resolution=0.5, 
+             key_added="leiden_cell", 
+             flavor="igraph",
+             n_iterations=2,
+             directed=False)
+
+print(f"Number of cell-level clusters found: {adata.obs['leiden_cell'].nunique()}")
+
+fig, ax = plt.subplots(figsize=(10, 10))
+sq.pl.spatial_scatter(
+    adata,
+    library_key="Slide_ID",   
+    library_id="CRC_P2",      
+    color="leiden_cell",
+    size=2,
+    shape=None,               
+    spatial_key="spatial",    
+    title="CRC_P2: Cell-based clustering with leiden resolution 0.5",
+    ax=ax
+)
+
+########## SVG issue
+import scanpy as sc
+import squidpy as sq
+import harmonypy as hm
+import matplotlib.pyplot as plt
+
+# 1. Filter to SVGs
+if 'spatially_variable_per_sample' in adata.varm:
+    svg_mask = adata.varm['spatially_variable_per_sample'].any(axis=1)
+elif 'spatially_variable_n_samples' in adata.var:
+    svg_mask = adata.var['spatially_variable_n_samples'] >= 1
+else:
+    svg_mask = adata.var['highly_variable']
+
+trans_svg = adata[:, svg_mask].copy()
+
+# 2. Scale & PCA
+sc.pp.scale(trans_svg, max_value=10)
+sc.pp.pca(trans_svg, n_comps=30)
+
+# 3. Direct Harmony Execution (Avoids transpose shape mismatch bug)
+ho = hm.run_harmony(
+    data_mat=trans_svg.obsm['X_pca'],
+    meta_data=trans_svg.obs,
+    vars_use=['Slide_ID']
+)
+
+# Fix shape alignment dynamically
+if ho.Z_corr.shape[0] == trans_svg.n_obs:
+    trans_svg.obsm['X_pca_harmony'] = ho.Z_corr
+else:
+    trans_svg.obsm['X_pca_harmony'] = ho.Z_corr.T
+
+# 4. Build Neighbors on HARMONIZED representation
+sc.pp.neighbors(trans_svg, n_neighbors=15, use_rep="X_pca_harmony")
+
+# 5. Leiden Clustering across all 5 slides
+sc.tl.leiden(
+    trans_svg, 
+    resolution=0.2,            # Resolution 0.1 - 0.3 works well on harmonized graphs
+    key_added="leiden_svg",
+    flavor="igraph",
+    n_iterations=1,
+    directed=False,
+)
+
+# 6. Assign clusters back to adata & Plot
+adata.obs["leiden_svg"] = trans_svg.obs["leiden_svg"]
+print(f"Number of harmonized cell-level clusters found: {adata.obs['leiden_svg'].nunique()}")
+
+fig, ax = plt.subplots(figsize=(10, 10))
+sq.pl.spatial_scatter(
+    adata,
+    library_key="Slide_ID",   
+    library_id="CRC_P2",  
+    color="leiden_svg",
+    size=2,
+    shape=None,
+    spatial_key="spatial",  
+    title="CRC_P2: Harmonized Multi-Slide SVG Clusters",
+    ax=ax
+)
+plt.show()
