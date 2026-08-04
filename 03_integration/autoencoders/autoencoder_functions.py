@@ -155,6 +155,76 @@ class ProjectionHead(nn.Module):
         return F.normalize(self.net(z), dim=-1)
  
  
+class GradientReversalFunction(torch.autograd.Function):
+    """Identity on the forward pass; negates (and scales) the gradient on the
+    backward pass. This is the standard trick behind domain-adversarial training
+    (Ganin & Lempitsky, DANN): whatever loss is computed *after* this layer still
+    gets minimized normally by the parameters after it, but the parameters
+    *before* it are pushed in the OPPOSITE direction -- i.e. explicitly penalized
+    for making that loss easy to minimize."""
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, lambd=1.0):
+        super().__init__()
+        self.lambd = lambd
+
+    def forward(self, x):
+        return GradientReversalFunction.apply(x, self.lambd)
+
+
+class SlideClassifier(nn.Module):
+    """
+    Domain-adversarial de-confounding head for a latent (e.g. z_patch_hist).
+
+    Deliberately a PLAIN LINEAR layer (hidden_dim=None) by default, matching the
+    sklearn LogisticRegression used as the leakage diagnostic -- this way,
+    adversarial training directly opposes exactly the family of function used to
+    measure the leak, so a drop in this loss during training should correspond
+    directly to a drop in that diagnostic's accuracy.
+
+    Unlike reconstruction-based conditioning (which only removes the *requirement*
+    to keep slide info in the latent), this actively penalizes the encoder for
+    letting slide identity remain linearly predictable from its output, via the
+    gradient-reversal layer above.
+    """
+    def __init__(self, latent_dim, n_slides, hidden_dim=None, grl_lambda=1.0):
+        super().__init__()
+        self.grl = GradientReversalLayer(lambd=grl_lambda)
+        if hidden_dim is None:
+            self.net = nn.Linear(latent_dim, n_slides)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(latent_dim, hidden_dim), nn.ReLU(),
+                nn.Linear(hidden_dim, n_slides),
+            )
+
+    def set_lambda(self, lambd):
+        self.grl.lambd = lambd
+
+    def forward(self, z):
+        return self.net(self.grl(z))
+
+
+def domain_adv_lambda_schedule(epoch, n_epochs, gamma=5.0):
+    """
+    Standard DANN ramp (Ganin & Lempitsky): lambda goes from 0 -> 1 smoothly over
+    training rather than jumping straight to full adversarial strength, so the
+    encoder isn't fighting the domain classifier before either has learned
+    anything useful yet.
+    """
+    p = epoch / max(n_epochs, 1)
+    return 2.0 / (1.0 + np.exp(-gamma * p)) - 1.0
+
+
 class DualAutoencoder(nn.Module):
     def __init__(self, n_svg, hist_dim, latent_dim=64, proj_dim=32, n_slides=5, pool_type="attention",
                  encoder_type="sage", transconv_heads=4):
@@ -168,12 +238,13 @@ class DualAutoencoder(nn.Module):
         self.trans_dec = MLPDecoder(latent_dim, [256, 512], n_svg, n_slides)
         self.hist_enc = MLPEncoder(hist_dim, [512, 128], latent_dim)
         self.hist_dec = MLPDecoder(latent_dim, [128, 512], hist_dim, n_slides,
-                                    condition_on_slide=False)
+                                    condition_on_slide=True)
         self.proj_trans = ProjectionHead(latent_dim, proj_dim)
         self.proj_hist = ProjectionHead(latent_dim, proj_dim)
  
         self.pool_type = pool_type
         self.pool = AttentionPool(latent_dim) if pool_type == "attention" else None
+        self.slide_clf_hist = SlideClassifier(latent_dim, n_slides)  # domain-adversarial de-confounder
 
 
 ################### functions
@@ -442,26 +513,42 @@ class PatchGroupedLoader:
     instead of the arbitrary partial patches a plain node-level NeighborLoader
     would produce. This makes patch-level pooling and patch-level contrastive
     alignment meaningful.
- 
+
+    SLIDE-STRATIFIED BATCHES: each batch's patches are drawn from a single slide
+    only (never mixed). This is deliberate: if batches mix slides, the patch-level
+    contrastive loss can satisfy InfoNCE by learning to recognize slide/scan
+    identity -- a much easier, more linearly-separable shortcut than genuine
+    morphology-transcriptomics correspondence -- rather than the intended
+    alignment. Restricting negatives to same-slide patches removes that shortcut
+    entirely, since slide identity carries no information within a single-slide
+    batch. See `patch_level_infonce`'s `slide_ids` masking for a second,
+    independent safeguard against this.
+
     Internally reuses a NeighborLoader's own subgraph-sampling machinery via its
     `collate_fn`, but we drive the seed-node groups ourselves (one group of patches
     per batch) rather than letting NeighborLoader chunk seed nodes arbitrarily.
- 
+
     NOTE: this relies on PyG's `NeighborLoader`/`NodeLoader.collate_fn(index)` being
     directly callable with an arbitrary index tensor. This is standard in recent PyG
     versions; if your PyG version's internals differ, the fallback is to construct a
     fresh `NeighborLoader(data, input_nodes=seed_nodes, batch_size=len(seed_nodes))`
     per group and take its single batch instead.
     """
- 
-    def __init__(self, data, patch_to_nodes, num_neighbors=(10, 10),
+
+    def __init__(self, data, patch_to_nodes, patch_slide_id, num_neighbors=(10, 10),
                  patches_per_batch=16, max_cells_per_patch=64, shuffle=True):
         self.patch_to_nodes = patch_to_nodes
-        self.patches = list(patch_to_nodes.keys())
         self.patches_per_batch = patches_per_batch
         self.max_cells_per_patch = max_cells_per_patch
         self.shuffle = shuffle
-        
+
+        # group patches by slide up front; `patch_slide_id` is indexed the same way
+        # as `patch_meta["slide_id"]` (one entry per patch_row id)
+        self.patches_by_slide = {}
+        for p in patch_to_nodes.keys():
+            sid = int(patch_slide_id[p])
+            self.patches_by_slide.setdefault(sid, []).append(p)
+
         # --- FIX: Pass torch.arange(data.num_nodes) so all node indices are valid ---
         self._sampler_loader = NeighborLoader(
             data, 
@@ -469,16 +556,29 @@ class PatchGroupedLoader:
             input_nodes=torch.arange(data.num_nodes), 
             batch_size=1,
         )
- 
+
     def __len__(self):
-        return (len(self.patches) + self.patches_per_batch - 1) // self.patches_per_batch
- 
+        total = 0
+        for plist in self.patches_by_slide.values():
+            total += (len(plist) + self.patches_per_batch - 1) // self.patches_per_batch
+        return total
+
     def __iter__(self):
-        patches = self.patches.copy()
+        # build all batches slide-by-slide first (each batch confined to one slide),
+        # then shuffle the batch ORDER so training still sees slides interleaved
+        # across steps -- only within-batch mixing is what causes the shortcut.
+        all_batches = []
+        for sid, plist in self.patches_by_slide.items():
+            plist = plist.copy()
+            if self.shuffle:
+                random.shuffle(plist)
+            for start in range(0, len(plist), self.patches_per_batch):
+                all_batches.append(plist[start:start + self.patches_per_batch])
+
         if self.shuffle:
-            random.shuffle(patches)
-        for start in range(0, len(patches), self.patches_per_batch):
-            batch_patch_ids = patches[start:start + self.patches_per_batch]
+            random.shuffle(all_batches)
+
+        for batch_patch_ids in all_batches:
             seed_chunks, local_patch_index = [], []
             for local_idx, p in enumerate(batch_patch_ids):
                 nodes = self.patch_to_nodes[p]
@@ -586,7 +686,18 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
     logits = p_trans @ p_hist.T / temperature  # (P, P)
     P = logits.shape[0]
     device = logits.device
- 
+
+    # Hard-exclude cross-slide pairs from the negative set entirely (independent of
+    # neighbor_radius below). With slide-stratified batches (see PatchGroupedLoader)
+    # this is normally a no-op, since every patch in a batch already shares a slide --
+    # it's kept as a defensive backstop so the loss can never exploit slide identity
+    # as a shortcut even if batch composition changes elsewhere.
+    if slide_ids is not None:
+        same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
+        cross_slide = ~same_slide
+        cross_slide.fill_diagonal_(False)  # never mask out the true positive
+        logits = logits.masked_fill(cross_slide, float("-inf"))
+
     if neighbor_radius is not None:
         dist = torch.cdist(centroids, centroids)
         neighbor_mask = dist < neighbor_radius
@@ -618,7 +729,7 @@ def contrast_weight_schedule(epoch, warmup_epochs=5, max_weight=1.0):
  
  
 def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
-               temperature=0.07, weight_reconstruction=True, device="cuda"):
+               domain_adv_weight=0.0, temperature=0.07, weight_reconstruction=True, device="cuda"):
     model.train()
     opt.zero_grad()
  
@@ -653,9 +764,10 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
  
     # --- histology side: one embedding per patch already, no duplication needed ---
     batch_patch_ids = batch.batch_patch_ids.to(device)
+    batch_slide_ids = patch_meta["slide_id"][batch_patch_ids]
     hist_batch = hist_emb_all[batch_patch_ids]
     z_patch_hist = model.hist_enc(hist_batch)
-    hist_recon = model.hist_dec(z_patch_hist)
+    hist_recon = model.hist_dec(z_patch_hist, slide_code=batch_slide_ids)
     loss_recon_hist = F.mse_loss(hist_recon, hist_batch)
  
     # --- patch-level contrastive alignment ---
@@ -664,14 +776,30 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
  
     centroids = patch_meta["centroid"][batch_patch_ids]
     weights = patch_meta["weight"][batch_patch_ids]
-    batch_slide_ids = patch_meta["slide_id"][batch_patch_ids]
     loss_contrast = patch_level_infonce(
         p_trans_patch, p_hist_patch, centroids, slide_ids=batch_slide_ids,
         temperature=temperature, neighbor_radius=patch_meta["neighbor_radius"], weight=weights,
     )
+
+    # --- domain-adversarial de-confounding: actively penalize z_patch_hist for
+    # letting slide identity remain (linearly) predictable, via gradient reversal.
+    # This is what actually removes the leak that reconstruction/conditioning alone
+    # only permitted-but-didn't-require removing. ---
+    if domain_adv_weight > 0:
+        slide_logits = model.slide_clf_hist(z_patch_hist)
+        loss_domain = F.cross_entropy(slide_logits, batch_slide_ids)
+    else:
+        loss_domain = torch.tensor(0.0, device=device)
  
-    loss = loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast
+    loss = loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast + domain_adv_weight * loss_domain
     loss.backward()
+    if domain_adv_weight > 0:
+        # GRL-based adversarial terms are prone to runaway logit growth (encoder and
+        # classifier escalating against each other) rather than settling at the
+        # intended chance-level equilibrium. Clipping caps how much any single step
+        # can push things, which is what keeps this a minimax game instead of a
+        # divergence.
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
     opt.step()
  
     return {
@@ -679,11 +807,13 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         "recon_trans": loss_recon_trans.item(),
         "recon_hist": loss_recon_hist.item(),
         "contrast": loss_contrast.item(),
+        "domain": loss_domain.item() if domain_adv_weight > 0 else 0.0,
     }
  
  
 def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5,
-          max_contrast_weight=1.0, temperature=0.07, weight_reconstruction=True, device="cuda"):
+          max_contrast_weight=1.0, max_domain_adv_weight=0.0, temperature=0.07,
+          weight_reconstruction=True, device="cuda"):
     model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     hist_emb_all = hist_emb_all.to(device)
@@ -691,17 +821,20 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
  
     for epoch in range(n_epochs):
         cw = contrast_weight_schedule(epoch, warmup_epochs, max_contrast_weight)
-        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0}
+        dw = max_domain_adv_weight * domain_adv_lambda_schedule(epoch, n_epochs)
+        model.slide_clf_hist.set_lambda(domain_adv_lambda_schedule(epoch, n_epochs))
+        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0, "domain": 0.0}
         n_batches = 0
         for batch in loader:
             stats = train_step(model, batch, hist_emb_all, patch_meta, opt, cw,
-                                temperature=temperature, weight_reconstruction=weight_reconstruction,
+                                domain_adv_weight=dw, temperature=temperature,
+                                weight_reconstruction=weight_reconstruction,
                                 device=device)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
         epoch_stats = {k: v / n_batches for k, v in epoch_stats.items()}
-        print(f"epoch {epoch:03d} | contrast_w={cw:.2f} | " +
+        print(f"epoch {epoch:03d} | contrast_w={cw:.2f} | domain_w={dw:.2f} | " +
               " | ".join(f"{k}={v:.4f}" for k, v in epoch_stats.items()))
  
  
