@@ -168,19 +168,27 @@ class ProjectionHead(nn.Module):
 class DualAutoencoder(nn.Module):
     def __init__(self, n_svg, hist_dim, latent_dim=64, proj_dim=32, n_slides=5,
                  pool_type="attention", encoder_type="sage", transconv_heads=4,
-                 hist_condition_on_slide=False):
+                 hist_condition_on_slide=True):
         """
         hist_condition_on_slide: whether `hist_dec` also gets the slide one-hot
-            concatenated onto z before decoding. DEFAULT FALSE: ablation showed an
-            unconditioned hist_dec (z alone) trained with a validated regime
-            (`pretrain_hist_autoencoder`) preserves anatomical structure and has
-            far lower slide-identity leakage than any conditioned variant tested,
-            including slide+tile conditioning -- conditioning gives the decoder a
-            side channel that lets it explain reconstruction without needing `z`
-            to carry much useful signal at all, which starves the encoder of
-            gradient pressure to organize `z` well. See conversation notes for the
-            comparison against an external single-objective baseline that this was
-            validated against. Set True only if deliberately re-testing conditioning.
+            concatenated onto z before decoding. DEFAULT TRUE, reversed from an
+            earlier default of False.
+
+            This was previously set to False on the theory that conditioning only
+            removes the *requirement* for z to encode slide identity, without
+            actively penalizing it for doing so anyway -- so it "shouldn't" help
+            much. That reasoning was incomplete: it ignored `weight_decay` in
+            `pretrain_hist_autoencoder`'s AdamW optimizer. With L2 regularization
+            active, the optimizer isn't just permitted to drop unneeded
+            information, it's actively pushed toward the lowest-norm solution
+            that still minimizes reconstruction loss -- and once conditioning
+            makes slide identity unnecessary for that, weight decay gives the
+            encoder a real incentive to drop it, not merely permission.
+
+            Directly measured, same data/seed/training regime, nothing else
+            changed: condition_on_slide=True -> Slide_ID leakage 0.495;
+            condition_on_slide=False -> 0.900 (chance = 0.20). Keep this True
+            unless deliberately re-testing the unconditioned case.
         """
         super().__init__()
         if encoder_type == "sage":
@@ -535,6 +543,7 @@ class PatchGroupedLoader:
     `collate_fn`, but we drive the seed-node groups ourselves (one group of patches
     per batch) rather than letting NeighborLoader chunk seed nodes arbitrarily.
 
+    
     NOTE: this relies on PyG's `NeighborLoader`/`NodeLoader.collate_fn(index)` being
     directly callable with an arbitrary index tensor. This is standard in recent PyG
     versions; if your PyG version's internals differ, the fallback is to construct a
@@ -817,8 +826,8 @@ def pretrain_hist_autoencoder(model, hist_emb_all, patch_meta, epochs=100, batch
         instead of running a fixed epoch count and keeping whatever that
         happens to produce.
 
-    Construct `model` with `hist_condition_on_slide=False` (the default) for the
-    validated unconditioned setup -- see `DualAutoencoder`'s docstring.
+    Leave `model`'s `hist_condition_on_slide=True` (the default) -- see
+    `DualAutoencoder`'s docstring for the measured effect of this flag.
 
     Meant to run BEFORE `train()`. Follow with `freeze_hist_encoder(model)` and
     `train(..., freeze_hist=True)` for the joint/contrastive phase, once this
@@ -1268,7 +1277,7 @@ def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_
         n_svg=n_svg, hist_dim=hist_dim,
         latent_dim=config["latent_dim"], proj_dim=config["proj_dim"],
         n_slides=n_slides, pool_type=config["pool_type"], encoder_type=config["encoder"],
-        hist_condition_on_slide=config.get("hist_condition_on_slide", False),
+        hist_condition_on_slide=config.get("hist_condition_on_slide", True),
     )
     model.hist_enc.load_state_dict(model_template_state["hist_enc"])
     model.hist_dec.load_state_dict(model_template_state["hist_dec"])
