@@ -1307,13 +1307,25 @@ def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_
     }
     row = {**{f"cfg__{k}": v for k, v in config.items()}, **metrics}
 
+    # Reconcile against whatever's already on disk rather than blindly appending:
+    # CONFIG has gained new keys over the course of this project (e.g.
+    # hist_condition_on_slide), so a log seeded from an older CONFIG's rows has
+    # fewer columns than a fresh row does. Plain csv.DictWriter.writerow() with
+    # write_header only gated on "does the file exist yet" doesn't notice that
+    # mismatch -- it silently appends rows with a different field count than
+    # whatever's already there, corrupting the file for any later pd.read_csv
+    # (this is exactly what happened: "Expected 32 fields... saw 33"). Reading
+    # the existing rows and doing a union-column concat instead means the file
+    # is always internally consistent no matter how CONFIG has evolved between
+    # runs -- older rows just get NaN in columns that didn't exist yet for them.
     log_path = Path(log_path)
-    write_header = not log_path.exists()
-    with open(log_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if write_header:
-            writer.writeheader()
-        writer.writerow(row)
+    row_df = pd.DataFrame([row])
+    if log_path.exists():
+        existing = pd.read_csv(log_path)
+        combined = pd.concat([existing, row_df], ignore_index=True, sort=False)
+    else:
+        combined = row_df
+    combined.to_csv(log_path, index=False)
 
     if checkpoint_dir is not None:
         checkpoint_dir = Path(checkpoint_dir)
