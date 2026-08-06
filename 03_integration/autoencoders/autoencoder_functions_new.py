@@ -1015,7 +1015,7 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
 
 def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5,
           max_contrast_weight=1.0, temperature=0.07,
-          weight_reconstruction=True, freeze_hist=False, device="cuda"):
+          weight_reconstruction=True, freeze_hist=False, hist_lr_mult=1.0, device="cuda"):
     """
     freeze_hist: if True, assumes `freeze_hist_encoder(model)` was already called
       (hist_enc/hist_dec requires_grad=False) -- the optimizer here only ever
@@ -1023,9 +1023,25 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
       automatically excluded rather than needing special-casing beyond that.
       `train_step` separately re-pins hist_enc/hist_dec to .eval() each step (see
       its docstring) so BatchNorm running stats stay frozen too.
+
+    hist_lr_mult: LR multiplier for hist_enc/hist_dec's param group, relative to
+      `lr`. Only matters when freeze_hist=False (otherwise those params have
+      requires_grad=False and never enter the optimizer at all). Use <1.0 so the
+      contrastive/recon_hist losses reshape the histology tower more gently than
+      trans_enc, which is training from scratch -- letting it move at full `lr`
+      risks undoing the Slide_ID-leakage fix that Phase 1 pretraining bought
+      (see `hist_condition_on_slide` docstring on DualAutoencoder), since
+      loss_contrast has every incentive to exploit slide-level shortcuts in the
+      histology latent once it's allowed to reshape it.
     """
     model.to(device)
-    opt = torch.optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=lr)
+    hist_param_ids = {id(p) for p in list(model.hist_enc.parameters()) + list(model.hist_dec.parameters())}
+    hist_params = [p for p in model.parameters() if p.requires_grad and id(p) in hist_param_ids]
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in hist_param_ids]
+    param_groups = [{"params": other_params, "lr": lr}]
+    if hist_params:
+        param_groups.append({"params": hist_params, "lr": lr * hist_lr_mult})
+    opt = torch.optim.Adam(param_groups)
     hist_emb_all = hist_emb_all.to(device)
     patch_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
 
@@ -1063,32 +1079,55 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
     training (which only ever sees small sampled subgraphs) fits fine. Chunked
     inference reuses the same `NeighborLoader` sampling strategy as training,
     just applied to every node in manageable pieces.
+
+    Also reports median_rank/mrr (mean reciprocal rank) of the true match, off the
+    same `sims` matrix as top1 -- top-1 over thousands of candidates is a harsh,
+    all-or-nothing metric that can read as ~0 even when the model consistently
+    places the true match near the top; rank-based stats surface that signal.
+
+    Also returns patch-level embeddings for reuse downstream (leakage checks,
+    spatial-autocorrelation checks, or as the actual joint representation to use):
+    z_trans_patch, z_hist_patch, and z_joint_patch = concat(z_trans_patch, z_hist_patch),
+    all row-aligned to `unique_patches` (also returned). These are the PRE-projection
+    encoder outputs (not proj_trans/proj_hist's output) -- proj_trans/proj_hist exist
+    specifically to serve the contrastive loss and are a narrower bottleneck (proj_dim
+    < latent_dim); standard contrastive-learning practice (SimCLR etc.) is that the
+    pre-projection encoder representation transfers better to downstream probes than
+    the projection-head output used for the loss itself.
     """
     model.eval()
     z_cells_full = encode_full_graph_batched(
         model.trans_enc, data, device,
         num_neighbors=eval_num_neighbors, batch_size=eval_batch_size,
     )
- 
+
     patch_row = data.patch_row.to(device)
     num_patches = int(patch_row.max().item()) + 1
     if model.pool_type == "attention":
         z_patch_trans_full, _ = model.pool(z_cells_full, patch_row, num_patches)
     else:
         z_patch_trans_full = segment_mean_pool(z_cells_full, patch_row, num_patches)
- 
+
     unique_patches = torch.unique(patch_row)
     hist_batch = hist_emb_all.to(device)[unique_patches]
     z_patch_hist = model.hist_enc(hist_batch)
- 
-    p_trans = model.proj_trans(z_patch_trans_full[unique_patches])
+    z_patch_trans = z_patch_trans_full[unique_patches]
+
+    p_trans = model.proj_trans(z_patch_trans)
     p_hist = model.proj_hist(z_patch_hist)
- 
+
     sims = p_trans @ p_hist.T
     pred = sims.argmax(dim=1)
     true_col = torch.arange(len(unique_patches), device=device)  # one-to-one, in `unique_patches` order
     top1_acc = (pred == true_col).float().mean().item()
- 
+
+    n_candidates = len(unique_patches)
+    diag = sims.diagonal()
+    rank = (sims >= diag.unsqueeze(1)).sum(dim=1).float()  # 1 = true match is the single best hit
+    mrr = (1.0 / rank).mean().item()
+    median_rank = rank.median().item()
+    chance_mrr = float(np.sum(1.0 / np.arange(1, n_candidates + 1)) / n_candidates)
+
     neighbor_radius = patch_meta.get("neighbor_radius")
     neighbor_acc = None
     if neighbor_radius is not None:
@@ -1097,22 +1136,58 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
         dist = (centroids[pred] - centroids).norm(dim=1)
         same_slide = slide_ids[pred] == slide_ids  # raw coords aren't comparable across slides
         neighbor_acc = ((dist < neighbor_radius) & same_slide).float().mean().item()
- 
-    print(f"Top-1 patch retrieval accuracy: {top1_acc:.3f} (chance = {1/len(unique_patches):.5f})")
+
+    print(f"Top-1 patch retrieval accuracy: {top1_acc:.3f} (chance = {1/n_candidates:.5f})")
     if neighbor_acc is not None:
         print(f"Neighborhood-tolerant top-1 accuracy (radius={neighbor_radius}): {neighbor_acc:.3f}")
- 
+    print(f"Median rank: {median_rank:.1f} / {n_candidates} | MRR: {mrr:.4f} (chance MRR = {chance_mrr:.5f})")
+
+    z_joint_patch = torch.cat([z_patch_trans, z_patch_hist], dim=1)
+
     return {"top1": top1_acc, "neighbor_tolerant": neighbor_acc,
-            "z_patch_trans_full": z_patch_trans_full.cpu().numpy()}
+            "median_rank": median_rank, "mrr": mrr, "chance_mrr": chance_mrr, "n_candidates": n_candidates,
+            "z_patch_trans_full": z_patch_trans_full.cpu().numpy(),
+            "z_trans_patch": z_patch_trans.cpu().numpy(),
+            "z_hist_patch": z_patch_hist.cpu().numpy(),
+            "z_joint_patch": z_joint_patch.cpu().numpy(),
+            "unique_patches": unique_patches.cpu().numpy()}
 
 
 # ---- experiment harness: reproducible sweeps with a persistent, inspectable log ----
 
+def evaluate_latent_leakage(z, slide_id, cv=5, max_iter=5000):
+    """
+    Slide_ID leakage diagnostic on an ALREADY-COMPUTED embedding `z` (n_patches x dim,
+    numpy array or tensor): checks how well a plain logistic regression can recover
+    Slide_ID from it via cross-validated accuracy (chance = 1/n_slides).
+
+    Use this directly on whatever embedding you actually intend to use downstream --
+    trans-only, hist-only, or the joint concat -- not just hist_enc's output.
+    `evaluate_hist_leakage` is a thin wrapper around this (runs hist_enc first, kept
+    for the existing call sites); reach for this one directly when you already have
+    the embedding computed (e.g. from `retrieval_accuracy`'s `z_trans_patch` /
+    `z_hist_patch` / `z_joint_patch`).
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import cross_val_score
+
+    if torch.is_tensor(z):
+        z = z.detach().cpu().numpy()
+    y = slide_id.cpu().numpy() if torch.is_tensor(slide_id) else np.asarray(slide_id)
+
+    clf = LogisticRegression(max_iter=max_iter)
+    scores = cross_val_score(clf, z, y, cv=cv)
+    return {
+        "leakage_mean": float(scores.mean()),
+        "leakage_scores": scores.tolist(),
+        "leakage_chance": 1.0 / len(np.unique(y)),
+    }
+
+
 def evaluate_hist_leakage(model, hist_emb_all, slide_id, device="cuda", cv=5, max_iter=5000):
     """
     Slide_ID leakage diagnostic: encodes every patch with `model.hist_enc` and
-    checks how well a plain logistic regression can recover Slide_ID from the
-    resulting latent, via cross-validated accuracy (chance = 1/n_slides).
+    delegates to `evaluate_latent_leakage` for the actual cross-validated check.
 
     Row-aligned directly against `hist_emb_all`/`slide_id` (the same tensors used
     throughout training -- pass `patch_meta["slide_id"]`) rather than going
@@ -1124,20 +1199,47 @@ def evaluate_hist_leakage(model, hist_emb_all, slide_id, device="cuda", cv=5, ma
     slide's copy survives. Use this function for any leakage check going
     forward instead of rebuilding that pipeline.
     """
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.model_selection import cross_val_score
-
     model.eval()
     with torch.no_grad():
         z = model.hist_enc(hist_emb_all.to(device)).cpu().numpy()
-    y = slide_id.cpu().numpy() if torch.is_tensor(slide_id) else np.asarray(slide_id)
+    return evaluate_latent_leakage(z, slide_id, cv=cv, max_iter=max_iter)
 
-    clf = LogisticRegression(max_iter=max_iter)
-    scores = cross_val_score(clf, z, y, cv=cv)
+
+def evaluate_latent_spatial_autocorr(z, centroids, n_neighs=6):
+    """
+    Unsupervised sanity check: computes Moran's I per latent dimension via squidpy,
+    using a KNN graph built directly on patch centroids. Call this on ONE slide's
+    patches at a time (pass that slide's z/centroids only) -- mixing slides would
+    build nonsensical cross-slide neighbor edges since raw coordinates aren't
+    comparable across slides (same caveat as retrieval_accuracy's neighbor_tolerant
+    check).
+
+    A real (non-noise) spatial embedding should be spatially smooth -- nearby patches
+    more similar than distant ones -- so this is a necessary-but-not-sufficient check:
+    near-zero mean |I| across dims suggests the embedding is ~noise for this slide;
+    high |I| confirms spatial structure exists but doesn't by itself prove that
+    structure is shared cross-modal biology rather than e.g. a smooth staining or
+    scanning artifact -- same ambiguity as any single unsupervised diagnostic here.
+    """
+    if torch.is_tensor(z):
+        z = z.detach().cpu().numpy()
+    if torch.is_tensor(centroids):
+        centroids = centroids.detach().cpu().numpy()
+
+    dims = [f"dim_{i}" for i in range(z.shape[1])]
+    a = ad.AnnData(X=z.astype(np.float32))
+    a.var_names = dims
+    a.obsm["spatial"] = centroids
+
+    sq.gr.spatial_neighbors_knn(a, spatial_key="spatial", n_neighs=n_neighs)
+    sq.gr.spatial_autocorr(a, mode="moran", genes=dims)
+
+    moran_df = a.uns["moranI"]
     return {
-        "leakage_mean": float(scores.mean()),
-        "leakage_scores": scores.tolist(),
-        "leakage_chance": 1.0 / len(np.unique(y)),
+        "moran_mean_I": float(moran_df["I"].mean()),
+        "moran_median_I": float(moran_df["I"].median()),
+        "moran_frac_sig": float((moran_df["pval_norm_fdr_bh"] < 0.05).mean()),
+        "moran_per_dim": moran_df,
     }
 
 
@@ -1340,3 +1442,352 @@ def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_
           f"leakage={metrics['hist_leakage_mean']:.4f} (chance={metrics['hist_leakage_chance']:.4f})")
 
     return metrics, model
+
+
+# ---- leave-one-slide-out evaluation ----------------------------------------
+
+def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
+                         svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True):
+    """
+    Runs the SVG-mask -> spatial-graph -> pairing -> standardize -> patch-metadata
+    -> PyG-data-and-loader pipeline (the same steps that live inline in
+    run_sweep.py / notebook cell 9), factored out into a reusable function so it
+    can be run on an arbitrary SLICE of slides -- needed for leave-one-slide-out
+    evaluation, where the exact same construction has to happen twice (once on
+    the training slides, once on the held-out slide), with the held-out call
+    reusing the training call's fitted feature selection and scalers rather
+    than re-deriving its own.
+
+    Expects f_hist_adata/f_trans_adata/f_trans_coord to ALREADY be filtered to
+    whichever slides this call should use (same convention as the
+    CONFIG["sample"] filtering already used elsewhere in this project, and
+    already assumes the Slide_ID+Patch_ID / Slide_ID+id index-setting from the
+    data-loading step has already been applied) -- this function itself does
+    no slide filtering.
+
+    svg_mask: if given, use this SVG selection instead of recomputing it from
+      whatever slides are passed. REQUIRED for a held-out call: SVG selection
+      must come from the training call, never recomputed on the held-out slide
+      alone (a different, incomparable feature set, and it would leak the
+      held-out slide's own spatial-variability pattern into what "counts" as a
+      spatially variable gene in the first place).
+    svg_scaler / hist_scaler: if given, .transform() (NOT .fit()) the data with
+      these instead of fitting fresh ones on whatever's passed in -- same
+      rationale, and exactly what standardize_modalities's own docstring
+      already flagged as the right approach for a held-out slide, before this
+      function existed to make it possible to actually do so. Fitting a
+      separate scaler on the held-out slide alone would let its own mean/std
+      leak into "normalization," defeating the point of holding it out.
+
+    Returns a dict with everything downstream code needs: svg_mask, svg_scaler,
+    hist_scaler, X_svg, hist_emb, hist_emb_t, trans_sub, patch_meta,
+    patch_meta_df, data, loader, n_slides, n_svg, hist_dim.
+    """
+    if svg_mask is None:
+        svg_mask = get_svg_union_mask(f_trans_adata)
+    if verbose:
+        print(f"  SVG mask: {svg_mask.sum()} genes")
+
+    conn = build_spatial_graph(f_trans_adata, library_key="Slide_ID",
+                                n_neighs=CONFIG["n_neighs"], delaunay=False)
+
+    keep_mask, patch_row_trans, hist_emb = build_pairing(f_trans_adata, f_hist_adata)
+    trans_sub = f_trans_adata[keep_mask].copy()
+    conn_sub = conn[keep_mask][:, keep_mask]
+    X_svg = trans_sub.X[:, svg_mask]
+    X_svg = X_svg.toarray() if sp.issparse(X_svg) else np.asarray(X_svg)
+
+    slide_codes, slide_uniques = pd.factorize(trans_sub.obs["Slide_ID"])
+    n_slides = len(slide_uniques)
+
+    if svg_scaler is None or hist_scaler is None:
+        X_svg, hist_emb, svg_scaler, hist_scaler = standardize_modalities(X_svg, hist_emb)
+    else:
+        X_svg = svg_scaler.transform(X_svg).astype(np.float32)
+        hist_emb = hist_scaler.transform(hist_emb).astype(np.float32)
+
+    cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
+    patch_meta, patch_meta_df = compute_patch_metadata(
+        patch_row_trans, cell_xy, f_hist_adata, neighbor_radius=CONFIG["neighbor_radius"],
+    )
+
+    data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
+    patch_to_nodes = build_patch_to_nodes(data.patch_row)
+    loader = PatchGroupedLoader(
+        data, patch_to_nodes, patch_meta["slide_id"],
+        num_neighbors=CONFIG["num_neighbors"], patches_per_batch=CONFIG["patches_per_batch"],
+        max_cells_per_patch=CONFIG["max_cells_per_patch"],
+    )
+    hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
+
+    return {
+        "svg_mask": svg_mask, "svg_scaler": svg_scaler, "hist_scaler": hist_scaler,
+        "X_svg": X_svg, "hist_emb": hist_emb, "hist_emb_t": hist_emb_t,
+        "trans_sub": trans_sub, "patch_meta": patch_meta, "patch_meta_df": patch_meta_df,
+        "data": data, "loader": loader, "n_slides": n_slides,
+        "n_svg": X_svg.shape[1], "hist_dim": hist_emb.shape[1],
+    }
+
+
+def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans_coord,
+                             CONFIG, device, log_path=None, checkpoint_dir=None,
+                             seed=0, verbose=True, run_tag=""):
+    """
+    run_tag: appended to run_id/checkpoint filename (as "loso_{slide}{run_tag}")
+      to keep comparison runs on the same held_out_slide from colliding -- e.g.
+      run_tag="_unfrozen" when testing freeze_hist=False against an existing
+      frozen baseline for the same slide, so the new checkpoint doesn't silently
+      overwrite the old one (same collision class as the run_id issue fixed in
+      run_sweep.py's BATCH_TAG). Empty by default so existing single-regime runs
+      keep their prior run_id/checkpoint naming unchanged.
+    Trains the full pipeline (Phase 1 hist pretrain -> freeze -> Phase 3 joint
+    training) on every slide EXCEPT held_out_slide, then evaluates cross-modal
+    retrieval on held_out_slide alone -- tissue the model has never seen at any
+    stage of training.
+
+    This is the actual test of the "inductive" claim discussed in conversation:
+    SAGEConv/TransformerConv are architecturally capable of running on unseen
+    nodes, but nothing before this function ever exercised that -- every prior
+    evaluation in this project (the whole max_contrast_weight sweep included)
+    ran retrieval_accuracy on data the model had already been trained on.
+
+    Reports retrieval_accuracy on BOTH the training slides (in-sample, for
+    direct comparison) and the held-out slide (the actual generalization
+    number) -- the GAP between them, not either number alone, is what tells
+    you whether this generalizes.
+
+    Deliberately NOT reported for the held-out slide:
+      - hist_leakage: a Slide_ID-classification diagnostic. There's no other
+        slide within a single held-out slide to classify against -- not just
+        hard to compute here, genuinely meaningless in this setting.
+      - hist_dec/trans_dec reconstruction quality: both decoders are
+        conditioned on slide identity via a one-hot sized for exactly the
+        TRAINING slides (n_slides = 4, not 5) -- the held-out slide has no
+        valid slot in that one-hot at all, categorically, not merely unseen
+        data. retrieval_accuracy is the right metric here specifically because
+        it never touches either decoder: hist_enc, trans_enc, pooling, and the
+        projection heads are all slide-agnostic.
+
+    seed: fixed (default 0) for the same reason run_experiment pins it -- an
+      uncontrolled random init for trans_enc/pooling/projections would
+      confound a fold-to-fold comparison the same way it did in the
+      max_contrast_weight sweep before that was caught and fixed.
+    """
+    import time
+    from pathlib import Path
+
+    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
+    if held_out_slide not in all_slides:
+        raise ValueError(f"held_out_slide {held_out_slide!r} not found among {all_slides}")
+    train_slides = [s for s in all_slides if s != held_out_slide]
+
+    if verbose:
+        print(f"[LOSO] held out: {held_out_slide} | train: {train_slides}")
+
+    hist_slide = f_hist_adata.obs["Slide_ID"].astype(str)
+    trans_slide = f_trans_adata.obs["Slide_ID"].astype(str)
+    coord_slide = f_trans_coord["Slide_ID"].astype(str)
+
+    f_hist_train = f_hist_adata[hist_slide != held_out_slide].copy()
+    f_trans_train = f_trans_adata[trans_slide != held_out_slide].copy()
+    f_coord_train = f_trans_coord[coord_slide != held_out_slide]
+
+    f_hist_held = f_hist_adata[hist_slide == held_out_slide].copy()
+    f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
+    f_coord_held = f_trans_coord[coord_slide == held_out_slide]
+
+    if verbose:
+        print("  building training-slide pipeline data...")
+    train_pipe = build_pipeline_data(f_hist_train, f_trans_train, f_coord_train, CONFIG, verbose=verbose)
+
+    if verbose:
+        print("  building held-out-slide pipeline data (reusing training svg_mask/scalers)...")
+    held_pipe = build_pipeline_data(
+        f_hist_held, f_trans_held, f_coord_held, CONFIG,
+        svg_mask=train_pipe["svg_mask"], svg_scaler=train_pipe["svg_scaler"],
+        hist_scaler=train_pipe["hist_scaler"], verbose=verbose,
+    )
+
+    model_kwargs = dict(
+        n_svg=train_pipe["n_svg"], hist_dim=train_pipe["hist_dim"],
+        latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
+        n_slides=train_pipe["n_slides"], pool_type=CONFIG["pool_type"], encoder_type=CONFIG["encoder"],
+        hist_condition_on_slide=CONFIG.get("hist_condition_on_slide", True),
+    )
+    pretrain_kwargs = dict(
+        epochs=CONFIG["hist_pretrain_epochs"], lr=CONFIG["hist_pretrain_lr"],
+        weight_decay=CONFIG["hist_pretrain_weight_decay"],
+        val_frac=CONFIG["hist_pretrain_val_frac"], patience=CONFIG["hist_pretrain_patience"],
+    )
+
+    set_seed(seed)
+    model = DualAutoencoder(**model_kwargs)
+    pretrain_info = pretrain_hist_autoencoder(
+        model, train_pipe["hist_emb_t"], train_pipe["patch_meta"],
+        device=device, verbose=verbose, **pretrain_kwargs,
+    )
+    freeze_hist = CONFIG.get("freeze_hist", True)
+    if freeze_hist:
+        freeze_hist_encoder(model, freeze_decoder=CONFIG.get("freeze_decoder", True))
+
+    train(
+        model, train_pipe["loader"], train_pipe["hist_emb_t"], train_pipe["patch_meta"],
+        n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
+        max_contrast_weight=CONFIG["max_contrast_weight"], temperature=CONFIG["temperature"],
+        weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
+        freeze_hist=freeze_hist, hist_lr_mult=CONFIG.get("hist_lr_mult", 1.0), device=device,
+    )
+
+    train_patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
+                                for k, v in train_pipe["patch_meta"].items()}
+    if verbose:
+        print("  in-sample (training slides) retrieval:")
+    train_eval = retrieval_accuracy(model, train_pipe["data"], train_pipe["hist_emb_t"],
+                                     train_patch_meta_device, device=device)
+
+    held_patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
+                               for k, v in held_pipe["patch_meta"].items()}
+    if verbose:
+        print(f"  held-out ({held_out_slide}) retrieval -- the actual generalization test:")
+    held_eval = retrieval_accuracy(model, held_pipe["data"], held_pipe["hist_emb_t"],
+                                    held_patch_meta_device, device=device)
+
+    # Slide_ID leakage on the TRAINING slides only -- meaningful here (n_slides-1
+    # classes to distinguish), unlike the held-out slide where there's nothing to
+    # classify against (see docstring). Checked on all three of trans-only, hist-only,
+    # and joint (the actual embedding this function exists to help produce) so a
+    # frozen-vs-unfrozen comparison shows exactly which representation absorbs any
+    # reopened leakage. Uses the numeric `patch_meta["slide_id"]` codes here (safe --
+    # both z_*_patch and slide_id come from the SAME build_pipeline_data call, so the
+    # factorization is internally consistent), restricted to `unique_patches` in case
+    # any patches were dropped.
+    train_slide_id_np = train_pipe["patch_meta"]["slide_id"].cpu().numpy()[train_eval["unique_patches"]]
+    train_leak_trans = evaluate_latent_leakage(train_eval["z_trans_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
+    train_leak_hist = evaluate_latent_leakage(train_eval["z_hist_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
+    train_leak_joint = evaluate_latent_leakage(train_eval["z_joint_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
+    if verbose:
+        print(f"  train-slide leakage -- trans: {train_leak_trans['leakage_mean']:.3f} | "
+              f"hist: {train_leak_hist['leakage_mean']:.3f} | joint: {train_leak_joint['leakage_mean']:.3f} "
+              f"(chance = {train_leak_hist['leakage_chance']:.3f})")
+
+    # Held-out-vs-train leakage: does a classifier trained on trans/hist/joint embeddings
+    # across ALL n_slides (train + held-out) separate the held-out slide's patches out as
+    # their own obviously-distinct cluster, or do they blend in like just another training
+    # slide would? Unlike the check above, this NEEDS string Slide_ID labels rather than
+    # the numeric `patch_meta["slide_id"]` codes -- those codes are factorized separately
+    # within each build_pipeline_data call (train_pipe sees 4 categories, held_pipe sees
+    # only 1), so code 0 in one is NOT the same slide as code 0 in the other. patch_meta_df
+    # carries the actual Slide_ID strings, aligned by the same patch_row indexing.
+    train_slide_name = train_pipe["patch_meta_df"]["Slide_ID"].values[train_eval["unique_patches"]]
+    held_slide_name = held_pipe["patch_meta_df"]["Slide_ID"].values[held_eval["unique_patches"]]
+    combined_slide_name = np.concatenate([train_slide_name, held_slide_name])
+    combined_leak_trans = evaluate_latent_leakage(
+        np.concatenate([train_eval["z_trans_patch"], held_eval["z_trans_patch"]]), combined_slide_name)
+    combined_leak_hist = evaluate_latent_leakage(
+        np.concatenate([train_eval["z_hist_patch"], held_eval["z_hist_patch"]]), combined_slide_name)
+    combined_leak_joint = evaluate_latent_leakage(
+        np.concatenate([train_eval["z_joint_patch"], held_eval["z_joint_patch"]]), combined_slide_name)
+    if verbose:
+        print(f"  held-out-vs-train leakage (n_slides={len(all_slides)}) -- trans: {combined_leak_trans['leakage_mean']:.3f} | "
+              f"hist: {combined_leak_hist['leakage_mean']:.3f} | joint: {combined_leak_joint['leakage_mean']:.3f} "
+              f"(chance = {combined_leak_hist['leakage_chance']:.3f})")
+
+    # Unsupervised spatial-smoothness sanity check on the held-out slide's embeddings --
+    # doesn't need cross-modal matching or labels at all, just asks "does this look like
+    # tissue architecture or noise" (see evaluate_latent_spatial_autocorr docstring for
+    # the necessary-but-not-sufficient caveat).
+    held_centroids_np = held_pipe["patch_meta"]["centroid"].cpu().numpy()[held_eval["unique_patches"]]
+    moran_trans = evaluate_latent_spatial_autocorr(held_eval["z_trans_patch"], held_centroids_np)
+    moran_hist = evaluate_latent_spatial_autocorr(held_eval["z_hist_patch"], held_centroids_np)
+    moran_joint = evaluate_latent_spatial_autocorr(held_eval["z_joint_patch"], held_centroids_np)
+    if verbose:
+        print(f"  held-out spatial autocorr (mean |Moran's I|) -- trans: {moran_trans['moran_mean_I']:.4f} | "
+              f"hist: {moran_hist['moran_mean_I']:.4f} | joint: {moran_joint['moran_mean_I']:.4f}")
+
+    metrics = {
+        "run_id": f"loso_{held_out_slide}{run_tag}",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "held_out_slide": held_out_slide,
+        "train_slides": ",".join(train_slides),
+        "train_top1_retrieval": train_eval["top1"],
+        "train_neighbor_tolerant_retrieval": train_eval["neighbor_tolerant"],
+        "train_median_rank": train_eval["median_rank"],
+        "train_mrr": train_eval["mrr"],
+        "train_chance_mrr": train_eval["chance_mrr"],
+        "held_out_top1_retrieval": held_eval["top1"],
+        "held_out_neighbor_tolerant_retrieval": held_eval["neighbor_tolerant"],
+        "held_out_median_rank": held_eval["median_rank"],
+        "held_out_mrr": held_eval["mrr"],
+        "held_out_chance_mrr": held_eval["chance_mrr"],
+        "hist_pretrain_best_val_mse": pretrain_info["best_val_mse"],
+        "hist_pretrain_stopped_epoch": pretrain_info["stopped_epoch"],
+        "train_trans_leakage_mean": train_leak_trans["leakage_mean"],
+        "train_hist_leakage_mean": train_leak_hist["leakage_mean"],
+        "train_joint_leakage_mean": train_leak_joint["leakage_mean"],
+        "train_leakage_chance": train_leak_hist["leakage_chance"],
+        "combined_trans_leakage_mean": combined_leak_trans["leakage_mean"],
+        "combined_hist_leakage_mean": combined_leak_hist["leakage_mean"],
+        "combined_joint_leakage_mean": combined_leak_joint["leakage_mean"],
+        "combined_leakage_chance": combined_leak_hist["leakage_chance"],
+        "held_out_moran_mean_I_trans": moran_trans["moran_mean_I"],
+        "held_out_moran_mean_I_hist": moran_hist["moran_mean_I"],
+        "held_out_moran_mean_I_joint": moran_joint["moran_mean_I"],
+    }
+
+    if log_path is not None:
+        row = {**{f"cfg__{k}": v for k, v in CONFIG.items()}, **metrics}
+        row_df = pd.DataFrame([row])
+        log_path = Path(log_path)
+        if log_path.exists():
+            existing = pd.read_csv(log_path)
+            combined_log = pd.concat([existing, row_df], ignore_index=True, sort=False)
+        else:
+            combined_log = row_df
+        combined_log.to_csv(log_path, index=False)
+
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"model_state_dict": model.state_dict(), "config": CONFIG, "metrics": metrics},
+            checkpoint_dir / f"loso_{held_out_slide}{run_tag}.pt",
+        )
+        # Joint/trans-only/hist-only patch embeddings, saved alongside the checkpoint --
+        # these ARE the actual deliverable (a combined latent embedding to use downstream),
+        # not just an eval byproduct, so they're persisted rather than only returned in
+        # memory for the duration of the script.
+        np.savez(
+            checkpoint_dir / f"loso_{held_out_slide}{run_tag}_embeddings.npz",
+            train_z_trans=train_eval["z_trans_patch"], train_z_hist=train_eval["z_hist_patch"],
+            train_z_joint=train_eval["z_joint_patch"], train_patch_row=train_eval["unique_patches"],
+            train_slide_name=train_slide_name,
+            held_out_z_trans=held_eval["z_trans_patch"], held_out_z_hist=held_eval["z_hist_patch"],
+            held_out_z_joint=held_eval["z_joint_patch"], held_out_patch_row=held_eval["unique_patches"],
+        )
+
+    if verbose:
+        gap = metrics["train_top1_retrieval"] - metrics["held_out_top1_retrieval"]
+        print(f"[LOSO {held_out_slide}] train_top1={metrics['train_top1_retrieval']:.4f} "
+              f"held_out_top1={metrics['held_out_top1_retrieval']:.4f} (gap={gap:.4f})")
+
+    return metrics, model
+
+
+def run_5fold_loso(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
+                    log_path=None, checkpoint_dir=None, seed=0, verbose=True):
+    """
+    Runs run_leave_one_slide_out once per slide (full leave-one-slide-out CV).
+    Expensive: trains the entire Phase 1 + Phase 3 pipeline from scratch once
+    per slide (5x the cost of a single run_leave_one_slide_out call) -- run a
+    single held-out slide first via run_leave_one_slide_out directly and sanity
+    check it before committing to this.
+    """
+    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
+    results = []
+    for held_out in all_slides:
+        metrics, _ = run_leave_one_slide_out(
+            held_out, f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
+            log_path=log_path, checkpoint_dir=checkpoint_dir, seed=seed, verbose=verbose,
+        )
+        results.append(metrics)
+    return pd.DataFrame(results)
