@@ -242,8 +242,41 @@ def get_svg_union_mask(trans_adata, per_sample_key="spatially_variable_per_sampl
         sv = np.asarray(trans_adata.varm[per_sample_key]).astype(bool)
         return sv.any(axis=1)
     return (trans_adata.var["spatially_variable_n_samples"] >= 1).values
- 
- 
+
+
+def get_hvg_union_mask(trans_adata, per_sample_key="highly_variable_per_sample"):
+    """Union across samples: gene is an HVG if flagged in >=1 sample. Mirrors
+    get_svg_union_mask exactly, reading the HVG-equivalent per-sample columns."""
+    if per_sample_key in trans_adata.varm:
+        hv = np.asarray(trans_adata.varm[per_sample_key]).astype(bool)
+        return hv.any(axis=1)
+    return (trans_adata.var["highly_variable_n_samples"] >= 1).values
+
+
+def get_gene_mask(trans_adata, gene_selection="svg"):
+    """
+    Dispatches to the gene-selection mask named by `gene_selection`:
+      "svg": spatially-variable-genes union (default, validated regime) -- genes
+        selected for spatial patterning WITHIN a slide, which is the signal the
+        cross-modal patch-level alignment task actually needs.
+      "hvg": highly-variable-genes union -- selected on overall variance alone,
+        no preference for spatial relevance. A raw-PCA leakage check found this
+        set leaks Slide_ID somewhat less than SVG (see conversation notes), but
+        that was never checked against retrieval quality -- treat as an
+        experiment to run via `run_leave_one_slide_out`, not a validated default.
+      "intersection": SVG & HVG -- a middle ground, keeping only genes that are
+        both spatially patterned and highly variable.
+    """
+    if gene_selection == "svg":
+        return get_svg_union_mask(trans_adata)
+    elif gene_selection == "hvg":
+        return get_hvg_union_mask(trans_adata)
+    elif gene_selection == "intersection":
+        return get_svg_union_mask(trans_adata) & get_hvg_union_mask(trans_adata)
+    else:
+        raise ValueError(f"Unsupported gene_selection: {gene_selection!r}. Choose from 'svg', 'hvg', 'intersection'.")
+
+
 def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delaunay=False, percentile=95.0):
     """Uses squidpy so that neighbors are only ever formed within a sample."""
     
@@ -1637,9 +1670,18 @@ def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans
     f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
     f_coord_held = f_trans_coord[coord_slide == held_out_slide]
 
+    # gene selection computed ONCE from TRAIN-only data -- same rationale as svg_scaler/
+    # hist_scaler being fit-on-train-only: computing it fresh on the held-out slide alone
+    # would leak its own variability pattern into what "counts" as a selected gene.
+    gene_selection = CONFIG.get("gene_selection", "svg")
+    gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection)
+    if verbose:
+        print(f"  gene selection ({gene_selection}): {gene_mask.sum()} genes")
+
     if verbose:
         print("  building training-slide pipeline data...")
-    train_pipe = build_pipeline_data(f_hist_train, f_trans_train, f_coord_train, CONFIG, verbose=verbose)
+    train_pipe = build_pipeline_data(f_hist_train, f_trans_train, f_coord_train, CONFIG,
+                                      svg_mask=gene_mask, verbose=verbose)
 
     if verbose:
         print("  building held-out-slide pipeline data (reusing training svg_mask/scalers)...")

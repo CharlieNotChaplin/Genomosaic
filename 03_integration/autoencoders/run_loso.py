@@ -58,6 +58,15 @@ def run_it():
         encoder="transconv",
         hist_condition_on_slide=True,   # validated: leakage 0.90 -> ~0.50 with this on
 
+        # which genes feed trans_enc -- "svg" (default, validated) selects for spatial
+        # patterning within a slide, the signal the alignment task actually needs. "hvg"
+        # showed lower raw-PCA leakage in a standalone check (conversation notes) but
+        # was never tested against retrieval quality -- treat as an experiment, not a
+        # replacement, until this run's retrieval numbers are compared against the "svg"
+        # baseline for the same held-out slide. "intersection" (SVG & HVG) is a middle
+        # ground worth trying too.
+        gene_selection="svg",   # "svg" | "hvg" | "intersection"
+
         # graph / batching
         n_neighs=6,
         num_neighbors=(10, 10),
@@ -169,6 +178,8 @@ def run_it():
         _tag_parts.append("unfrozen")
     if CONFIG["trans_weight_decay"] > 0 or CONFIG["edge_dropout_p"] > 0 or CONFIG["gene_dropout_p"] > 0:
         _tag_parts.append("transreg")
+    if CONFIG["gene_selection"] != "svg":
+        _tag_parts.append(CONFIG["gene_selection"])
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
 
     print(f"\n=== Leave-one-slide-out: holding out {HELD_OUT_SLIDE} (freeze_hist={CONFIG['freeze_hist']}) ===\n")
