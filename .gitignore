@@ -23,6 +23,8 @@ __pycache__/
 .mypy_cache/
 .ipynb_checkpoints/
 **/log/
+**/logs/
+*.sh
 
 # Sensitive information
 .env

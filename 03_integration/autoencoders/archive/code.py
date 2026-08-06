@@ -20,7 +20,23 @@ from torch_geometric.nn import SAGEConv
 from torch_geometric.nn import TransformerConv
 
 
-from autoencoder_functions import *
+# Now import your module
+from autoencoder_functions_new import *
+
+
+def set_seed(seed: int = 42):
+    """Set random seeds across all dependencies for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # for multi-GPU setups
+    
+    # Enforce deterministic algorithm behavior in PyTorch/cuDNN
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
 
 
 CONFIG = dict(
@@ -38,27 +54,31 @@ CONFIG = dict(
     # graph / batching
     n_neighs=6,                       
     num_neighbors=(10, 10),           
-    patches_per_batch=16,            
+    patches_per_batch=64,            
     max_cells_per_patch=64,           
  
     # loss
     temperature=0.07,
-    neighbor_radius=None,            
+    neighbor_radius=2912,     # 2x patch diameter, currently 224x224 px       
                                        
     weight_reconstruction_by_patch_freq=True,   
  
+    hist_batch_correct=False,
+    hist_harmony_npcs=50,
+
+    hist_pretrain_epochs=200,
+    hist_pretrain_lr=1e-3,
+    hist_pretrain_weight_decay=1e-5,
+    hist_pretrain_val_frac=0.1,
+    hist_pretrain_patience=15,
+    
     # training
-    n_epochs=30,
+    n_epochs=100,
     lr=1e-3,
     warmup_epochs=5,
-    max_contrast_weight=1.0,
-    max_domain_adv_weight=0.1,        # domain-adversarial de-confounding strength for z_hist vs Slide_ID; 0 disables it
+    max_contrast_weight=0.0,
+    #max_domain_adv_weight=0.1,        # domain-adversarial de-confounding strength for z_hist vs Slide_ID; 0 disables it
 )
- 
-xpca_hist = False
-xpca_trans = False
-xpca_col_hist = "X_pca"
-xpca_col_trans = "X_pca"
 
 
 basedir = Path("../../data")
@@ -68,15 +88,17 @@ _run_tag = CONFIG["sample"] if isinstance(CONFIG["sample"], str) else "combined"
 dir_output = basedir / _run_tag / "03_integration/autoencoders" / CONFIG["bin_size"]
 dir_output.mkdir(parents=True, exist_ok=True)
 
+
 import anndata as ad
 
+ 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+ 
 # -- load --
 f_hist_adata = sc.read_h5ad(dir_histology / "filtered_WSI_patch_embeddings.h5ad")
 f_trans_adata = ad.read_h5ad(dir_transcriptomics / "count_area_filtered_adata.h5ad")
 f_trans_coord = gpd.read_parquet(dir_transcriptomics / "nuclei_geometry.parquet")
-
+ 
 if CONFIG["sample"] == "combined":
     # keep every slide already in the loaded (combined) anndata objects -- no filtering
     pass
@@ -91,12 +113,12 @@ elif isinstance(CONFIG["sample"], (list, tuple)):
     f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].isin(CONFIG["sample"])]
     f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(CONFIG["sample"])]
 print("Training on slides:", sorted(f_trans_adata.obs["Slide_ID"].unique().tolist()))
-
+ 
 trans_global_id = f_trans_adata.obs["Slide_ID"].astype(str) + "_" + f_trans_adata.obs["id"].astype(str)
 if not trans_global_id.is_unique:
     raise ValueError("Cannot set Slide_ID+id as index: contains duplicates")
 f_trans_adata.obs = f_trans_adata.obs.set_index(trans_global_id)
-
+ 
 hist_global_id = f_hist_adata.obs["Slide_ID"].astype(str) + "_" + f_hist_adata.obs["Patch_ID"].astype(str)
 if not hist_global_id.is_unique:
     raise ValueError("Cannot set Slide_ID+Patch_ID as index: contains duplicates")
@@ -124,11 +146,11 @@ X_svg = X_svg.toarray() if sp.issparse(X_svg) else np.asarray(X_svg)
 slide_codes, slide_uniques = pd.factorize(trans_sub.obs["Slide_ID"])
 n_slides = len(slide_uniques)
 
-# 4. standardize both modalities (NEW)
+# 4. standardize both modalities
 print("4. standardising")
 X_svg, hist_emb, svg_scaler, hist_scaler = standardize_modalities(X_svg, hist_emb)
 
-# 5. patch metadata: centroid, cell count, inverse-frequency weight (NEW)
+# 5. patch metadata: centroid, cell count, inverse-frequency weight
 print("5. centroids")
 cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
 patch_meta, patch_meta_df = compute_patch_metadata(
@@ -137,7 +159,7 @@ patch_meta, patch_meta_df = compute_patch_metadata(
 )
 patch_meta_df.to_csv(dir_output / "patch_metadata.csv", index=False)
 
-# 6. PyG data + patch-grouped loader (NEW loader; replaces plain NeighborLoader)
+# 6. PyG data + patch-grouped loader
 print("6. pyg")
 data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
 patch_to_nodes = build_patch_to_nodes(data.patch_row)
@@ -153,17 +175,31 @@ print("7. model training")
 model = DualAutoencoder(
     n_svg=X_svg.shape[1], hist_dim=hist_emb.shape[1],
     latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
-    n_slides=n_slides, pool_type=CONFIG["pool_type"],
-    encoder_type=CONFIG["encoder"],
+    n_slides=n_slides,
+    pool_type=CONFIG["pool_type"], encoder_type=CONFIG["encoder"],
 )
+model.to(device)
 hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
 
+# Phase 1: pure-MSE pretraining
+pretrain_hist_autoencoder(
+    model, hist_emb_t, patch_meta,
+    epochs=CONFIG["hist_pretrain_epochs"], lr=CONFIG["hist_pretrain_lr"],
+    weight_decay=CONFIG["hist_pretrain_weight_decay"],
+    val_frac=CONFIG["hist_pretrain_val_frac"], patience=CONFIG["hist_pretrain_patience"],
+    device=device,
+)
+
+# Phase 2: freeze
+freeze_hist_encoder(model, freeze_decoder=True)
+
+# Phase 3: joint training
 train(
     model, loader, hist_emb_t, patch_meta,
     n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
     max_contrast_weight=CONFIG["max_contrast_weight"],
-    max_domain_adv_weight=CONFIG["max_domain_adv_weight"], temperature=CONFIG["temperature"],
     weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
+    freeze_hist=True,
     device=device,
 )
 
@@ -199,14 +235,13 @@ z_patch_trans_all = eval_results["z_patch_trans_full"]  # one row per unique pat
 
 np.savez(
     dir_output / "dual_ae_latents.npz",
-    z_trans_cell=z_trans_all,                              # per-cell trans latent
-    z_hist_per_patch=z_hist_all,                            # per-patch hist latent
-    z_patch_trans=z_patch_trans_all,                        # per-patch pooled trans latent (NEW)
-    patch_row=data.patch_row.numpy(),                       # cell -> patch index mapping
+    z_trans_cell=z_trans_all,
+    z_hist_per_patch=z_hist_all,
+    z_patch_trans=z_patch_trans_all,
+    patch_row=data.patch_row.numpy(),
     slide_code=data.slide_code.numpy(),
 )
 
-# save anndata: per-cell trans latent, per-cell (via lookup) pooled patch latents of both modalities
 trans_sub.obsm["X_dae_trans_cell"] = z_trans_all
 trans_sub.obsm["X_dae_trans_patch"] = z_patch_trans_all[data.patch_row.numpy()]
 trans_sub.obsm["X_dae_hist_patch"] = z_hist_all[data.patch_row.numpy()]
@@ -218,29 +253,9 @@ trans_sub.write_h5ad(dir_output / "trans_with_dae_latents.h5ad")
 
 print("Done. Outputs written to:", dir_output)
 
-# Trigger a system notification
 notification.notify(
     title='Jupyter Notebook Alert',
     message='Your script has finished running!',
     app_name='Jupyter',
-    timeout=5 # Notification disappears after 5 seconds
+    timeout=5
 )
-
-
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import cross_val_score
-
-X = patch_adata_global.obsm["X_dae_concat_patch"]
-y = patch_adata_global.obs["Slide_ID"]
-
-clf = LogisticRegression(max_iter=5000)
-
-scores = cross_val_score(
-    clf,
-    X,
-    y,
-    cv=5,
-)
-
-print(scores)
-print(scores.mean())
