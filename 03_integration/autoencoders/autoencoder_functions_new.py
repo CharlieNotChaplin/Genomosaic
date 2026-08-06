@@ -17,6 +17,7 @@ from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
 from torch_geometric.nn import SAGEConv
 from torch_geometric.nn import TransformerConv
+from torch_geometric.utils import dropout_edge
 
 
 ######### Model definitions
@@ -110,13 +111,17 @@ class AttentionPool(nn.Module):
 class MLPDecoder(nn.Module):
     """
     Optionally conditions on slide identity, one-hot-concatenated onto the latent
-    before decoding. Conditioning gives the decoder a "free" channel to explain
-    away which slide a patch came from, so the encoder has less incentive to keep
-    that in the bottleneck it's optimized to compress -- but it only removes the
-    *requirement*, it doesn't penalize the encoder for keeping it anyway. For
-    `hist_dec` specifically, `condition_on_slide=False` (the validated default via
-    `DualAutoencoder`) outperformed conditioning entirely -- see that class's
-    docstring.
+    before decoding. Conditioning alone only gives the decoder a "free" channel to
+    explain away which slide a patch came from -- it removes the *requirement* for
+    the encoder to keep that in its bottleneck, without directly penalizing it for
+    keeping it anyway. The actual incentive to drop it comes from weight_decay on
+    the encoder's optimizer (see `DualAutoencoder`'s `hist_condition_on_slide`
+    docstring for the full mechanism and the measured effect): once conditioning
+    makes slide identity unnecessary for reconstruction, L2 regularization pushes
+    the optimizer toward not encoding it anyway. `condition_on_slide=True` (this
+    class's default) is the validated setting for `hist_dec`, paired with
+    `pretrain_hist_autoencoder`'s weight_decay -- Slide_ID leakage 0.495 vs 0.900
+    unconditioned, same data/seed/regime.
     """
     def __init__(self, latent_dim, hidden_dims, out_dim, n_slides=5, condition_on_slide=True):
         super().__init__()
@@ -936,7 +941,23 @@ def freeze_hist_encoder(model, freeze_decoder=True):
 
 def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
                temperature=0.07, weight_reconstruction=True,
-               freeze_hist=False, device="cuda"):
+               freeze_hist=False, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda"):
+    """
+    edge_dropout_p / gene_dropout_p: denoising-style corruption applied ONLY to what
+    `trans_enc` sees -- the reconstruction target (`x[:n_seed]` below) stays the clean,
+    uncorrupted input, so this is a proper denoising objective (forces trans_enc to
+    recover clean expression from a corrupted view) rather than noise for its own sake.
+    Targets two different channels of the Slide_ID leakage seen in `z_trans_patch`:
+    edge_dropout_p (torch_geometric.utils.dropout_edge on `edge_index`) attacks
+    signal coming from local graph structure (e.g. slide-specific cell-density
+    differences from preprocessing/filtering); gene_dropout_p (plain `F.dropout` on
+    `x`) attacks over-reliance on any small set of especially slide/batch-discriminative
+    genes. Neither touches the part of that leakage which reflects genuine biology
+    (this dataset's 5 slides = 5 different patients, 3 tumor/2 normal, so Slide_ID is
+    confounded 1:1 with patient identity and tumor status -- no amount of input
+    corruption can separate a real biological signal from a technical one at this
+    sample size). See conversation notes for the full reasoning.
+    """
     model.train()
     if freeze_hist:
         # model.train() above just re-enabled BatchNorm updates on every submodule.
@@ -956,11 +977,15 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
     x = batch.x.to(device)
     edge_index = batch.edge_index.to(device)
     n_seed = batch.local_patch_index.shape[0]
- 
-    z_full = model.trans_enc(x, edge_index)
+
+    x_in = F.dropout(x, p=gene_dropout_p, training=True) if gene_dropout_p > 0 else x
+    edge_index_in = dropout_edge(edge_index, p=edge_dropout_p, training=True)[0] if edge_dropout_p > 0 else edge_index
+
+    z_full = model.trans_enc(x_in, edge_index_in)
     z_cells = z_full[:n_seed]  # cell-level latents for seed cells only
- 
+
     # --- cell-level reconstruction (unchanged in spirit: still per cell) ---
+    # target is the CLEAN x, not x_in -- see docstring above
     slide_code = batch.slide_code[:n_seed].to(device)
     x_recon = model.trans_dec(z_cells, slide_code)
     recon_per_cell = F.mse_loss(x_recon, x[:n_seed], reduction="none").mean(dim=1)
@@ -1015,7 +1040,8 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
 
 def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5,
           max_contrast_weight=1.0, temperature=0.07,
-          weight_reconstruction=True, freeze_hist=False, hist_lr_mult=1.0, device="cuda"):
+          weight_reconstruction=True, freeze_hist=False, hist_lr_mult=1.0,
+          weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda"):
     """
     freeze_hist: if True, assumes `freeze_hist_encoder(model)` was already called
       (hist_enc/hist_dec requires_grad=False) -- the optimizer here only ever
@@ -1033,14 +1059,27 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
       (see `hist_condition_on_slide` docstring on DualAutoencoder), since
       loss_contrast has every incentive to exploit slide-level shortcuts in the
       histology latent once it's allowed to reshape it.
+
+    weight_decay: applied uniformly to every trainable param group (trans_enc,
+      trans_dec, pool, both projection heads, and hist_enc/hist_dec too if
+      unfrozen). `pretrain_hist_autoencoder` already applies its own weight_decay
+      to hist_enc/hist_dec in Phase 1 -- this is the equivalent lever for
+      trans_enc, which previously had none at all here. trans_dec already
+      defaults to condition_on_slide=True (see MLPDecoder), so the same
+      conditioning-plus-weight-decay mechanism that dropped Slide_ID leakage in
+      hist_enc is structurally already available to trans_enc; it was just
+      missing the weight_decay half.
+
+    edge_dropout_p / gene_dropout_p: forwarded to `train_step` -- see its
+      docstring for the denoising-style mechanism and what each targets.
     """
     model.to(device)
     hist_param_ids = {id(p) for p in list(model.hist_enc.parameters()) + list(model.hist_dec.parameters())}
     hist_params = [p for p in model.parameters() if p.requires_grad and id(p) in hist_param_ids]
     other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in hist_param_ids]
-    param_groups = [{"params": other_params, "lr": lr}]
+    param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
     if hist_params:
-        param_groups.append({"params": hist_params, "lr": lr * hist_lr_mult})
+        param_groups.append({"params": hist_params, "lr": lr * hist_lr_mult, "weight_decay": weight_decay})
     opt = torch.optim.Adam(param_groups)
     hist_emb_all = hist_emb_all.to(device)
     patch_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
@@ -1053,7 +1092,9 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
             stats = train_step(model, batch, hist_emb_all, patch_meta, opt, cw,
                                 temperature=temperature,
                                 weight_reconstruction=weight_reconstruction,
-                                freeze_hist=freeze_hist, device=device)
+                                freeze_hist=freeze_hist,
+                                edge_dropout_p=edge_dropout_p, gene_dropout_p=gene_dropout_p,
+                                device=device)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
@@ -1635,7 +1676,10 @@ def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans
         n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
         max_contrast_weight=CONFIG["max_contrast_weight"], temperature=CONFIG["temperature"],
         weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
-        freeze_hist=freeze_hist, hist_lr_mult=CONFIG.get("hist_lr_mult", 1.0), device=device,
+        freeze_hist=freeze_hist, hist_lr_mult=CONFIG.get("hist_lr_mult", 1.0),
+        weight_decay=CONFIG.get("trans_weight_decay", 0.0),
+        edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0), gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
+        device=device,
     )
 
     train_patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)

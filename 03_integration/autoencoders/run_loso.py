@@ -97,6 +97,24 @@ def run_it():
         # so it can't be reshaped as aggressively as a from-scratch component.
         freeze_hist=True,
         hist_lr_mult=0.1,   # only used if freeze_hist=False
+
+        # trans_enc regularization -- first pass at the leakage findings from the
+        # frozen CRC_P1 run (train_trans_leakage_mean=0.669 vs hist's 0.554, chance
+        # 0.25). trans_enc previously had NO weight_decay at all in Phase 3, unlike
+        # hist_enc's Phase 1 regime; trans_dec already defaults to
+        # condition_on_slide=True, so the same conditioning+weight_decay mechanism
+        # that dropped hist leakage 0.90->0.50 is structurally available here too --
+        # it was just missing the weight_decay half. edge_dropout_p/gene_dropout_p
+        # add denoising-style corruption on top (see train_step docstring for which
+        # leakage channel each targets: edges -> graph-structure/cell-density signal,
+        # genes -> over-reliance on a few especially discriminative genes).
+        # NOTE: none of this can fix the *biological* component of that leakage --
+        # this dataset's 5 slides are 5 different patients, 3 tumor/2 normal, so
+        # Slide_ID is confounded 1:1 with patient identity + tumor status. Expect
+        # SOME reduction, not a drop to chance the way hist's was.
+        trans_weight_decay=1e-5,   # matches hist_pretrain_weight_decay for consistency
+        edge_dropout_p=0.1,
+        gene_dropout_p=0.1,
     )
 
     # ---- WHICH SLIDE TO HOLD OUT (single-slide test) ---------------------------
@@ -140,11 +158,18 @@ def run_it():
     checkpoint_dir = dir_output / "loso_checkpoints"
 
     # run_tag disambiguates run_id/checkpoint filename when comparing regimes on the
-    # same held_out_slide (e.g. rerunning with freeze_hist=False) -- otherwise the
-    # second run silently overwrites the first run's checkpoint (same collision
-    # class run_sweep.py's BATCH_TAG fixed). "" for the default frozen regime keeps
-    # continuity with the CRC_P2/CRC_P1 rows already in loso_log.csv.
-    RUN_TAG = "" if CONFIG["freeze_hist"] else "_unfrozen"
+    # same held_out_slide -- otherwise a second run silently overwrites the first
+    # run's checkpoint (same collision class run_sweep.py's BATCH_TAG fixed). Built
+    # from whichever non-default regimes are active, so it composes as new toggles
+    # get added instead of needing a new if/else per one. "" (all defaults, i.e. the
+    # original frozen/no-regularization regime) keeps continuity with the
+    # CRC_P2/CRC_P1 rows already in loso_log.csv.
+    _tag_parts = []
+    if not CONFIG["freeze_hist"]:
+        _tag_parts.append("unfrozen")
+    if CONFIG["trans_weight_decay"] > 0 or CONFIG["edge_dropout_p"] > 0 or CONFIG["gene_dropout_p"] > 0:
+        _tag_parts.append("transreg")
+    RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
 
     print(f"\n=== Leave-one-slide-out: holding out {HELD_OUT_SLIDE} (freeze_hist={CONFIG['freeze_hist']}) ===\n")
     metrics, model = run_leave_one_slide_out(
