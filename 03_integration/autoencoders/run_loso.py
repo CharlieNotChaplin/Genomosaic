@@ -122,8 +122,8 @@ def run_it():
         # Slide_ID is confounded 1:1 with patient identity + tumor status. Expect
         # SOME reduction, not a drop to chance the way hist's was.
         trans_weight_decay=1e-5,   # matches hist_pretrain_weight_decay for consistency
-        edge_dropout_p=0.1,
-        gene_dropout_p=0.1,
+        edge_dropout_p=0.0,
+        gene_dropout_p=0.0,
     )
 
     # ---- WHICH SLIDE TO HOLD OUT (single-slide test) ---------------------------
