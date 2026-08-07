@@ -176,8 +176,22 @@ def run_it():
     _tag_parts = []
     if not CONFIG["freeze_hist"]:
         _tag_parts.append("unfrozen")
-    if CONFIG["trans_weight_decay"] > 0 or CONFIG["edge_dropout_p"] > 0 or CONFIG["gene_dropout_p"] > 0:
+    # which trans-regularization levers are active -- "transreg" alone (no suffix) is
+    # kept reserved for the all-three-active combo to match the run_id already logged
+    # for the existing loso_CRC_P1_transreg rows; any OTHER subset gets its own distinct
+    # suffix so e.g. weight_decay-only doesn't collide with (and silently overwrite) the
+    # full-combo checkpoint/log rows -- same collision class run_sweep.py's BATCH_TAG fixed.
+    _reg_active = []
+    if CONFIG["trans_weight_decay"] > 0:
+        _reg_active.append("wd")
+    if CONFIG["edge_dropout_p"] > 0:
+        _reg_active.append("edge")
+    if CONFIG["gene_dropout_p"] > 0:
+        _reg_active.append("gene")
+    if len(_reg_active) == 3:
         _tag_parts.append("transreg")
+    elif _reg_active:
+        _tag_parts.append("transreg_" + "".join(_reg_active))
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
