@@ -1317,6 +1317,73 @@ def evaluate_latent_spatial_autocorr(z, centroids, n_neighs=6):
     }
 
 
+def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
+                             tumor_prefix="CRC", max_iter=5000):
+    """
+    Tests whether an embedding captures real tumor-vs-normal biological signal --
+    reframes part of the Slide_ID leakage problem as a feature, not purely a bug: with
+    5 slides split 3 tumor (CRC_*) / 2 normal (Normal_*), one patient each, tumor status
+    is confounded 1:1 with Slide_ID, so some of the Slide_ID leakage measured elsewhere
+    in this pipeline (evaluate_latent_leakage) is plausibly real, desired biology, not a
+    technical artifact to suppress.
+
+    Two checks, both genuinely slide-disjoint (a slide's own patches never appear in
+    both the fit set and the set they're evaluated on -- unlike a naive pooled
+    cross_val_score, which would let a slide's patches leak across CV folds):
+
+      - train_loso_acc: leave-one-TRAINING-slide-out, via sklearn's LeaveOneGroupOut so
+        it works regardless of how many tumor/normal slides happen to be in the
+        training pool for this particular held-out fold. Genuinely discriminative:
+        does the classifier correctly separate tumor from normal on a training slide
+        it wasn't fit on? Some folds are degenerate (e.g. holding a fold's training
+        slides down to a single class when the removed slide was the only one of its
+        class) -- those are skipped, not silently included; `n_valid_folds` reports how
+        many contributed.
+
+      - held_out_acc: fits on ALL training-slide patches (real tumor/normal labels),
+        predicts on the TRUE held-out slide's patches (never seen at any stage) --
+        genuine zero-shot generalization to a 5th, entirely unseen patient. Since the
+        held-out slide's true label is CONSTANT (one slide = one class), this is "what
+        fraction of its patches got classified as its own known true label", not a
+        two-sided discriminative accuracy the way train_loso_acc is -- read the two
+        together, not `held_out_acc` alone.
+    """
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import LeaveOneGroupOut
+
+    if torch.is_tensor(z_train):
+        z_train = z_train.detach().cpu().numpy()
+    if torch.is_tensor(z_held):
+        z_held = z_held.detach().cpu().numpy()
+
+    groups = np.asarray(train_slide_name)
+    y_train = np.array([1 if str(s).startswith(tumor_prefix) else 0 for s in train_slide_name])
+    y_held = np.array([1 if str(s).startswith(tumor_prefix) else 0 for s in held_slide_name])
+
+    fold_scores = []
+    if len(np.unique(groups)) >= 2:
+        for tr_idx, te_idx in LeaveOneGroupOut().split(z_train, y_train, groups=groups):
+            if len(np.unique(y_train[tr_idx])) < 2:
+                continue  # degenerate fold: training portion left with only one class
+            clf_fold = LogisticRegression(max_iter=max_iter)
+            clf_fold.fit(z_train[tr_idx], y_train[tr_idx])
+            fold_scores.append(clf_fold.score(z_train[te_idx], y_train[te_idx]))
+    train_loso_acc = float(np.mean(fold_scores)) if fold_scores else None
+
+    held_out_acc = None
+    if len(y_held) and len(np.unique(y_train)) >= 2:
+        clf = LogisticRegression(max_iter=max_iter)
+        clf.fit(z_train, y_train)
+        held_out_acc = float((clf.predict(z_held) == y_held).mean())
+
+    return {
+        "train_loso_acc": train_loso_acc,
+        "n_valid_folds": len(fold_scores),
+        "held_out_acc": held_out_acc,
+        "held_out_true_label": int(y_held[0]) if len(y_held) else None,
+    }
+
+
 def pretrain_hist_once(model_kwargs, hist_emb_all, patch_meta, pretrain_kwargs, device="cuda"):
     """
     Runs `pretrain_hist_autoencoder` exactly ONCE on a throwaway model built from
@@ -1790,6 +1857,26 @@ def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans
         print(f"  held-out spatial autocorr (mean |Moran's I|) -- trans: {moran_trans['moran_mean_I']:.4f} | "
               f"hist: {moran_hist['moran_mean_I']:.4f} | joint: {moran_joint['moran_mean_I']:.4f}")
 
+    # Tumor-vs-normal signal -- the flip side of the leakage checks above: this dataset's
+    # 5 slides are 3 tumor (CRC_*) / 2 normal (Normal_*), 1 patient each, so tumor status
+    # is confounded 1:1 with Slide_ID. Some of the Slide_ID leakage measured above is
+    # plausibly this real, desired biological signal rather than a technical artifact --
+    # this checks that directly, on trans/hist/joint, both within the training pool
+    # (slide-disjoint) and as a genuine zero-shot check on the held-out slide.
+    disease_trans = evaluate_disease_signal(train_eval["z_trans_patch"], train_slide_name,
+                                             held_eval["z_trans_patch"], held_slide_name)
+    disease_hist = evaluate_disease_signal(train_eval["z_hist_patch"], train_slide_name,
+                                            held_eval["z_hist_patch"], held_slide_name)
+    disease_joint = evaluate_disease_signal(train_eval["z_joint_patch"], train_slide_name,
+                                             held_eval["z_joint_patch"], held_slide_name)
+    if verbose:
+        print(f"  train-slide-disjoint tumor/normal accuracy ({disease_trans['n_valid_folds']} valid folds) -- "
+              f"trans: {disease_trans['train_loso_acc']} | hist: {disease_hist['train_loso_acc']} | "
+              f"joint: {disease_joint['train_loso_acc']}")
+        print(f"  held-out ({held_out_slide}, true label={disease_trans['held_out_true_label']}) tumor/normal "
+              f"accuracy -- trans: {disease_trans['held_out_acc']} | hist: {disease_hist['held_out_acc']} | "
+              f"joint: {disease_joint['held_out_acc']}")
+
     metrics = {
         "run_id": f"loso_{held_out_slide}{run_tag}",
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -1818,6 +1905,14 @@ def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans
         "held_out_moran_mean_I_trans": moran_trans["moran_mean_I"],
         "held_out_moran_mean_I_hist": moran_hist["moran_mean_I"],
         "held_out_moran_mean_I_joint": moran_joint["moran_mean_I"],
+        "train_loso_disease_acc_trans": disease_trans["train_loso_acc"],
+        "train_loso_disease_acc_hist": disease_hist["train_loso_acc"],
+        "train_loso_disease_acc_joint": disease_joint["train_loso_acc"],
+        "train_loso_disease_n_valid_folds": disease_trans["n_valid_folds"],
+        "held_out_disease_acc_trans": disease_trans["held_out_acc"],
+        "held_out_disease_acc_hist": disease_hist["held_out_acc"],
+        "held_out_disease_acc_joint": disease_joint["held_out_acc"],
+        "held_out_disease_true_label": disease_trans["held_out_true_label"],
     }
 
     if log_path is not None:
