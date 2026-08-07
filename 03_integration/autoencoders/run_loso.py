@@ -239,3 +239,7 @@ def run_it():
     #     log_path=log_path, checkpoint_dir=checkpoint_dir, seed=0, verbose=True,
     # )
     # print(results_df[["held_out_slide", "train_top1_retrieval", "held_out_top1_retrieval"]])
+
+
+if __name__ == "__main__":
+    run_it()
