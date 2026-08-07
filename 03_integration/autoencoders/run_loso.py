@@ -214,6 +214,12 @@ def run_it():
           f"joint: {metrics['combined_joint_leakage_mean']:.4f} (chance = {metrics['combined_leakage_chance']:.4f})")
     print(f"Held-out spatial autocorr (mean |Moran's I|) -- trans: {metrics['held_out_moran_mean_I_trans']:.4f} | "
           f"hist: {metrics['held_out_moran_mean_I_hist']:.4f} | joint: {metrics['held_out_moran_mean_I_joint']:.4f}")
+    print(f"Train-slide-disjoint tumor/normal acc ({metrics['train_loso_disease_n_valid_folds']} valid folds) -- "
+          f"trans: {metrics['train_loso_disease_acc_trans']} | hist: {metrics['train_loso_disease_acc_hist']} | "
+          f"joint: {metrics['train_loso_disease_acc_joint']}")
+    print(f"Held-out ({HELD_OUT_SLIDE}, true label={metrics['held_out_disease_true_label']}) tumor/normal acc -- "
+          f"trans: {metrics['held_out_disease_acc_trans']} | hist: {metrics['held_out_disease_acc_hist']} | "
+          f"joint: {metrics['held_out_disease_acc_joint']}")
     print(f"\nFull results logged to {log_path}")
     print(f"Patch embeddings (trans/hist/joint, train + held-out) saved to {checkpoint_dir / f'loso_{HELD_OUT_SLIDE}{RUN_TAG}_embeddings.npz'}")
 
