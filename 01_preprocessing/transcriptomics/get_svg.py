@@ -9,6 +9,7 @@ from pathlib import Path
 import pickle
 import scanpy as sc
 import squidpy as sq
+import sys
 
 from csbdeep.utils import normalize
 from matplotlib.colors import ListedColormap
@@ -16,6 +17,9 @@ from scipy import sparse
 from shapely.geometry import Polygon, Point
 from stardist.models import StarDist2D
 from tifffile import imread, imwrite
+
+sys.path.insert(0, str(Path("../..").resolve()))
+from functions.merge import read_h5ad_with_null_uns_healing, sanitize_uns
 
 
 ###############################################################
@@ -52,7 +56,11 @@ dir_custom_binning.mkdir(parents=True, exist_ok=True)
 
 # load files
 nuclei_geometry = gpd.read_parquet(dir_custom_binning / "nuclei_geometry.parquet")
-count_area_filtered_adata = sc.read_h5ad(dir_custom_binning / "count_area_filtered_adata.h5ad")
+# read_h5ad_with_null_uns_healing instead of a plain sc.read_h5ad: this is the
+# exact file type that broke merge_anndatas with an unreadable null-encoded
+# uns entry (see functions/merge.py) -- auto-heals in place if this particular
+# file predates the write-side sanitize_uns fix below.
+count_area_filtered_adata = read_h5ad_with_null_uns_healing(dir_custom_binning / "count_area_filtered_adata.h5ad")
 count_area_filtered_adata.var_names_make_unique()
 
 # get centroids if they dont exist yet
@@ -114,5 +122,14 @@ count_area_filtered_adata.var['spatially_variable'] = (
     (count_area_filtered_adata.var['moranI'] > 0.1)   # adjust threshold based on I distr.
 )
 print(count_area_filtered_adata.var['spatially_variable'].sum(), "spatially variable genes for person ", sample)
+
+# sq.gr.spatial_neighbors (delaunay=True, no radius) leaves uns['spatial_neighbors']['params']
+# with None values (e.g. 'radius', 'transform') that newer anndata writes as a "null"-encoded
+# entry older anndata versions can't read back -- strip those before saving so this file stays
+# readable regardless of which environment reads it later (see functions/merge.py:sanitize_uns).
+stray_nones = sanitize_uns(count_area_filtered_adata)
+if stray_nones:
+    print("Sanitized stray null uns entries before saving:", stray_nones)
+
 count_area_filtered_adata.write(dir_result_output / "custom_binning/count_area_filtered_adata_test_svg.h5ad")
 print("unique var_names in count_area_filtered_adata: ", count_area_filtered_adata.var_names.is_unique)
