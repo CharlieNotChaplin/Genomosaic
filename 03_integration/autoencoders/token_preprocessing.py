@@ -1,0 +1,229 @@
+"""
+Distills the raw per-patch ViT token grid (256 tokens x 1536-dim per 224px
+patch, ~9GB/slide) down to two compact, per-CELL feature vectors:
+
+  - footprint: area-weighted average of the token embeddings overlapping a
+    cell's segmented nucleus polygon.
+  - halo: area-weighted average of the token embeddings overlapping a small
+    ring around the nucleus (nucleus dilated by `halo_px`, minus the nucleus
+    itself) -- captures immediate membrane/cytoplasm/microenvironment context
+    that StarDist's nuclear-only segmentation misses.
+
+Kept as two separate vectors (rather than one blended average) so the model
+can treat "this cell's own tissue" and "immediately around this cell" as
+distinct signals -- see conversation notes (TRIPLEX's target/neighbor split).
+
+Why per-cell distillation at all: the raw token file is one row per token
+(256/patch), which is only tractable to keep on disk per-slide. Once every
+cell has been resolved to its own footprint+halo vector, the result is one
+row per CELL (same order of magnitude as the existing transcriptomics/SVG
+data), cheap enough to load whole across every slide at once.
+
+Coordinate system: cell centroids (`trans_adata.obsm['spatial']`), nucleus
+polygons (`nuclei_geometry.parquet`), and token positions (`Token_X`/`Token_Y`
+in the token h5ad) all live in the same per-slide WSI pixel space -- verified
+directly against this project's data (see conversation notes). Patch linkage
+uses the existing `Patch_ID` string (e.g. "patch_123.png"), which is shared
+between the transcriptomics obs and the token obs for a given slide.
+
+Usage:
+    python token_preprocessing.py --slide CRC_P1
+"""
+import argparse
+from pathlib import Path
+
+import anndata as ad
+import geopandas as gpd
+import h5py
+import numpy as np
+import pandas as pd
+from shapely.geometry import box as shapely_box
+
+TOKEN_SIZE_PX = 14.0
+TOKENS_PER_SIDE = 16
+
+
+def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_tokens=1):
+    """Bounding-box prefilter: which (col, row) token grid cells could possibly
+    overlap a region with these pixel bounds, given the patch's token-grid
+    origin. `margin_tokens` pads by extra token-widths to be safe against
+    off-by-one rounding at the boundary -- cheap (a handful of extra shapely
+    intersection checks that will just come back as zero-area)."""
+    col_lo = int(np.floor((minx - origin_x) / TOKEN_SIZE_PX)) - margin_tokens
+    col_hi = int(np.floor((maxx - origin_x) / TOKEN_SIZE_PX)) + margin_tokens
+    row_lo = int(np.floor((miny - origin_y) / TOKEN_SIZE_PX)) - margin_tokens
+    row_hi = int(np.floor((maxy - origin_y) / TOKEN_SIZE_PX)) + margin_tokens
+    col_lo, col_hi = max(0, col_lo), min(TOKENS_PER_SIDE - 1, col_hi)
+    row_lo, row_hi = max(0, row_lo), min(TOKENS_PER_SIDE - 1, row_hi)
+    return col_lo, col_hi, row_lo, row_hi
+
+
+def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad_path,
+                                 patch_col="Patch_ID", halo_px=6.0, margin_tokens=1,
+                                 verbose=True):
+    """
+    Returns (footprint, halo, matched), each row-aligned to
+    `trans_adata_slide.obs_names`:
+      footprint: (n_cells, token_dim) float32 -- area-weighted tokens under the nucleus
+      halo:      (n_cells, token_dim) float32 -- area-weighted tokens in the halo ring
+      matched:   (n_cells,) bool -- False for cells whose patch has no token data
+                 (e.g. dropped/filtered patch) or whose nucleus id wasn't found
+                 in `nuclei_geom_slide`
+    """
+    f = h5py.File(token_h5ad_path, "r")
+    token_patch_codes = f["obs/Patch_ID/codes"][:]
+    token_patch_cats = f["obs/Patch_ID/categories"].asstr()[:]
+    token_X = f["obs/Token_X"][:]
+    token_Y = f["obs/Token_Y"][:]
+    token_dim = f["X"].shape[1]
+
+    # tokens are stored contiguously per patch (verified against this project's
+    # files) -- group into contiguous row-ranges so each patch's 256 tokens are
+    # read from disk with a single slice, not 256 individual row reads
+    order = np.argsort(token_patch_codes, kind="stable")
+    sorted_codes = token_patch_codes[order]
+    uniq_codes, start_idx = np.unique(sorted_codes, return_index=True)
+    groups = np.split(order, start_idx[1:])
+    patch_token_rows = {}
+    for code, g in zip(uniq_codes, groups):
+        g_sorted = np.sort(g)
+        assert g_sorted[-1] - g_sorted[0] + 1 == len(g_sorted), \
+            f"token rows for patch {token_patch_cats[code]} aren't contiguous -- distillation assumes they are"
+        patch_token_rows[token_patch_cats[code]] = (int(g_sorted[0]), int(g_sorted[-1]) + 1)
+
+    nuclei = nuclei_geom_slide.set_index(nuclei_geom_slide["id"].astype(str))["geometry"]
+
+    cell_ids = trans_adata_slide.obs["id"].astype(str).values
+    patch_ids = trans_adata_slide.obs[patch_col].astype(str).values
+    n_cells = len(cell_ids)
+
+    footprint = np.zeros((n_cells, token_dim), dtype=np.float32)
+    halo = np.zeros((n_cells, token_dim), dtype=np.float32)
+    matched = np.zeros(n_cells, dtype=bool)
+
+    cell_idx_by_patch = pd.Series(np.arange(n_cells)).groupby(patch_ids).apply(lambda s: s.values).to_dict()
+
+    n_patches = len(cell_idx_by_patch)
+    for pi, (patch_id, cell_rows) in enumerate(cell_idx_by_patch.items()):
+        if verbose and pi % 2000 == 0:
+            print(f"  [token distillation] patch {pi}/{n_patches}")
+
+        row_range = patch_token_rows.get(patch_id)
+        if row_range is None:
+            continue  # this patch has no token data
+
+        lo, hi = row_range
+        tok_x = token_X[lo:hi]
+        tok_y = token_Y[lo:hi]
+        tok_emb = f["X"][lo:hi].astype(np.float32)
+        origin_x, origin_y = tok_x.min(), tok_y.min()
+        tok_col = np.round((tok_x - origin_x) / TOKEN_SIZE_PX).astype(int)
+        tok_row = np.round((tok_y - origin_y) / TOKEN_SIZE_PX).astype(int)
+
+        for ci in cell_rows:
+            cid = cell_ids[ci]
+            if cid not in nuclei.index:
+                continue
+            geom = nuclei.loc[cid]
+            if geom is None or geom.is_empty:
+                continue
+
+            halo_poly = geom.buffer(halo_px)
+            halo_ring = halo_poly.difference(geom)
+
+            minx, miny, maxx, maxy = halo_poly.bounds
+            col_lo, col_hi, row_lo, row_hi = _candidate_token_range(
+                minx, miny, maxx, maxy, origin_x, origin_y, margin_tokens
+            )
+            cand = np.nonzero(
+                (tok_col >= col_lo) & (tok_col <= col_hi) & (tok_row >= row_lo) & (tok_row <= row_hi)
+            )[0]
+            if len(cand) == 0:
+                continue
+            matched[ci] = True
+
+            fw = np.empty(len(cand))
+            hw = np.empty(len(cand))
+            for j, ti in enumerate(cand):
+                tbox = shapely_box(tok_x[ti], tok_y[ti], tok_x[ti] + TOKEN_SIZE_PX, tok_y[ti] + TOKEN_SIZE_PX)
+                fw[j] = tbox.intersection(geom).area
+                hw[j] = tbox.intersection(halo_ring).area
+
+            if fw.sum() > 0:
+                w = fw / fw.sum()
+                footprint[ci] = (tok_emb[cand] * w[:, None]).sum(axis=0)
+            else:
+                # fallback: nucleus fell entirely between candidate token boxes
+                # (shouldn't happen given the margin, but stay defensive) --
+                # use the single nearest token by center distance
+                cx, cy = geom.centroid.x, geom.centroid.y
+                d2 = (tok_x[cand] + TOKEN_SIZE_PX / 2 - cx) ** 2 + (tok_y[cand] + TOKEN_SIZE_PX / 2 - cy) ** 2
+                footprint[ci] = tok_emb[cand[np.argmin(d2)]]
+
+            if hw.sum() > 0:
+                w = hw / hw.sum()
+                halo[ci] = (tok_emb[cand] * w[:, None]).sum(axis=0)
+            else:
+                # ring fully covered by the footprint itself (dense tissue) --
+                # neutral fallback rather than an artificial zero vector
+                halo[ci] = footprint[ci]
+
+    f.close()
+    return footprint, halo, matched
+
+
+def run(slide, basedir=Path("../../data"), halo_px=6.0, out_name="cell_token_embeddings.h5ad",
+        token_filename="WSI_patch_token_embeddings_filtered.h5ad"):
+    trans_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/count_area_filtered_adata.h5ad"
+    nuclei_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/nuclei_geometry.parquet"
+    token_path = basedir / slide / "01_preprocessing/unimodel/metadata" / token_filename
+    out_path = basedir / slide / "01_preprocessing/unimodel/metadata" / out_name
+
+    print(f"[{slide}] loading transcriptomics (backed) + nuclei geometry...")
+    trans_adata = ad.read_h5ad(trans_path, backed="r")
+    trans_slide = trans_adata[trans_adata.obs["Slide_ID"] == slide].to_memory()
+
+    nuclei = gpd.read_parquet(nuclei_path)
+    if "Slide_ID" in nuclei.columns:
+        nuclei = nuclei[nuclei["Slide_ID"] == slide]
+
+    print(f"[{slide}] {trans_slide.n_obs} cells, {len(nuclei)} nucleus polygons, "
+          f"distilling from {token_path.name} (halo_px={halo_px})...")
+    footprint, halo, matched = compute_cell_token_features(
+        trans_slide, nuclei, token_path, halo_px=halo_px,
+    )
+    print(f"[{slide}] matched {matched.sum()}/{len(matched)} cells to token data "
+          f"({matched.mean():.1%})")
+
+    # X left empty (0 vars) -- footprint/halo live in obsm only, so neither is
+    # stored twice (an earlier version of this script set X=footprint AND
+    # obsm["X_token_footprint"]=footprint, silently doubling the footprint
+    # array's storage for no reason).
+    out = ad.AnnData(
+        X=np.empty((len(matched), 0), dtype=np.float32),
+        obs=pd.DataFrame({
+            "Slide_ID": trans_slide.obs["Slide_ID"].values,
+            "Patch_ID": trans_slide.obs["Patch_ID"].values,
+            "id": trans_slide.obs["id"].values,
+            "matched": matched,
+        }, index=trans_slide.obs_names),
+    )
+    out.obsm["X_token_footprint"] = footprint
+    out.obsm["X_token_halo"] = halo
+    out.uns["halo_px"] = halo_px
+    out.uns["token_size_px"] = TOKEN_SIZE_PX
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.write_h5ad(out_path)
+    print(f"[{slide}] wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--slide", required=True, help="Slide_ID, e.g. CRC_P1")
+    parser.add_argument("--halo-px", type=float, default=6.0,
+                         help="halo ring dilation in pixels (kept well under the ~19px "
+                              "10th-percentile nearest-cell spacing measured for this dataset)")
+    parser.add_argument("--basedir", type=Path, default=Path("../../data"))
+    args = parser.parse_args()
+    run(args.slide, basedir=args.basedir, halo_px=args.halo_px)
