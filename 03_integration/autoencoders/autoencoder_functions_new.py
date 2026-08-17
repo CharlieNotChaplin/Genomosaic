@@ -173,8 +173,28 @@ class ProjectionHead(nn.Module):
 class DualAutoencoder(nn.Module):
     def __init__(self, n_svg, hist_dim, latent_dim=64, proj_dim=32, n_slides=5,
                  pool_type="attention", encoder_type="sage", transconv_heads=4,
-                 hist_condition_on_slide=True):
+                 hist_condition_on_slide=True, token_dim=None, token_hidden=(512, 128),
+                 token_condition_on_slide=True):
         """
+        token_dim: dimensionality of the per-cell local histology token feature
+            (footprint+halo area-weighted ViT token embedding, see
+            `token_preprocessing.py`). None (default) builds the model exactly as
+            before -- no token branch at all -- so existing checkpoints/pipelines
+            (`autoencoder.ipynb`) are unaffected. Passing a value adds a THIRD,
+            structurally independent branch (`token_enc`/`token_dec`/`proj_token`),
+            mirroring `hist_enc`/`hist_dec`/`proj_hist` exactly, plus a dedicated
+            `proj_trans_local` -- kept separate from `proj_trans` so the cell-level
+            (trans vs. token) and patch-level (pooled-trans vs. hist) contrastive
+            objectives don't have to share one projection subspace for two
+            different alignment targets (same reasoning as `proj_trans`/`proj_hist`
+            being separate from each other, see `ProjectionHead` docstring).
+
+            Token embeddings are per-CELL, not per-patch -- there is no pooling
+            step and no broadcast, since footprint/halo aggregation already makes
+            the token<->cell correspondence close to genuinely one-to-one (see
+            conversation notes: median nucleus diameter ~21px vs. 14px tokens,
+            ~27px median cell-cell spacing).
+
         hist_condition_on_slide: whether `hist_dec` also gets the slide one-hot
             concatenated onto z before decoding. DEFAULT TRUE, reversed from an
             earlier default of False.
@@ -211,6 +231,19 @@ class DualAutoencoder(nn.Module):
 
         self.pool_type = pool_type
         self.pool = AttentionPool(latent_dim) if pool_type == "attention" else None
+
+        self.token_dim = token_dim
+        if token_dim is not None:
+            self.token_enc = MLPEncoder(token_dim, list(token_hidden), latent_dim)
+            self.token_dec = MLPDecoder(latent_dim, list(token_hidden)[::-1], token_dim, n_slides,
+                                         condition_on_slide=token_condition_on_slide)
+            self.proj_token = ProjectionHead(latent_dim, proj_dim)
+            self.proj_trans_local = ProjectionHead(latent_dim, proj_dim)
+        else:
+            self.token_enc = None
+            self.token_dec = None
+            self.proj_token = None
+            self.proj_trans_local = None
 
 
 ################### functions
@@ -537,8 +570,33 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
     })
 
     return meta_tensors, meta_df
- 
- 
+
+
+def build_cell_meta(cell_xy, slide_codes, neighbor_radius=None):
+    """
+    CELL-level analogue of `compute_patch_metadata`, for the token branch's
+    cell<->token contrastive term. Deliberately minimal compared to the patch
+    version -- there's no pooling/weighting/dedup step to do at the cell level,
+    since (unlike patches) every row here already IS the unit the loss operates
+    on, one-to-one, with no broadcast.
+
+    `cell_xy`/`slide_codes` must be row-aligned with `data.x` (i.e. the same
+    order as `X_svg`/`trans_sub`), since `train_step` indexes into these tensors
+    using `batch.n_id` (global node ids) directly.
+
+    neighbor_radius: same role as `patch_meta["neighbor_radius"]`, but should be
+    MUCH smaller here -- patches are 224px, cells are tens of px apart (median
+    nearest-cell spacing ~27px in this dataset). A radius on that order (e.g.
+    40-50px) excludes only genuinely adjacent cells from the negative set,
+    rather than the whole local neighborhood.
+    """
+    return {
+        "xy": torch.tensor(np.asarray(cell_xy), dtype=torch.float32),
+        "slide_id": torch.tensor(np.asarray(slide_codes), dtype=torch.long),
+        "neighbor_radius": neighbor_radius,
+    }
+
+
 def build_pyg_data(X_svg, conn, patch_row_trans, slide_codes):
     edge_index = torch.tensor(np.vstack(conn.tocoo().nonzero()), dtype=torch.long)
     data = Data(
@@ -718,15 +776,35 @@ def segment_softmax(scores, index, num_segments):
 # ---- loss ----
  
 def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
-                         neighbor_radius=None, weight=None):
+                         neighbor_radius=None, weight=None, anchor_sim_threshold=None):
     """
     One-to-one patch-level InfoNCE (post-pooling: each row is a genuine patch, not
     a cell). Optionally:
       - excludes spatially close, non-matching patches from the negative set
         (`neighbor_radius`) instead of forcing them apart -- nearby tissue can be
         genuinely similar in both modalities under spatial autocorrelation.
+      - excludes TRANSCRIPTOMICALLY near-duplicate, non-matching patches from the
+        negative set (`anchor_sim_threshold`) -- the same false-negative problem
+        as `neighbor_radius`, but for patches that are biologically alike (e.g.
+        two separate tumor nests of the same subtype) rather than spatially close.
+        Without this, InfoNCE still tries to push `p_trans[i]` and `p_hist[j]`
+        apart whenever `p_trans[i]` and `p_trans[j]` are already near-identical,
+        even though there's no way to satisfy that without the model inventing
+        some spurious, non-biological distinguishing signal (staining/scan
+        artifacts, slide identity) purely as a tie-breaker -- exactly the kind of
+        shortcut the rest of this pipeline's leakage-fighting machinery exists to
+        avoid. Gated on `p_trans`-vs-`p_trans` similarity specifically (not
+        `p_hist`-vs-`p_hist`) so the exclusion doesn't depend on the histology
+        branch already having converged to agree -- it's most needed exactly
+        when it hasn't yet. `p_trans` is assumed L2-normalized (true for
+        `ProjectionHead`'s output), so this is a plain cosine-similarity cutoff
+        in [-1, 1]; e.g. 0.9 excludes only near-duplicates, not merely similar
+        patches. Masking-only (never an added attractive term) -- excluded pairs
+        become "don't care" for this loss, not a forced match, so genuinely
+        divergent cases (same expression, different morphology) remain free to
+        stay divergent rather than being pulled together.
       - applies inverse-frequency weighting per patch (`weight`).
- 
+
     MULTI-SLIDE NOTE: if a batch mixes patches from more than one slide, pass
     `slide_ids` (int tensor, one per patch, same order as `centroids`). Raw
     spatial coordinates aren't comparable across slides -- two different slides
@@ -735,7 +813,9 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
     Without `slide_ids`, the neighbor mask would incorrectly treat that
     coincidence as a reason to exclude a perfectly good negative. When
     `slide_ids` is given, masking additionally requires both patches to be on
-    the same slide.
+    the same slide -- this applies to `anchor_sim_threshold` too, for the same
+    reason (in practice a no-op with slide-stratified batches, kept as the same
+    defensive backstop as the other two masks).
     """
     logits = p_trans @ p_hist.T / temperature  # (P, P)
     P = logits.shape[0]
@@ -760,7 +840,16 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
             neighbor_mask = neighbor_mask & same_slide
         neighbor_mask.fill_diagonal_(False)  # never mask out the true positive
         logits = logits.masked_fill(neighbor_mask, float("-inf"))
- 
+
+    if anchor_sim_threshold is not None:
+        anchor_sim = p_trans @ p_trans.T  # cosine sim, p_trans is L2-normalized
+        false_neg_mask = anchor_sim > anchor_sim_threshold
+        if slide_ids is not None:
+            same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
+            false_neg_mask = false_neg_mask & same_slide
+        false_neg_mask.fill_diagonal_(False)  # never mask out the true positive
+        logits = logits.masked_fill(false_neg_mask, float("-inf"))
+
     idx = torch.arange(P, device=device)
  
     log_prob_t2h = logits - torch.logsumexp(logits, dim=1, keepdim=True)
@@ -972,10 +1061,148 @@ def freeze_hist_encoder(model, freeze_decoder=True):
         model.hist_dec.eval()
 
 
+def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batch_size=1024,
+                                lr=1e-3, weight_decay=1e-5, val_frac=0.1, patience=15,
+                                device="cuda", verbose=True, seed=0):
+    """
+    Phase-1 pretraining for the token branch (`token_enc`/`token_dec`) -- CELL-level
+    analogue of `pretrain_hist_autoencoder`, same rationale and same recipe (pure
+    MSE, AdamW+weight_decay, ReduceLROnPlateau, held-out val split, early stopping,
+    restore best checkpoint). Batched over CELLS via `cell_meta["slide_id"]`
+    instead of over patches via `patch_meta["slide_id"]` -- everything else is
+    identical in structure.
+
+    Requires `model.token_enc`/`model.token_dec` to exist, i.e. `DualAutoencoder`
+    was constructed with `token_dim` set.
+
+    Meant to run BEFORE `train()`, alongside (order doesn't matter relative to)
+    `pretrain_hist_autoencoder`. Follow with `freeze_token_encoder(model)` and
+    `train(..., freeze_token=True)` for the joint phase.
+    """
+    import copy
+
+    if model.token_enc is None:
+        raise ValueError("model has no token branch (token_dim was None) -- nothing to pretrain")
+
+    model.to(device)
+    opt = torch.optim.AdamW(
+        list(model.token_enc.parameters()) + list(model.token_dec.parameters()),
+        lr=lr, weight_decay=weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=5)
+
+    token_emb_all = token_emb_all.to(device)
+    slide_id = cell_meta["slide_id"].to(device)
+    N = token_emb_all.shape[0]
+
+    n_val = max(1, int(N * val_frac))
+    perm = torch.randperm(N, generator=torch.Generator().manual_seed(seed))
+    val_idx = perm[:n_val]
+    train_idx = perm[n_val:]
+
+    best_val = float("inf")
+    best_state = None
+    epochs_no_improve = 0
+
+    for epoch in range(epochs):
+        model.token_enc.train()
+        model.token_dec.train()
+        train_perm = train_idx[torch.randperm(len(train_idx))]
+        tot_recon, nb = 0.0, 0
+        for start in range(0, len(train_perm), batch_size):
+            idx = train_perm[start:start + batch_size]
+            x = token_emb_all[idx]
+            sid = slide_id[idx]
+            z = model.token_enc(x)
+            recon = model.token_dec(z, slide_code=sid)
+            loss = F.mse_loss(recon, x)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            tot_recon += loss.item() * len(idx)
+            nb += len(idx)
+        train_loss = tot_recon / nb
+
+        model.token_enc.eval()
+        model.token_dec.eval()
+        with torch.no_grad():
+            x = token_emb_all[val_idx]
+            sid = slide_id[val_idx]
+            z = model.token_enc(x)
+            recon = model.token_dec(z, slide_code=sid)
+            val_loss = F.mse_loss(recon, x).item()
+        scheduler.step(val_loss)
+
+        if verbose and (epoch % 5 == 0 or epoch == epochs - 1):
+            print(f"[token pretrain] epoch {epoch:4d} | train MSE {train_loss:.5f} | "
+                  f"val MSE {val_loss:.5f} | lr {opt.param_groups[0]['lr']:.2e}")
+
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            best_state = {
+                "token_enc": copy.deepcopy(model.token_enc.state_dict()),
+                "token_dec": copy.deepcopy(model.token_dec.state_dict()),
+            }
+            epochs_no_improve = 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                if verbose:
+                    print(f"[token pretrain] early stopping at epoch {epoch} (best val MSE {best_val:.5f})")
+                break
+
+    if best_state is not None:
+        model.token_enc.load_state_dict(best_state["token_enc"])
+        model.token_dec.load_state_dict(best_state["token_dec"])
+        if verbose:
+            print(f"[token pretrain] restored best checkpoint (val MSE {best_val:.5f})")
+
+    return {"best_val_mse": best_val, "stopped_epoch": epoch}
+
+
+def freeze_token_encoder(model, freeze_decoder=True):
+    """
+    Freezes `token_enc` (and, by default, `token_dec`) in place -- CELL-level
+    analogue of `freeze_hist_encoder`, same mechanism (requires_grad=False +
+    .eval() for BatchNorm). Call after `pretrain_token_autoencoder`, before the
+    joint `train(..., freeze_token=True)` phase.
+    """
+    if model.token_enc is None:
+        return
+    for p in model.token_enc.parameters():
+        p.requires_grad_(False)
+    model.token_enc.eval()
+    if freeze_decoder:
+        for p in model.token_dec.parameters():
+            p.requires_grad_(False)
+        model.token_dec.eval()
+
+
 def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
                temperature=0.07, weight_reconstruction=True,
-               freeze_hist=False, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda"):
+               freeze_hist=False, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
+               token_emb_all=None, cell_meta=None, local_contrast_weight=0.0, freeze_token=False,
+               patch_anchor_sim_threshold=None, local_anchor_sim_threshold=None):
     """
+    token_emb_all / cell_meta / local_contrast_weight / freeze_token: the token
+    branch's cell-level analogue of hist_emb_all/patch_meta/contrast_weight/
+    freeze_hist. `token_emb_all` and `cell_meta["xy"]`/`cell_meta["slide_id"]`
+    must be row-aligned with `data.x` (see `build_cell_meta`) -- seed cells are
+    looked up via `batch.n_id[:n_seed]` (PyG's NeighborLoader/`collate_fn` always
+    puts seed nodes first and preserves their global ids in `n_id`, same
+    convention `encode_full_graph_batched` relies on). Left at their defaults
+    (None / 0.0), this reproduces the exact pre-token behavior, including for
+    models built without a token branch at all (`model.token_enc is None`).
+
+    patch_anchor_sim_threshold / local_anchor_sim_threshold: forwarded to
+    `patch_level_infonce`'s `anchor_sim_threshold` for the patch-level and
+    cell-level contrastive calls respectively -- see that function's docstring
+    for the false-negative reasoning. Two separate thresholds (not one shared
+    value) because pooled per-patch expression is smoother/more separable than
+    raw per-cell expression, so the same cosine-similarity cutoff may not be
+    equally meaningful at both scales. Both default to None (off), matching
+    every other new-behavior flag in this file.
+
     edge_dropout_p / gene_dropout_p: denoising-style corruption applied ONLY to what
     `trans_enc` sees -- the reconstruction target (`x[:n_seed]` below) stays the clean,
     uncorrupted input, so this is a proper denoising objective (forces trans_enc to
@@ -1005,6 +1232,12 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
             model.hist_enc.eval()
         if not any(p.requires_grad for p in model.hist_dec.parameters()):
             model.hist_dec.eval()
+    if freeze_token and model.token_enc is not None:
+        # same reasoning as the freeze_hist block above, mirrored for the token branch
+        if not any(p.requires_grad for p in model.token_enc.parameters()):
+            model.token_enc.eval()
+        if not any(p.requires_grad for p in model.token_dec.parameters()):
+            model.token_dec.eval()
     opt.zero_grad()
  
     x = batch.x.to(device)
@@ -1057,9 +1290,37 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
     loss_contrast = patch_level_infonce(
         p_trans_patch, p_hist_patch, centroids, slide_ids=batch_slide_ids,
         temperature=temperature, neighbor_radius=patch_meta["neighbor_radius"], weight=weights,
+        anchor_sim_threshold=patch_anchor_sim_threshold,
     )
 
-    loss = loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast
+    # --- token side: CELL-level local branch, genuinely one-to-one, no pooling ---
+    # Always computed (mirrors loss_recon_hist's unconditional-even-when-frozen
+    # pattern above, kept for logging/monitoring parity) whenever the model has a
+    # token branch and token data was supplied; contributes zero gradient to
+    # token_enc/token_dec once frozen, same as loss_recon_hist does for hist_enc/dec.
+    if model.token_enc is not None and token_emb_all is not None:
+        seed_global_ids = batch.n_id[:n_seed].to(device)
+        token_x = token_emb_all[seed_global_ids]
+        cell_slide_ids = cell_meta["slide_id"][seed_global_ids]
+
+        z_token_cells = model.token_enc(token_x)
+        token_recon = model.token_dec(z_token_cells, slide_code=cell_slide_ids)
+        loss_recon_token = F.mse_loss(token_recon, token_x)
+
+        p_trans_local = model.proj_trans_local(z_cells)
+        p_token = model.proj_token(z_token_cells)
+        cell_xy = cell_meta["xy"][seed_global_ids]
+        loss_contrast_local = patch_level_infonce(
+            p_trans_local, p_token, cell_xy, slide_ids=cell_slide_ids,
+            temperature=temperature, neighbor_radius=cell_meta["neighbor_radius"],
+            anchor_sim_threshold=local_anchor_sim_threshold,
+        )
+    else:
+        loss_recon_token = z_cells.new_tensor(0.0)
+        loss_contrast_local = z_cells.new_tensor(0.0)
+
+    loss = (loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast
+            + loss_recon_token + local_contrast_weight * loss_contrast_local)
     loss.backward()
     opt.step()
 
@@ -1068,14 +1329,43 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         "recon_trans": loss_recon_trans.item(),
         "recon_hist": loss_recon_hist.item(),
         "contrast": loss_contrast.item(),
+        "recon_token": loss_recon_token.item(),
+        "contrast_local": loss_contrast_local.item(),
     }
 
 
 def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5,
           max_contrast_weight=1.0, temperature=0.07,
           weight_reconstruction=True, freeze_hist=False, hist_lr_mult=1.0,
-          weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda"):
+          weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
+          token_emb_all=None, cell_meta=None, max_local_contrast_weight=0.0,
+          local_warmup_epochs=None, freeze_token=False, token_lr_mult=1.0,
+          patch_anchor_sim_threshold=None, local_anchor_sim_threshold=None):
     """
+    token_emb_all / cell_meta: the token branch's cell-level analogue of
+      hist_emb_all/patch_meta, forwarded to `train_step` unchanged (see
+      `build_cell_meta`). Leave both None (default) to train exactly as before,
+      including for models with no token branch at all.
+
+    patch_anchor_sim_threshold / local_anchor_sim_threshold: forwarded to
+      `train_step`/`patch_level_infonce` unchanged -- excludes transcriptomically
+      near-duplicate, non-matching patches/cells from the hard-negative set
+      (cosine-similarity cutoff on `p_trans`/`p_trans_local`, e.g. 0.9), the
+      same false-negative protection `neighbor_radius` already gives spatially
+      close patches, just gated on expression similarity instead of distance.
+      Both default to None (off).
+
+    max_local_contrast_weight / local_warmup_epochs: own ramp schedule for the
+      cell<->token contrastive term, reusing `contrast_weight_schedule` --
+      separate from `max_contrast_weight`/`warmup_epochs` (the patch-level
+      term's) since there's no reason the two should have to share one ramp.
+      `local_warmup_epochs` defaults to `warmup_epochs` if not given.
+
+    freeze_token / token_lr_mult: token-branch analogues of freeze_hist/
+      hist_lr_mult -- same rationale (gentler LR on a branch that already went
+      through its own Phase-1 pretraining, so the contrastive loss doesn't
+      undo it).
+
     freeze_hist: if True, assumes `freeze_hist_encoder(model)` was already called
       (hist_enc/hist_dec requires_grad=False) -- the optimizer here only ever
       collects trainable (requires_grad=True) parameters, so frozen params are
@@ -1108,18 +1398,33 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
     """
     model.to(device)
     hist_param_ids = {id(p) for p in list(model.hist_enc.parameters()) + list(model.hist_dec.parameters())}
+    token_param_ids = set()
+    if model.token_enc is not None:
+        token_param_ids = {id(p) for p in list(model.token_enc.parameters()) + list(model.token_dec.parameters())}
+    special_param_ids = hist_param_ids | token_param_ids
     hist_params = [p for p in model.parameters() if p.requires_grad and id(p) in hist_param_ids]
-    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in hist_param_ids]
+    token_params = [p for p in model.parameters() if p.requires_grad and id(p) in token_param_ids]
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in special_param_ids]
     param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
     if hist_params:
         param_groups.append({"params": hist_params, "lr": lr * hist_lr_mult, "weight_decay": weight_decay})
+    if token_params:
+        param_groups.append({"params": token_params, "lr": lr * token_lr_mult, "weight_decay": weight_decay})
     opt = torch.optim.Adam(param_groups)
     hist_emb_all = hist_emb_all.to(device)
     patch_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
 
+    use_tokens = model.token_enc is not None and token_emb_all is not None
+    if use_tokens:
+        token_emb_all = token_emb_all.to(device)
+        cell_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
+    local_warmup_epochs = local_warmup_epochs if local_warmup_epochs is not None else warmup_epochs
+
     for epoch in range(n_epochs):
         cw = contrast_weight_schedule(epoch, warmup_epochs, max_contrast_weight)
-        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0}
+        lcw = contrast_weight_schedule(epoch, local_warmup_epochs, max_local_contrast_weight) if use_tokens else 0.0
+        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0,
+                        "recon_token": 0.0, "contrast_local": 0.0}
         n_batches = 0
         for batch in loader:
             stats = train_step(model, batch, hist_emb_all, patch_meta, opt, cw,
@@ -1127,12 +1432,17 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
                                 weight_reconstruction=weight_reconstruction,
                                 freeze_hist=freeze_hist,
                                 edge_dropout_p=edge_dropout_p, gene_dropout_p=gene_dropout_p,
-                                device=device)
+                                device=device,
+                                token_emb_all=token_emb_all if use_tokens else None,
+                                cell_meta=cell_meta if use_tokens else None,
+                                local_contrast_weight=lcw, freeze_token=freeze_token,
+                                patch_anchor_sim_threshold=patch_anchor_sim_threshold,
+                                local_anchor_sim_threshold=local_anchor_sim_threshold)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
         epoch_stats = {k: v / n_batches for k, v in epoch_stats.items()}
-        print(f"epoch {epoch:03d} | contrast_w={cw:.2f} | " +
+        print(f"epoch {epoch:03d} | contrast_w={cw:.2f}" + (f" | local_w={lcw:.2f}" if use_tokens else "") + " | " +
               " | ".join(f"{k}={v:.4f}" for k, v in epoch_stats.items()))
  
  
@@ -1225,6 +1535,81 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
             "z_hist_patch": z_patch_hist.cpu().numpy(),
             "z_joint_patch": z_joint_patch.cpu().numpy(),
             "unique_patches": unique_patches.cpu().numpy()}
+
+
+@torch.no_grad()
+def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda",
+                              eval_num_neighbors=(10, 10), eval_batch_size=4096,
+                              max_cells_per_slide=5000, seed=0):
+    """
+    CELL-level analogue of `retrieval_accuracy`, for the token branch.
+
+    Retrieval over the full cell population isn't feasible the way patch-level
+    retrieval is -- an N x N similarity matrix over hundreds of thousands of
+    cells would be 10^11+ entries. Instead this subsamples up to
+    `max_cells_per_slide` cells PER SLIDE and computes top-1 retrieval within
+    each slide's subsample separately (same reasoning as `PatchGroupedLoader`'s
+    slide-stratified batching: pooling cells across slides into one candidate
+    set would let the metric be satisfied by recognizing slide identity rather
+    than genuine cell<->token correspondence).
+
+    Returns full-dataset (unsampled) `z_trans_cell_full`/`z_token_cell_full` for
+    reuse downstream (e.g. `evaluate_latent_leakage`), same convention as
+    `retrieval_accuracy`'s `z_patch_trans_full`.
+    """
+    if model.token_enc is None:
+        raise ValueError("model has no token branch (token_dim was None)")
+
+    model.eval()
+    z_cells_full = encode_full_graph_batched(
+        model.trans_enc, data, device,
+        num_neighbors=eval_num_neighbors, batch_size=eval_batch_size,
+    )
+    token_emb_all = token_emb_all.to(device)
+    slide_id_all = cell_meta["slide_id"].to(device)
+    xy_all = cell_meta["xy"].to(device)
+    neighbor_radius = cell_meta.get("neighbor_radius")
+
+    z_token_full = model.token_enc(token_emb_all)
+
+    rng = np.random.default_rng(seed)
+    results_per_slide = {}
+    all_top1, all_n = [], []
+    for sid in torch.unique(slide_id_all).cpu().numpy():
+        idx = (slide_id_all == int(sid)).nonzero(as_tuple=True)[0]
+        if len(idx) > max_cells_per_slide:
+            perm = torch.tensor(rng.choice(len(idx), size=max_cells_per_slide, replace=False), device=idx.device)
+            idx = idx[perm]
+
+        p_trans_local = model.proj_trans_local(z_cells_full[idx])
+        p_token = model.proj_token(z_token_full[idx])
+        sims = p_trans_local @ p_token.T
+        pred = sims.argmax(dim=1)
+        true_col = torch.arange(len(idx), device=device)
+        top1 = (pred == true_col).float().mean().item()
+
+        neighbor_acc = None
+        if neighbor_radius is not None:
+            xy = xy_all[idx]
+            dist = (xy[pred] - xy).norm(dim=1)
+            neighbor_acc = (dist < neighbor_radius).float().mean().item()
+
+        results_per_slide[int(sid)] = {"top1": top1, "neighbor_tolerant": neighbor_acc, "n": len(idx)}
+        all_top1.append(top1)
+        all_n.append(len(idx))
+
+    mean_top1 = float(np.average(all_top1, weights=all_n))
+    print(f"Cell<->token retrieval, n-weighted mean top-1 across slides: {mean_top1:.3f}")
+    for sid, r in results_per_slide.items():
+        msg = f"  slide {sid}: top1={r['top1']:.3f}"
+        if r["neighbor_tolerant"] is not None:
+            msg += f" | neighbor_tolerant={r['neighbor_tolerant']:.3f}"
+        msg += f" (n={r['n']}, chance={1 / r['n']:.5f})"
+        print(msg)
+
+    return {"mean_top1": mean_top1, "per_slide": results_per_slide,
+            "z_trans_cell_full": z_cells_full.cpu().numpy(),
+            "z_token_cell_full": z_token_full.cpu().numpy()}
 
 
 # ---- experiment harness: reproducible sweeps with a persistent, inspectable log ----
