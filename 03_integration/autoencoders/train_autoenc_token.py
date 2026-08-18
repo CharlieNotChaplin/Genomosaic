@@ -201,11 +201,12 @@ keep_mask, patch_row_trans, hist_emb = build_pairing(f_trans_adata, f_hist_adata
 
 # 3b. token pairing: further restrict keep_mask to cells that also have token data
 if CONFIG["use_tokens"]:
+    # Index.isin() already returns a plain ndarray, not a Series -- no .values needed
     has_token = f_trans_adata.obs_names.isin(f_token_adata.obs_names)
-    n_dropped = int(keep_mask.sum() - (keep_mask & has_token.values).sum())
+    n_dropped = int(keep_mask.sum() - (keep_mask & has_token).sum())
     if n_dropped:
         print(f"  dropping {n_dropped} cells with a hist-patch match but no token match")
-    keep_mask = keep_mask & has_token.values
+    keep_mask = keep_mask & has_token
 
 trans_sub = f_trans_adata[keep_mask].copy()
 conn_sub = conn[keep_mask][:, keep_mask]
