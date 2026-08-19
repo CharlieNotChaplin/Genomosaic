@@ -101,12 +101,30 @@ CONFIG = dict(
     token_lr_mult=1.0,
     freeze_token=True,
 
-    local_neighbor_radius=50,           # px -- cell-level analogue of neighbor_radius (2912 for
+    local_neighbor_radius=100,          # px -- cell-level analogue of neighbor_radius (2912 for
                                          # patches). Median nearest-cell spacing measured ~27px in
-                                         # this dataset, so this excludes only genuinely adjacent
-                                         # cells from the negative set, not the whole neighborhood.
+                                         # this dataset. Was 50 (~1.85x spacing) -- too small: cells
+                                         # a few widths apart (still very likely the same local
+                                         # tissue/cell-type) were still treated as hard negatives,
+                                         # producing a fine checkerboard-like alternation in the
+                                         # resulting clusters (see conversation notes). 100 (~3.7x
+                                         # spacing) is a first attempt at giving more room before
+                                         # anything gets pushed apart -- worth iterating on.
     max_local_contrast_weight=0.5,
     local_warmup_epochs=5,
+
+    # skip Phase 1a (histology-patch pretraining) entirely -- with
+    # max_contrast_weight=0.0 above, the patch-level trans<->hist alignment
+    # never trains anyway, so hist_enc/hist_dec/pool/proj_trans/proj_hist never
+    # receive any gradient in Phase 3 either (their only path is
+    # contrast_weight * loss_contrast, which is always zero) -- X_dae_hist_patch
+    # would be a real pretrained-but-unaligned embedding either way, but
+    # X_dae_trans_patch (pool output) is already untrained noise regardless of
+    # whether Phase 1a runs. Skipping it saves a real, dedicated
+    # hist_pretrain_epochs-epoch training loop for output nothing here uses.
+    # Flip back to False once patch-level alignment is actually being trained
+    # (max_contrast_weight > 0).
+    skip_hist_pretrain=True,
 )
 
 # ---- output dirs ----------------------------------------------------------
@@ -269,14 +287,18 @@ model = DualAutoencoder(
 model.to(device)
 
 # ---- Phase 1a: pretrain histology (patch) branch -----------------------
-print("\n=== Phase 1a: pretrain histology branch ===")
-pretrain_hist_autoencoder(
-    model, hist_emb_t, patch_meta,
-    epochs=CONFIG["hist_pretrain_epochs"], lr=CONFIG["hist_pretrain_lr"],
-    weight_decay=CONFIG["hist_pretrain_weight_decay"],
-    val_frac=CONFIG["hist_pretrain_val_frac"], patience=CONFIG["hist_pretrain_patience"],
-    device=device,
-)
+if CONFIG["skip_hist_pretrain"]:
+    print("\n=== Phase 1a: SKIPPED (skip_hist_pretrain=True) -- "
+          "hist_enc/hist_dec left at random init, harmless since max_contrast_weight=0.0 ===")
+else:
+    print("\n=== Phase 1a: pretrain histology branch ===")
+    pretrain_hist_autoencoder(
+        model, hist_emb_t, patch_meta,
+        epochs=CONFIG["hist_pretrain_epochs"], lr=CONFIG["hist_pretrain_lr"],
+        weight_decay=CONFIG["hist_pretrain_weight_decay"],
+        val_frac=CONFIG["hist_pretrain_val_frac"], patience=CONFIG["hist_pretrain_patience"],
+        device=device,
+    )
 
 # ---- Phase 1b: pretrain token (local) branch (skipped when use_tokens=False) ----
 if CONFIG["use_tokens"]:

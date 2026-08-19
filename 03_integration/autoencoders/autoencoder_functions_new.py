@@ -793,10 +793,21 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
         some spurious, non-biological distinguishing signal (staining/scan
         artifacts, slide identity) purely as a tie-breaker -- exactly the kind of
         shortcut the rest of this pipeline's leakage-fighting machinery exists to
-        avoid. Gated on `p_trans`-vs-`p_trans` similarity specifically (not
-        `p_hist`-vs-`p_hist`) so the exclusion doesn't depend on the histology
-        branch already having converged to agree -- it's most needed exactly
-        when it hasn't yet. `p_trans` is assumed L2-normalized (true for
+        avoid. Checked on BOTH `p_trans`-vs-`p_trans` AND `p_hist`-vs-`p_hist`
+        similarity (either clearing the threshold is enough to exclude a pair) --
+        originally trans-only, extended to also check the second modality since
+        two genuinely-similar nearby cells/patches can easily fail a strict
+        transcriptomic-similarity cutoff from expression noise/dropout alone
+        (sparse Visium HD data especially) while still being obviously
+        near-duplicate in histology/token space, or vice versa; checking only one
+        side left real false negatives uncaught (see conversation notes: a fine
+        checkerboard-like alternation between two leiden clusters traced back to
+        exactly this gap). Note this is still a moving target early in training:
+        both projections are themselves being trained by this same loss (or, for
+        the local/token call, by a freshly-initialized `proj_token` sitting on
+        top of an already-frozen-and-pretrained `token_enc`), so the similarity
+        judgment can drift as training progresses rather than being a fixed
+        reference. `p_trans`/`p_hist` are assumed L2-normalized (true for
         `ProjectionHead`'s output), so this is a plain cosine-similarity cutoff
         in [-1, 1]; e.g. 0.9 excludes only near-duplicates, not merely similar
         patches. Masking-only (never an added attractive term) -- excluded pairs
@@ -842,8 +853,9 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
         logits = logits.masked_fill(neighbor_mask, float("-inf"))
 
     if anchor_sim_threshold is not None:
-        anchor_sim = p_trans @ p_trans.T  # cosine sim, p_trans is L2-normalized
-        false_neg_mask = anchor_sim > anchor_sim_threshold
+        trans_sim = p_trans @ p_trans.T  # cosine sim, p_trans is L2-normalized
+        hist_sim = p_hist @ p_hist.T     # p_token for the local/cell-level call
+        false_neg_mask = (trans_sim > anchor_sim_threshold) | (hist_sim > anchor_sim_threshold)
         if slide_ids is not None:
             same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
             false_neg_mask = false_neg_mask & same_slide
