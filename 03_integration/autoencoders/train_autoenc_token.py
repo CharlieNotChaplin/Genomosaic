@@ -334,16 +334,10 @@ train(
     local_anchor_sim_threshold=(CONFIG["local_anchor_sim_threshold"] if CONFIG["use_tokens"] else None),
 )
 
-# ---- eval ---------------------------------------------------------------
-print("\n=== Eval ===")
-patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
-eval_results = retrieval_accuracy(model, data, hist_emb_t, patch_meta_device, device=device)
-
-if CONFIG["use_tokens"]:
-    cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
-    token_eval_results = token_retrieval_accuracy(model, data, token_emb_t, cell_meta_device, device=device)
-
-# ---- save checkpoint + latents -------------------------------------------
+# ---- save checkpoint immediately -----------------------------------------
+# Saved right after training, before eval, so a crash in retrieval_accuracy
+# (e.g. an OOM building the full-cohort similarity matrix) can never lose a
+# completed training run -- the eval below is diagnostic, not load-bearing.
 checkpoint = {
     "model_state_dict": model.state_dict(),
     "epoch": CONFIG["n_epochs"] - 1,
@@ -362,6 +356,16 @@ if CONFIG["use_tokens"]:
     checkpoint["token_scaler"] = token_scaler
 torch.save(checkpoint, dir_output / "dual_ae_checkpoint.pt")
 
+# ---- eval ---------------------------------------------------------------
+print("\n=== Eval ===")
+patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
+eval_results = retrieval_accuracy(model, data, hist_emb_t, patch_meta_device, device=device)
+
+if CONFIG["use_tokens"]:
+    cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
+    token_eval_results = token_retrieval_accuracy(model, data, token_emb_t, cell_meta_device, device=device)
+
+# ---- save latents ----------------------------------------------------
 with torch.no_grad():
     z_trans_all = encode_full_graph_batched(
         model.trans_enc, data, device,

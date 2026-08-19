@@ -1519,7 +1519,14 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
 
     n_candidates = len(unique_patches)
     diag = sims.diagonal()
-    rank = (sims >= diag.unsqueeze(1)).sum(dim=1).float()  # 1 = true match is the single best hit
+    # Chunked to avoid materializing a second full n_candidates x n_candidates
+    # tensor (`sims` itself is already n_candidates^2 and, at full-cohort scale
+    # across all slides, that's the largest tensor this function can afford --
+    # a second one of the same size is what OOMs).
+    rank = torch.empty(n_candidates, device=device)
+    for start in range(0, n_candidates, eval_batch_size):
+        end = min(start + eval_batch_size, n_candidates)
+        rank[start:end] = (sims[start:end] >= diag[start:end].unsqueeze(1)).sum(dim=1).float()
     mrr = (1.0 / rank).mean().item()
     median_rank = rank.median().item()
     chance_mrr = float(np.sum(1.0 / np.arange(1, n_candidates + 1)) / n_candidates)
