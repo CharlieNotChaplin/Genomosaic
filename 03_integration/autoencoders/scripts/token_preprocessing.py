@@ -59,7 +59,7 @@ def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_to
 
 
 def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad_path,
-                                 patch_col="Patch_ID", halo_px=6.0, margin_tokens=1,
+                                 patch_col="Patch_ID", halo_px=15.0, margin_tokens=1,
                                  verbose=True):
     """
     Returns (footprint, halo, matched), each row-aligned to
@@ -172,7 +172,7 @@ def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad
     return footprint, halo, matched
 
 
-def run(slide, basedir=Path("../../data"), halo_px=6.0, out_name="cell_token_embeddings.h5ad",
+def run(slide, basedir=Path("../../data"), halo_px=15.0, out_name="cell_token_embeddings.h5ad",
         token_filename="WSI_patch_token_embeddings_filtered.h5ad"):
     trans_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/count_area_filtered_adata.h5ad"
     nuclei_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/nuclei_geometry.parquet"
@@ -221,9 +221,16 @@ def run(slide, basedir=Path("../../data"), halo_px=6.0, out_name="cell_token_emb
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--slide", required=True, help="Slide_ID, e.g. CRC_P1")
-    parser.add_argument("--halo-px", type=float, default=6.0,
-                         help="halo ring dilation in pixels (kept well under the ~19px "
-                              "10th-percentile nearest-cell spacing measured for this dataset)")
+    parser.add_argument("--halo-px", type=float, default=15.0,
+                         help="halo ring dilation in pixels. Was 6.0 (nucleus[~21px]+halo "
+                              "~33px wide, only ~2-3 tokens[14px] contributing per cell -- too "
+                              "few to average out per-cell noise, confirmed via conversation-notes "
+                              "diagnostics: raw pre-autoencoder footprint/halo features already show "
+                              "fine-scale spatial speckle in cluster assignment). 15.0 widens the "
+                              "window to ~51px (~3.6 tokens) for better SNR, at the cost of pulling "
+                              "in more neighboring-cell signal (median nearest-cell spacing ~27px, "
+                              "so halo rings now commonly extend into neighboring cells' territory "
+                              "-- an accepted tradeoff, not an oversight)")
     parser.add_argument("--basedir", type=Path, default=Path("../../data"))
     args = parser.parse_args()
     run(args.slide, basedir=args.basedir, halo_px=args.halo_px)
