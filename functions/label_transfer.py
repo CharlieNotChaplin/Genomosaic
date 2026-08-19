@@ -119,6 +119,34 @@ def load_patch_embeddings(sample: str, data_dir: Path = DATA_DIR) -> ad.AnnData:
     return sc.read_h5ad(data_dir / PATCH_METADATA_TEMPLATE.format(sample))
 
 
+def compute_harmony_image_embeddings(
+    samples: list[str], data_dir: Path = DATA_DIR, n_comps: int = 50,
+) -> dict[str, np.ndarray]:
+    """Joint PCA + Harmony correction (keyed on Slide_ID) over the raw UNI image
+    embeddings of every sample in `samples`, so the image classifier can be
+    trained/predicted on a batch-corrected representation instead of raw .X.
+
+    Returns {sample: harmonized array}, each row-aligned to
+    load_patch_embeddings(sample) (same order, same length).
+    """
+    import harmonypy
+
+    embs = {s: load_patch_embeddings(s, data_dir) for s in samples}
+    combined = ad.concat(embs, label="Slide_ID", index_unique="-")
+    sc.pp.pca(combined, n_comps=n_comps)
+
+    # NOTE: harmonypy>=2.0 already returns Z_corr as (n_obs, n_pcs) -- do not
+    # transpose (unlike scanpy's sce.pp.harmony_integrate, which still assumes
+    # the pre-2.0 (n_pcs, n_obs) orientation and would silently produce a
+    # wrongly-shaped result).
+    harmony_out = harmonypy.run_harmony(combined.obsm["X_pca"].astype(np.float64), combined.obs, "Slide_ID")
+    harmonized = harmony_out.Z_corr
+
+    sizes = [embs[s].n_obs for s in samples]
+    offsets = np.cumsum([0] + sizes)
+    return {s: harmonized[offsets[i]:offsets[i + 1]] for i, s in enumerate(samples)}
+
+
 def primary_tissuetype(tissuetype: pd.Series, min_count: int | None = None) -> pd.Series:
     """
     Resolve each (possibly compound, '_'-joined) tissuetype label to a
@@ -532,6 +560,7 @@ def main(
     min_compound_label_count: int | None = MIN_COMPOUND_LABEL_COUNT,
     neoplasm_prior_weight_on_normal: float | None = NEOPLASM_PRIOR_WEIGHT_ON_NORMAL,
     model_type: str = MODEL_TYPE,
+    use_harmony: bool = False,
 ):
     """Run the full pipeline. All knobs default to the module-level
     constants above, but can be overridden per call -- e.g. from a notebook:
@@ -540,9 +569,25 @@ def main(
         lt.main(
             min_compound_label_count=100, neoplasm_prior_weight_on_normal=0.0, model_type="knn",
         )
+
+    use_harmony: if True, the image classifier is trained/predicted on a joint
+    PCA + Harmony-corrected embedding (see compute_harmony_image_embeddings)
+    instead of the raw UNI .X embedding, to remove slide-to-slide batch effects
+    before label transfer. Outputs are written to
+    "{sample}_patch_predictions_harmony.h5ad" instead of the usual
+    "{sample}_patch_predictions.h5ad", so both are kept side by side for
+    comparison; the transcriptomics classifier is unaffected either way.
     """
     device = get_device()
     print(f"Using device: {device}")
+
+    targets = discover_target_samples()
+    print(f"Target samples: {targets}")
+
+    harmony_emb = None
+    if use_harmony:
+        print("\nComputing joint PCA + Harmony correction (keyed on Slide_ID) for image embeddings...")
+        harmony_emb = compute_harmony_image_embeddings([REFERENCE_SAMPLE] + targets)
 
     # ------------------------------------------------------------------
     # Reference (CRC_P2): ground-truth-labeled patches
@@ -555,7 +600,8 @@ def main(
           f"  {y_ref.value_counts().to_dict()}")
 
     print("\nTraining image-based classifier...")
-    X_ref_img = ref_emb.X[labeled.to_numpy()]
+    ref_img_source = harmony_emb[REFERENCE_SAMPLE] if use_harmony else ref_emb.X
+    X_ref_img = ref_img_source[labeled.to_numpy()]
     img_fit = train_classifier(X_ref_img, y_ref, device, model_type=model_type, name="image")
 
     print("\nAggregating reference transcriptomics per patch + fitting SVD...")
@@ -578,9 +624,6 @@ def main(
     # ------------------------------------------------------------------
     # Target samples
     # ------------------------------------------------------------------
-    targets = discover_target_samples()
-    print(f"\nTarget samples: {targets}")
-
     for sample in targets:
         print(f"\n--- {sample} ---")
         emb = load_patch_embeddings(sample)
@@ -591,9 +634,10 @@ def main(
         if apply_neoplasm_prior:
             print(f"  disease_status=Normal: suppressing Neoplasm (weight={neoplasm_prior_weight_on_normal})")
 
+        img_input = harmony_emb[sample] if use_harmony else emb.X
         img_suppress = classes_containing(img_fit, "Neoplasm") if apply_neoplasm_prior else None
         img_labels, img_conf = predict_classifier(
-            img_fit, emb.X, device,
+            img_fit, img_input, device,
             suppress_classes=img_suppress, suppress_weight=neoplasm_prior_weight_on_normal or 0.0,
         )
 
@@ -617,7 +661,8 @@ def main(
 
         out_dir = DATA_DIR / OUT_DIR_TEMPLATE.format(sample)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{sample}_patch_predictions.h5ad"
+        suffix = "_harmony" if use_harmony else ""
+        out_path = out_dir / f"{sample}_patch_predictions{suffix}.h5ad"
         out.write_h5ad(out_path)
         print(f"  Saved -> {out_path}")
         agree = (img_labels == tx_labels).mean()
