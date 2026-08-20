@@ -98,8 +98,25 @@ CONFIG = dict(
     token_pretrain_weight_decay=1e-5,
     token_pretrain_val_frac=0.1,
     token_pretrain_patience=15,
-    token_lr_mult=1.0,
-    freeze_token=True,
+    # token_lr_mult<1.0: token_enc/token_dec are already well-pretrained (Phase 1b,
+    # pure reconstruction) -- once unfrozen below, they get a reduced LR relative
+    # to trans_enc/trans_dec so the joint contrastive+reconstruction objective
+    # fine-tunes that pretrained structure gently rather than overwriting it at
+    # the same rate as trans_enc, which is being trained from scratch this phase.
+    token_lr_mult=0.3,
+    # False (was True): downstream goal is predicting trans embeddings from
+    # histology alone (see conversation notes) -- that needs token_enc's actual
+    # OUTPUT (X_dae_token_cell, saved post-training) to move toward trans_enc's
+    # embedding space, not just the narrow proj_token/proj_trans_local heads used
+    # inside the contrastive loss. With freeze_token=True, token_enc never
+    # received gradient in Phase 3 at all regardless of this flag or
+    # max_local_contrast_weight (train_autoenc_token.py's Phase 2 called
+    # freeze_token_encoder() unconditionally) -- fixed below so this flag now
+    # actually controls it. token_dec stays attached (not separately frozen) so
+    # loss_recon_token keeps regularizing token_enc against collapsing to a
+    # degenerate, purely-retrieval-optimized solution while it moves toward
+    # trans_enc's space.
+    freeze_token=False,
 
     local_neighbor_radius=100,          # px -- cell-level analogue of neighbor_radius (2912 for
                                          # patches). Median nearest-cell spacing measured ~27px in
@@ -110,7 +127,15 @@ CONFIG = dict(
                                          # resulting clusters (see conversation notes). 100 (~3.7x
                                          # spacing) is a first attempt at giving more room before
                                          # anything gets pushed apart -- worth iterating on.
-    max_local_contrast_weight=0.5,
+    # 0.5 -> 1.0: stronger pull toward a trans-predictive token embedding (see
+    # conversation notes on the downstream histology->transcriptomics goal).
+    # Kept moderate rather than pushed much higher -- contrast_local's raw
+    # magnitude in past runs (~4-5) already gives it a larger WEIGHTED
+    # contribution than recon_trans/recon_token (each effectively weight 1.0)
+    # even at 0.5, so doubling it already meaningfully shifts the balance
+    # without needing an aggressive jump that risks collapsing token_enc's
+    # representation to a degenerate, purely-retrieval-friendly solution.
+    max_local_contrast_weight=1.0,
     local_warmup_epochs=5,
 
     # skip Phase 1a (histology-patch pretraining) entirely -- with
@@ -311,9 +336,17 @@ if CONFIG["use_tokens"]:
         device=device,
     )
 
-# ---- Phase 2: freeze both histology branches ---------------------------
+# ---- Phase 2: freeze histology branches -------------------------------
+# hist_enc always freezes here regardless of CONFIG (max_contrast_weight=0.0
+# means it never trains in Phase 3 anyway -- see Phase 1a's skip message).
+# token_enc freezing is now gated on CONFIG["freeze_token"] -- previously
+# called unconditionally, which meant freeze_token/max_local_contrast_weight/
+# token_lr_mult had no way to actually let token_enc adapt during Phase 3, no
+# matter how they were set (see conversation notes: downstream goal is a
+# trans-predictive token embedding, which needs token_enc's actual output to
+# move, not just the projection heads used inside the contrastive loss).
 freeze_hist_encoder(model, freeze_decoder=True)
-if CONFIG["use_tokens"]:
+if CONFIG["use_tokens"] and CONFIG["freeze_token"]:
     freeze_token_encoder(model, freeze_decoder=True)
 
 # ---- Phase 3: joint training (patch-level + cell-level contrastive) ----
