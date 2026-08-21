@@ -34,9 +34,11 @@ or from the command line: `python functions/label_transfer.py`.
 from __future__ import annotations
 
 import gc
+import json
 from pathlib import Path
 
 import anndata as ad
+import h5py
 import numpy as np
 import pandas as pd
 import scanpy as sc
@@ -44,6 +46,7 @@ import torch
 import torch.nn as nn
 from anndata.utils import make_index_unique
 from scipy import sparse
+from scipy.spatial import cKDTree
 from sklearn.decomposition import TruncatedSVD
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
@@ -58,6 +61,8 @@ OUT_DIR_TEMPLATE = "{}/02_baselines/label_transfer"
 EXCLUDE_DIRS = {"new", "CRC_P_Mixed", "combined", REFERENCE_SAMPLE}
 
 SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_002um"
+GRID_SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_008um"
+TOKEN_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/WSI_patch_token_embeddings_filtered.h5ad"
 PATCH_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/filtered_WSI_patch_embeddings.h5ad"
 
 # Defaults for main()'s keyword parameters below -- used by plain
@@ -217,6 +222,159 @@ def assign_bins_to_patches(
 
     matched = bin_grid.join(patch_lookup, on=["patch_x", "patch_y"], how="inner")
     return matched["Patch_ID"]
+
+
+def aggregate_bin_annotation_to_grid(
+    reference_sample: str = REFERENCE_SAMPLE,
+    group_size: int = 4,
+    label_col: str = "annotation",
+    data_dir: Path = DATA_DIR,
+) -> pd.DataFrame:
+    """
+    Aggregate the reference's real per-bin (2um) ground-truth annotation up
+    to a coarser square grid -- group_size x group_size 2um bins per cell,
+    e.g. group_size=4 -> 8um. Like the patch-level `tissuetype` ground truth
+    elsewhere in this module, a grid cell mixing multiple bin types gets a
+    compound, "_"-joined label ordered most- to least-dominant (e.g.
+    "Vessel_Veins"), not just the single majority type -- primary_tissuetype
+    collapses it back down later exactly like it does for patches.
+
+    Visium HD's bin grids are hierarchically nested (each 8um bin is exactly
+    a 4x4 block of 2um bins by array coordinate), so grouping by
+    (array_row // group_size, array_col // group_size) is an exact
+    partition of the 2um grid, not an approximate spatial join -- grid_row/
+    grid_col in the output equal a native square_008um bin's own array_row/
+    array_col exactly, so this can be joined directly onto load_grid_bin_counts.
+
+    Returns a DataFrame, one row per non-empty grid cell: grid_row, grid_col,
+    pxl_row / pxl_col (mean bin position -- the grid cell's centroid),
+    <label_col> (compound label), n_bins (bins aggregated into it).
+    """
+    annotation = ad.read_h5ad(
+        data_dir / OUT_DIR_TEMPLATE.format(reference_sample) / f"{reference_sample}_with_annotation.h5ad",
+        backed="r",
+    ).obs[[label_col]]
+
+    positions = pd.read_parquet(
+        data_dir / SPATIAL_DIR_TEMPLATE.format(reference_sample) / "spatial" / "tissue_positions.parquet"
+    ).set_index("barcode")
+
+    joined = annotation.join(
+        positions[["array_row", "array_col", "pxl_row_in_fullres", "pxl_col_in_fullres"]], how="inner"
+    )
+    grid_row = joined["array_row"] // group_size
+    grid_col = joined["array_col"] // group_size
+
+    def compound_label(s):
+        # value_counts() sorts most- to least-common, but on a Categorical Series it
+        # also includes every *defined* category at 0 -- drop those, or every group's
+        # label would list all 7 tissue types regardless of what's actually present.
+        vc = s.value_counts()
+        return "_".join(vc[vc > 0].index)
+
+    grouped = joined.groupby([grid_row, grid_col]).agg(
+        pxl_row=("pxl_row_in_fullres", "mean"),
+        pxl_col=("pxl_col_in_fullres", "mean"),
+        **{label_col: (label_col, compound_label)},
+        n_bins=(label_col, "size"),
+    )
+    grouped.index = grouped.index.set_names(["grid_row", "grid_col"])
+    return grouped.reset_index()
+
+
+def assign_nearest_grid_label(coords: np.ndarray, grid_df: pd.DataFrame, label_col: str = "annotation") -> np.ndarray:
+    """
+    Assign each row of `coords` (shape (n, 2), [x, y] = [pxl_col, pxl_row] --
+    matches AnnData obsm["spatial"]'s convention) the label of its nearest
+    grid cell in `grid_df` (see aggregate_bin_annotation_to_grid), by
+    centroid distance.
+    """
+    tree = cKDTree(grid_df[["pxl_col", "pxl_row"]].to_numpy())
+    _, nearest = tree.query(np.asarray(coords)[:, :2])
+    return grid_df[label_col].to_numpy()[nearest]
+
+
+def load_grid_bin_counts(sample: str, data_dir: Path = DATA_DIR) -> ad.AnnData:
+    """
+    Native 8um-bin gene expression (SpaceRanger's own square_008um binning --
+    already properly aggregated, no manual bin summation needed), restricted
+    to in-tissue bins. obs gets array_row/array_col (for exact-joining onto
+    aggregate_bin_annotation_to_grid's grid_row/grid_col) and obsm["spatial"]
+    = [pxl_col, pxl_row] (matching the rest of this module's convention).
+    """
+    h5_path = data_dir / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "filtered_feature_bc_matrix.h5"
+    adata = sc.read_10x_h5(h5_path)
+    adata.var_names_make_unique()
+
+    positions = pd.read_parquet(
+        data_dir / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "tissue_positions.parquet"
+    ).set_index("barcode")
+    positions = positions.loc[positions["in_tissue"] == 1]
+
+    adata = adata[adata.obs_names.isin(positions.index)].copy()
+    positions = positions.loc[adata.obs_names]
+    adata.obs["array_row"] = positions["array_row"].to_numpy()
+    adata.obs["array_col"] = positions["array_col"].to_numpy()
+    adata.obsm["spatial"] = positions[["pxl_col_in_fullres", "pxl_row_in_fullres"]].to_numpy()
+    return adata
+
+
+def aggregate_tokens_to_grid(
+    sample: str, bin_coords: np.ndarray, radius_px: float, data_dir: Path = DATA_DIR, batch_size: int = 20_000
+) -> np.ndarray:
+    """
+    Image feature per grid bin: average the raw per-token UNI embeddings
+    (WSI_patch_token_embeddings_filtered.h5ad's Token_X/Token_Y, which are
+    absolute full-slide pixel positions, not patch-relative) within
+    radius_px of each row in bin_coords ([x, y] = [pxl_col, pxl_row]).
+
+    Unlike a 224px UNI patch (far coarser than one 8um bin, so reusing it
+    would just replicate one embedding across every bin inside it), raw
+    tokens (~14px) are close enough in scale to an 8um bin (~29px) that a
+    handful of them genuinely fall within/near a single bin -- this is what
+    makes bin-level image features possible at all here.
+
+    Bins with no token within radius_px (rare, edge cases) fall back to
+    their single nearest token instead of an all-zero vector.
+
+    Processes bin_coords in batches and reads only the token embedding rows
+    needed for each batch directly off disk (h5py indexed read) -- a whole
+    slide's raw token matrix is millions of 1536-dim rows (multiple GB even
+    at its on-disk float16), too large to load in full.
+    """
+    path = data_dir / TOKEN_METADATA_TEMPLATE.format(sample)
+    bin_coords = np.asarray(bin_coords)[:, :2]
+
+    with h5py.File(path, "r") as f:
+        tok_x = f["obs/Token_X"][:].astype(np.float64)
+        tok_y = f["obs/Token_Y"][:].astype(np.float64)
+        n_dims = f["X"].shape[1]
+        tree = cKDTree(np.stack([tok_x, tok_y], axis=1))
+        del tok_x, tok_y
+
+        out = np.zeros((len(bin_coords), n_dims), dtype=np.float32)
+        for start in range(0, len(bin_coords), batch_size):
+            batch = bin_coords[start : start + batch_size]
+            neighbor_lists = tree.query_ball_point(batch, r=radius_px)
+
+            empty = [i for i, nb in enumerate(neighbor_lists) if len(nb) == 0]
+            if empty:
+                _, nearest = tree.query(batch[empty])
+                for j, i in enumerate(empty):
+                    neighbor_lists[i] = [int(nearest[j])]
+
+            # h5py fancy indexing needs sorted unique indices -- read this
+            # batch's needed rows in one indexed call, small enough to hold
+            # in memory, then average per-bin from that slice.
+            all_idx = np.unique(np.concatenate([np.asarray(nb, dtype=np.int64) for nb in neighbor_lists]))
+            sub_emb = f["X"][all_idx].astype(np.float32)
+            row_of = {idx: pos for pos, idx in enumerate(all_idx)}
+
+            for i, nb in enumerate(neighbor_lists):
+                out[start + i] = sub_emb[[row_of[idx] for idx in nb]].mean(axis=0)
+            del sub_emb
+
+    return out
 
 
 def aggregate_expression_by_patch(bin_adata: ad.AnnData, bin_to_patch: pd.Series) -> ad.AnnData:
@@ -668,6 +826,136 @@ def main(
         agree = (img_labels == tx_labels).mean()
         print(f"  image/transcriptomics agreement: {agree:.1%}")
         del emb, out, tx_embedding
+        gc.collect()
+
+    print("\nDone.")
+
+
+def _microns_per_pixel(sample: str, data_dir: Path = DATA_DIR) -> float:
+    path = data_dir / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "scalefactors_json.json"
+    with open(path) as f:
+        return json.load(f)["microns_per_pixel"]
+
+
+def main_grid(
+    group_size: int = 4,
+    min_compound_label_count: int | None = MIN_COMPOUND_LABEL_COUNT,
+    neoplasm_prior_weight_on_normal: float | None = NEOPLASM_PRIOR_WEIGHT_ON_NORMAL,
+    model_type: str = MODEL_TYPE,
+    radius_factor: float = 0.8,
+):
+    """
+    Same idea as main(), but label transfer at a coarser grid resolution --
+    group_size x group_size 2um bins per cell (default 4 -> 8um) -- instead
+    of 224px patches. 2um bins are too sparse individually for either
+    modality (median ~13 UMI / ~12 genes per bin), but 8um bins comfortably
+    clear the signal bar the rest of this pipeline already uses.
+
+    Image features: aggregate_tokens_to_grid -- raw ViT tokens (~14px) are
+    close enough in scale to an 8um bin (~29px) that a handful genuinely
+    fall within one, unlike a 224px UNI patch (far coarser than one bin,
+    which would just replicate a single embedding across ~dozens of bins).
+    Transcriptomics features: SpaceRanger's own native square_008um binning
+    directly (load_grid_bin_counts) -- already properly aggregated, no
+    manual bin-summation needed (unlike the patch pipeline's
+    aggregate_expression_by_patch).
+
+    Writes "{sample}_grid_predictions.h5ad" per target sample, mirroring
+    "{sample}_patch_predictions.h5ad" from main().
+    """
+    device = get_device()
+    print(f"Using device: {device}")
+
+    targets = discover_target_samples()
+    print(f"Target samples: {targets}")
+
+    grid_um = group_size * 2.0
+
+    # ------------------------------------------------------------------
+    # Reference (CRC_P2): ground-truth-labeled grid cells
+    # ------------------------------------------------------------------
+    print(f"\nAggregating reference ({REFERENCE_SAMPLE}) bin annotation to the {grid_um:g}um grid...")
+    grid_gt = aggregate_bin_annotation_to_grid(REFERENCE_SAMPLE, group_size=group_size)
+    print(f"  {len(grid_gt)} grid cells.")
+
+    print(f"\nLoading reference ({REFERENCE_SAMPLE}) native {grid_um:g}um bin expression...")
+    ref_adata = load_grid_bin_counts(REFERENCE_SAMPLE)
+    ref_obs = ref_adata.obs.reset_index().rename(columns={"index": "barcode"})
+    merged = ref_obs.merge(
+        grid_gt[["grid_row", "grid_col", "annotation"]],
+        left_on=["array_row", "array_col"], right_on=["grid_row", "grid_col"], how="left",
+    )
+    labeled = merged["annotation"].notna().to_numpy()
+    y_ref = primary_tissuetype(merged.loc[labeled, "annotation"], min_count=min_compound_label_count)
+    print(f"  {labeled.sum()}/{ref_adata.n_obs} grid cells have ground truth. Classes:\n"
+          f"  {y_ref.value_counts().to_dict()}")
+
+    radius_px = grid_um / _microns_per_pixel(REFERENCE_SAMPLE) * radius_factor
+    print(f"\nAggregating reference raw-token image features (radius={radius_px:.1f}px)...")
+    X_ref_img = aggregate_tokens_to_grid(REFERENCE_SAMPLE, ref_adata.obsm["spatial"][labeled], radius_px)
+    print("\nTraining image-based classifier...")
+    img_fit = train_classifier(X_ref_img, y_ref, device, model_type=model_type, name="image")
+
+    print("\nFitting transcriptomics SVD on reference...")
+    svd, hvg_genes, ref_svd_embedding = fit_reference_svd(ref_adata[labeled])
+    print("\nTraining transcriptomics-based classifier...")
+    tx_fit = train_classifier(ref_svd_embedding, y_ref, device, model_type=model_type, name="transcriptomics")
+
+    del ref_adata, merged, X_ref_img, ref_svd_embedding
+    gc.collect()
+
+    # ------------------------------------------------------------------
+    # Target samples
+    # ------------------------------------------------------------------
+    for sample in targets:
+        print(f"\n--- {sample} ---")
+        grid_h5_path = DATA_DIR / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "filtered_feature_bc_matrix.h5"
+        if not grid_h5_path.exists():
+            print(f"  WARNING: no local square_008um output for {sample} ({grid_h5_path}) -- skipping.")
+            continue
+        adata = load_grid_bin_counts(sample)
+
+        apply_neoplasm_prior = (
+            neoplasm_prior_weight_on_normal is not None and get_disease_status(sample) == "Normal"
+        )
+        if apply_neoplasm_prior:
+            print(f"  disease_status=Normal: suppressing Neoplasm (weight={neoplasm_prior_weight_on_normal})")
+
+        radius_px = grid_um / _microns_per_pixel(sample) * radius_factor
+        img_input = aggregate_tokens_to_grid(sample, adata.obsm["spatial"], radius_px)
+        img_suppress = classes_containing(img_fit, "Neoplasm") if apply_neoplasm_prior else None
+        img_labels, img_conf = predict_classifier(
+            img_fit, img_input, device,
+            suppress_classes=img_suppress, suppress_weight=neoplasm_prior_weight_on_normal or 0.0,
+        )
+
+        tx_embedding = project_svd(adata, hvg_genes, svd)
+        tx_suppress = classes_containing(tx_fit, "Neoplasm") if apply_neoplasm_prior else None
+        tx_labels, tx_conf = predict_classifier(
+            tx_fit, tx_embedding, device,
+            suppress_classes=tx_suppress, suppress_weight=neoplasm_prior_weight_on_normal or 0.0,
+        )
+
+        out = ad.AnnData(
+            X=adata.X,
+            obs=adata.obs.assign(
+                Slide_ID=sample,
+                predicted_tissuetype_grid_image=img_labels,
+                predicted_confidence_grid_image=img_conf,
+                predicted_tissuetype_grid_transcriptomics=tx_labels,
+                predicted_confidence_grid_transcriptomics=tx_conf,
+            ),
+        )
+        out.obsm["spatial"] = adata.obsm["spatial"]
+
+        out_dir = DATA_DIR / OUT_DIR_TEMPLATE.format(sample)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / f"{sample}_grid_predictions.h5ad"
+        out.write_h5ad(out_path)
+        print(f"  Saved -> {out_path}")
+        agree = (img_labels == tx_labels).mean()
+        print(f"  image/transcriptomics agreement: {agree:.1%}")
+        del adata, out, tx_embedding, img_input
         gc.collect()
 
     print("\nDone.")
