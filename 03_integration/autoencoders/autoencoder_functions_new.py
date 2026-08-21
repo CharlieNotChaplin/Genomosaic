@@ -776,7 +776,8 @@ def segment_softmax(scores, index, num_segments):
 # ---- loss ----
  
 def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
-                         neighbor_radius=None, weight=None, anchor_sim_threshold=None):
+                         neighbor_radius=None, weight=None, anchor_sim_threshold=None,
+                         return_stats=False):
     """
     One-to-one patch-level InfoNCE (post-pooling: each row is a genuine patch, not
     a cell). Optionally:
@@ -815,6 +816,19 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
         divergent cases (same expression, different morphology) remain free to
         stay divergent rather than being pulled together.
       - applies inverse-frequency weighting per patch (`weight`).
+
+    `return_stats=True`: also returns a dict with `frac_masked` -- the fraction
+    of the P*(P-1) off-diagonal (candidate-negative) entries excluded by ANY of
+    the three masks above. This is a collapse early-warning signal: if
+    `anchor_sim_threshold` masking is circular (it checks the model's own live,
+    still-training projections) and those projections start collapsing toward
+    each other, more pairs cross the threshold and get masked, which removes
+    the very gradient that would otherwise correct the collapse -- a
+    self-reinforcing loop. `frac_masked` climbing toward 1.0 within the first
+    few epochs is the visible symptom, catchable in minutes instead of only
+    discovering a fully collapsed `contrast_local` (stuck at ~0.0 for the rest
+    of training, chance-level retrieval at eval) after a full run finishes --
+    see conversation notes for a run where exactly this happened.
 
     MULTI-SLIDE NOTE: if a batch mixes patches from more than one slide, pass
     `slide_ids` (int tensor, one per patch, same order as `centroids`). Raw
@@ -862,20 +876,30 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
         false_neg_mask.fill_diagonal_(False)  # never mask out the true positive
         logits = logits.masked_fill(false_neg_mask, float("-inf"))
 
+    if return_stats:
+        off_diag = ~torch.eye(P, dtype=torch.bool, device=device)
+        frac_masked = (logits[off_diag] == float("-inf")).float().mean().item()
+        stats = {"frac_masked": frac_masked, "n_candidates": P}
+
     idx = torch.arange(P, device=device)
- 
+
     log_prob_t2h = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     loss_t2h = -log_prob_t2h[idx, idx]
- 
+
     logits_h2t = logits.T
     log_prob_h2t = logits_h2t - torch.logsumexp(logits_h2t, dim=1, keepdim=True)
     loss_h2t = -log_prob_h2t[idx, idx]
- 
+
     per_patch_loss = 0.5 * (loss_t2h + loss_h2t)
- 
+
     if weight is not None:
-        return (per_patch_loss * weight).sum() / weight.sum().clamp(min=1e-8)
-    return per_patch_loss.mean()
+        loss = (per_patch_loss * weight).sum() / weight.sum().clamp(min=1e-8)
+    else:
+        loss = per_patch_loss.mean()
+
+    if return_stats:
+        return loss, stats
+    return loss
  
  
 def contrast_weight_schedule(epoch, warmup_epochs=5, max_weight=1.0):
@@ -1322,14 +1346,17 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         p_trans_local = model.proj_trans_local(z_cells)
         p_token = model.proj_token(z_token_cells)
         cell_xy = cell_meta["xy"][seed_global_ids]
-        loss_contrast_local = patch_level_infonce(
+        loss_contrast_local, local_mask_stats = patch_level_infonce(
             p_trans_local, p_token, cell_xy, slide_ids=cell_slide_ids,
             temperature=temperature, neighbor_radius=cell_meta["neighbor_radius"],
             anchor_sim_threshold=local_anchor_sim_threshold,
+            return_stats=True,
         )
+        local_frac_masked = local_mask_stats["frac_masked"]
     else:
         loss_recon_token = z_cells.new_tensor(0.0)
         loss_contrast_local = z_cells.new_tensor(0.0)
+        local_frac_masked = 0.0
 
     loss = (loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast
             + loss_recon_token + local_contrast_weight * loss_contrast_local)
@@ -1343,6 +1370,7 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         "contrast": loss_contrast.item(),
         "recon_token": loss_recon_token.item(),
         "contrast_local": loss_contrast_local.item(),
+        "local_frac_masked": local_frac_masked,
     }
 
 
@@ -1436,7 +1464,7 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
         cw = contrast_weight_schedule(epoch, warmup_epochs, max_contrast_weight)
         lcw = contrast_weight_schedule(epoch, local_warmup_epochs, max_local_contrast_weight) if use_tokens else 0.0
         epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0,
-                        "recon_token": 0.0, "contrast_local": 0.0}
+                        "recon_token": 0.0, "contrast_local": 0.0, "local_frac_masked": 0.0}
         n_batches = 0
         for batch in loader:
             stats = train_step(model, batch, hist_emb_all, patch_meta, opt, cw,
@@ -1559,7 +1587,7 @@ def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
 @torch.no_grad()
 def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda",
                               eval_num_neighbors=(10, 10), eval_batch_size=4096,
-                              max_cells_per_slide=5000, seed=0):
+                              max_cells_per_slide=5000, seed=0, cell_type_labels=None):
     """
     CELL-level analogue of `retrieval_accuracy`, for the token branch.
 
@@ -1571,6 +1599,19 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
     slide-stratified batching: pooling cells across slides into one candidate
     set would let the metric be satisfied by recognizing slide identity rather
     than genuine cell<->token correspondence).
+
+    `cell_type_labels`: optional (n_cells,) array/tensor, row-aligned to `data`
+    -- an INDEPENDENT cell-type/cluster assignment (e.g. leiden on a trans-only
+    embedding), not derived from this model's own trans/token projections
+    (that would be circular). If given, also reports cluster-level top-1:
+    a "hit" if the retrieved cell shares the query cell's cluster label, even
+    if it isn't the exact same cell. Strict exact-ID top-1 is a harsh metric
+    when many cells are genuinely near-duplicates biologically (a large
+    homogeneous region of similar cells makes picking the one true ID close to
+    a coin flip among the crowd, regardless of embedding quality) -- see
+    conversation notes. `neighbor_tolerant` already gives similar relief for
+    spatial proximity; this gives the analogous relief for biological/cluster
+    similarity regardless of physical distance.
 
     Returns full-dataset (unsampled) `z_trans_cell_full`/`z_token_cell_full` for
     reuse downstream (e.g. `evaluate_latent_leakage`), same convention as
@@ -1588,12 +1629,14 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
     slide_id_all = cell_meta["slide_id"].to(device)
     xy_all = cell_meta["xy"].to(device)
     neighbor_radius = cell_meta.get("neighbor_radius")
+    if cell_type_labels is not None:
+        cell_type_labels = torch.as_tensor(cell_type_labels, device=device)
 
     z_token_full = model.token_enc(token_emb_all)
 
     rng = np.random.default_rng(seed)
     results_per_slide = {}
-    all_top1, all_n = [], []
+    all_top1, all_n, all_cluster_top1 = [], [], []
     for sid in torch.unique(slide_id_all).cpu().numpy():
         idx = (slide_id_all == int(sid)).nonzero(as_tuple=True)[0]
         if len(idx) > max_cells_per_slide:
@@ -1613,20 +1656,33 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
             dist = (xy[pred] - xy).norm(dim=1)
             neighbor_acc = (dist < neighbor_radius).float().mean().item()
 
-        results_per_slide[int(sid)] = {"top1": top1, "neighbor_tolerant": neighbor_acc, "n": len(idx)}
+        cluster_top1 = None
+        if cell_type_labels is not None:
+            labels = cell_type_labels[idx]
+            cluster_top1 = (labels[pred] == labels).float().mean().item()
+            all_cluster_top1.append(cluster_top1)
+
+        results_per_slide[int(sid)] = {"top1": top1, "neighbor_tolerant": neighbor_acc,
+                                        "cluster_top1": cluster_top1, "n": len(idx)}
         all_top1.append(top1)
         all_n.append(len(idx))
 
     mean_top1 = float(np.average(all_top1, weights=all_n))
     print(f"Cell<->token retrieval, n-weighted mean top-1 across slides: {mean_top1:.3f}")
+    mean_cluster_top1 = None
+    if all_cluster_top1:
+        mean_cluster_top1 = float(np.average(all_cluster_top1, weights=all_n))
+        print(f"Cell<->token retrieval, n-weighted mean CLUSTER-level top-1: {mean_cluster_top1:.3f}")
     for sid, r in results_per_slide.items():
         msg = f"  slide {sid}: top1={r['top1']:.3f}"
         if r["neighbor_tolerant"] is not None:
             msg += f" | neighbor_tolerant={r['neighbor_tolerant']:.3f}"
+        if r["cluster_top1"] is not None:
+            msg += f" | cluster_top1={r['cluster_top1']:.3f}"
         msg += f" (n={r['n']}, chance={1 / r['n']:.5f})"
         print(msg)
 
-    return {"mean_top1": mean_top1, "per_slide": results_per_slide,
+    return {"mean_top1": mean_top1, "mean_cluster_top1": mean_cluster_top1, "per_slide": results_per_slide,
             "z_trans_cell_full": z_cells_full.cpu().numpy(),
             "z_token_cell_full": z_token_full.cpu().numpy()}
 

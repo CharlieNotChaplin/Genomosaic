@@ -127,16 +127,28 @@ CONFIG = dict(
                                          # resulting clusters (see conversation notes). 100 (~3.7x
                                          # spacing) is a first attempt at giving more room before
                                          # anything gets pushed apart -- worth iterating on.
-    # 0.5 -> 1.0: stronger pull toward a trans-predictive token embedding (see
-    # conversation notes on the downstream histology->transcriptomics goal).
-    # Kept moderate rather than pushed much higher -- contrast_local's raw
-    # magnitude in past runs (~4-5) already gives it a larger WEIGHTED
-    # contribution than recon_trans/recon_token (each effectively weight 1.0)
-    # even at 0.5, so doubling it already meaningfully shifts the balance
-    # without needing an aggressive jump that risks collapsing token_enc's
-    # representation to a degenerate, purely-retrieval-friendly solution.
-    max_local_contrast_weight=1.0,
-    local_warmup_epochs=5,
+    # REVERTED 1.0 -> 0.5, warmup 5 -> 20: the 1.0/5-epoch combination collapsed.
+    # Actual run log: contrast_local crashed 7.29 -> 0.03 -> 0.0001 within the
+    # first 2 epochs and sat at exactly 0.0000 for ~90 straight epochs; eval
+    # showed top-1 retrieval = 0.000 on all 7 slides. Root cause: unfreezing
+    # token_enc AND raising this weight to full strength within
+    # local_warmup_epochs=5 both at once pushed token_enc's projections to drift
+    # fast -- and local_anchor_sim_threshold's masking is circular (it checks
+    # the model's OWN live projections), so as they drifted together even
+    # slightly, more pairs crossed the 0.9 similarity threshold and got masked
+    # OUT of the negative set, removing the very gradient that would have
+    # corrected the drift -- a self-reinforcing collapse with no way back out
+    # (confirmed directly: a synthetic test with deliberately collapsed
+    # projections reproduces frac_masked=1.0, loss=0.0, exactly matching the
+    # real log -- see patch_level_infonce's `return_stats`/`frac_masked`,
+    # logged per-epoch now as `local_frac_masked` specifically to catch this
+    # within a couple epochs instead of after a full wasted run). This run:
+    # back to the old 0.5 ceiling (isolates whether unfreezing token_enc ALONE
+    # is stable before also pushing the weight higher) and a much slower
+    # 20-epoch ramp (gives token_enc time to adapt gradually rather than being
+    # hit at full strength almost immediately).
+    max_local_contrast_weight=0.5,
+    local_warmup_epochs=20,
 
     # skip Phase 1a (histology-patch pretraining) entirely -- with
     # max_contrast_weight=0.0 above, the patch-level trans<->hist alignment
