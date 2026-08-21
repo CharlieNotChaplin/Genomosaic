@@ -51,6 +51,7 @@ Thumbs.db
 **/patches/
 **/results/
 **/output/
+**/outputs/
 **/metadata/
 *.h5ad
 
