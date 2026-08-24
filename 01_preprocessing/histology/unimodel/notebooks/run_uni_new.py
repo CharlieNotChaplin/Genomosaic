@@ -46,6 +46,13 @@ def parse_args():
         help="Number of workers for DataLoader.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
+    parser.add_argument(
+        "--sample",
+        type=str,
+        default=None,
+        help="Slide_ID of a single sample to process. If omitted, all valid "
+        "samples under --data_dir are processed.",
+    )
     return parser.parse_args()
 
 
@@ -61,15 +68,24 @@ def set_seed(seed: int = 42):
     print(f"Global seed set to: {seed}")
 
 
-def check_for_patches(basedir: Path, skip_samples=None):
+def check_for_patches(basedir: Path, skip_samples=None, only_sample=None):
     if skip_samples is None:
         skip_samples = ["new", "CRC_P1", "CRC_P2", "CRC_P5", "Normal_P3", "Normal_P5"]
 
-    sample_dirs = [
-        p
-        for p in basedir.iterdir()
-        if p.is_dir() and p.name != "combined" and p.name not in skip_samples
-    ]
+    if only_sample is not None:
+        sample_dirs = [
+            p for p in basedir.iterdir() if p.is_dir() and p.name == only_sample
+        ]
+        if not sample_dirs:
+            raise FileNotFoundError(
+                f"Sample '{only_sample}' not found as a directory under {basedir}"
+            )
+    else:
+        sample_dirs = [
+            p
+            for p in basedir.iterdir()
+            if p.is_dir() and p.name != "combined" and p.name not in skip_samples
+        ]
 
     valid_patch_dirs = []
     for sample_dir in sample_dirs:
@@ -193,7 +209,7 @@ def main():
 
     master_csv_path = basedir / "combined/01_preprocessing/unimodel/metadata" / f_metadata_csv
 
-    patch_directories = check_for_patches(basedir, skip_samples)
+    patch_directories = check_for_patches(basedir, skip_samples, only_sample=args.sample)
 
     if not master_csv_path.exists():
         raise FileNotFoundError(f"Master metadata CSV file not found at {master_csv_path}")
@@ -217,6 +233,7 @@ def main():
 
     all_patch_adata_list = []
     all_token_adata_list = []
+    processed_sample_names = []
 
     # ============================================================
     # Main Processing Loop
@@ -310,6 +327,8 @@ def main():
         print(f" Saved Sample Token AnnData: {token_h5ad_path}")
         all_token_adata_list.append(adata_token)
 
+        processed_sample_names.append(sample_name)
+
         # Cleanup intermediate arrays
         del patch_feats, token_feats, token_matrix, df_patch, obs_tokens
         gc.collect()
@@ -324,6 +343,11 @@ def main():
         new_patch_adata = ad.concat(all_patch_adata_list, join='outer', index_unique=None)
         if combined_patch_h5ad_path.exists():
             existing_patch_adata = ad.read_h5ad(combined_patch_h5ad_path)
+            stale_mask = existing_patch_adata.obs["Slide_ID"].astype(str).isin(processed_sample_names)
+            if stale_mask.any():
+                print(f"Dropping {stale_mask.sum()} pre-existing rows for re-processed sample(s) "
+                      f"{sorted(set(processed_sample_names))} before appending.")
+                existing_patch_adata = existing_patch_adata[~stale_mask].copy()
             combined_patch_adata = ad.concat([existing_patch_adata, new_patch_adata], join='outer', index_unique=None)
             combined_patch_adata.write(combined_patch_h5ad_path)
         else:
@@ -334,6 +358,11 @@ def main():
         new_token_adata = ad.concat(all_token_adata_list, join='outer', index_unique=None)
         if combined_token_h5ad_path.exists():
             existing_token_adata = ad.read_h5ad(combined_token_h5ad_path)
+            stale_mask = existing_token_adata.obs["Slide_ID"].astype(str).isin(processed_sample_names)
+            if stale_mask.any():
+                print(f"Dropping {stale_mask.sum()} pre-existing rows for re-processed sample(s) "
+                      f"{sorted(set(processed_sample_names))} before appending.")
+                existing_token_adata = existing_token_adata[~stale_mask].copy()
             combined_token_adata = ad.concat([existing_token_adata, new_token_adata], join='outer', index_unique=None)
             combined_token_adata.write(combined_token_h5ad_path, compression="gzip")
         else:
