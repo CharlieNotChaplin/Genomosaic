@@ -71,7 +71,15 @@ CONFIG = dict(
     # but gated on expression similarity instead of spatial distance -- see
     # `patch_level_infonce`'s docstring. Set to None to disable.
     patch_anchor_sim_threshold=0.9,
-    local_anchor_sim_threshold=0.9,
+    # None (was 0.9): run_token_sweep.py's 18-config sweep (max_local_contrast_weight
+    # x local_warmup_epochs x local_anchor_sim_threshold) showed this masking doesn't
+    # clearly help -- None beat 0.9 in most matched pairs (e.g. weight=1.0/warmup=10:
+    # cell_top1 0.0663 vs 0.0579) and never lost by much when it didn't. Also the
+    # mechanism that caused the original collapse (this masking checks the model's
+    # OWN live projections, so drifting projections got progressively masked out of
+    # the negative set) -- disabling it removes that failure mode entirely, and the
+    # sweep confirms nothing is being traded away to do so.
+    local_anchor_sim_threshold=None,
 
     weight_reconstruction_by_patch_freq=True,
 
@@ -127,28 +135,27 @@ CONFIG = dict(
                                          # resulting clusters (see conversation notes). 100 (~3.7x
                                          # spacing) is a first attempt at giving more room before
                                          # anything gets pushed apart -- worth iterating on.
-    # REVERTED 1.0 -> 0.5, warmup 5 -> 20: the 1.0/5-epoch combination collapsed.
-    # Actual run log: contrast_local crashed 7.29 -> 0.03 -> 0.0001 within the
-    # first 2 epochs and sat at exactly 0.0000 for ~90 straight epochs; eval
-    # showed top-1 retrieval = 0.000 on all 7 slides. Root cause: unfreezing
-    # token_enc AND raising this weight to full strength within
-    # local_warmup_epochs=5 both at once pushed token_enc's projections to drift
-    # fast -- and local_anchor_sim_threshold's masking is circular (it checks
-    # the model's OWN live projections), so as they drifted together even
-    # slightly, more pairs crossed the 0.9 similarity threshold and got masked
-    # OUT of the negative set, removing the very gradient that would have
-    # corrected the drift -- a self-reinforcing collapse with no way back out
-    # (confirmed directly: a synthetic test with deliberately collapsed
-    # projections reproduces frac_masked=1.0, loss=0.0, exactly matching the
-    # real log -- see patch_level_infonce's `return_stats`/`frac_masked`,
-    # logged per-epoch now as `local_frac_masked` specifically to catch this
-    # within a couple epochs instead of after a full wasted run). This run:
-    # back to the old 0.5 ceiling (isolates whether unfreezing token_enc ALONE
-    # is stable before also pushing the weight higher) and a much slower
-    # 20-epoch ramp (gives token_enc time to adapt gradually rather than being
-    # hit at full strength almost immediately).
-    max_local_contrast_weight=0.5,
-    local_warmup_epochs=20,
+    # History: 1.0/5-epoch-warmup collapsed (contrast_local crashed to 0.0000 for
+    # ~90 epochs, top-1 retrieval=0.000 on all 7 slides -- root cause: unfreezing
+    # token_enc AND raising this weight to full strength within just 5 epochs let
+    # token_enc's projections drift together fast, and local_anchor_sim_threshold's
+    # masking is circular (checks the model's OWN live projections), so drifting
+    # pairs got masked OUT of the negative set, removing the corrective gradient --
+    # self-reinforcing, no way back out). Reverted to 0.5/20 epochs, confirmed
+    # stable (local_frac_masked flat ~0.012 for the full 100-epoch run, real
+    # retrieval signal: cell_top1=0.088).
+    #
+    # run_token_sweep.py's 18-config sweep (see its token_sweep_log.csv) then
+    # tested 1.0 again, but with warmup>=10 instead of 5, and it was NOT the
+    # weight itself that was dangerous -- every warmup>=10 config stayed stable
+    # (local_frac_masked settled into the same healthy 0.011-0.017 band
+    # regardless of weight), and both higher weight and shorter warmup
+    # monotonically improved retrieval within the sweep's grid. Best of 18:
+    # weight=1.0, warmup=10 -> cell_top1=0.0663, cluster_top1=0.5015 (vs.
+    # 0.0532/0.4923 at the old 0.5/20 setting) -- so back to full strength, just
+    # with warmup=10 instead of the 5 that actually caused the collapse.
+    max_local_contrast_weight=1.0,
+    local_warmup_epochs=10,
 
     # skip Phase 1a (histology-patch pretraining) entirely -- with
     # max_contrast_weight=0.0 above, the patch-level trans<->hist alignment
