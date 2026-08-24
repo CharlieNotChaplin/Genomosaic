@@ -1460,6 +1460,13 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
         cell_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
     local_warmup_epochs = local_warmup_epochs if local_warmup_epochs is not None else warmup_epochs
 
+    # Per-epoch history, returned (not just printed) so callers running many
+    # configs unattended (e.g. run_token_experiment/a sweep) can check for a
+    # repeat of the local_frac_masked collapse (see CONFIG's comment on
+    # max_local_contrast_weight in train_autoenc_token.py) without a human
+    # having to scroll each run's stdout -- existing callers that ignore the
+    # return value are unaffected.
+    history = []
     for epoch in range(n_epochs):
         cw = contrast_weight_schedule(epoch, warmup_epochs, max_contrast_weight)
         lcw = contrast_weight_schedule(epoch, local_warmup_epochs, max_local_contrast_weight) if use_tokens else 0.0
@@ -1484,8 +1491,11 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
         epoch_stats = {k: v / n_batches for k, v in epoch_stats.items()}
         print(f"epoch {epoch:03d} | contrast_w={cw:.2f}" + (f" | local_w={lcw:.2f}" if use_tokens else "") + " | " +
               " | ".join(f"{k}={v:.4f}" for k, v in epoch_stats.items()))
- 
- 
+        history.append({"epoch": epoch, "contrast_w": cw, "local_w": lcw, **epoch_stats})
+
+    return history
+
+
 @torch.no_grad()
 def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
                         eval_num_neighbors=(10, 10), eval_batch_size=4096):
@@ -1937,6 +1947,27 @@ def pretrain_hist_replicated(model_kwargs, hist_emb_all, patch_meta, pretrain_kw
     return best_state, replicate_log
 
 
+def pretrain_token_once(model_kwargs, token_emb_all, cell_meta, pretrain_kwargs, device="cuda"):
+    """
+    Token-branch analogue of `pretrain_hist_once`: runs `pretrain_token_autoencoder`
+    exactly ONCE on a throwaway model built from `model_kwargs` (which must include
+    `token_dim`), and returns just the resulting token_enc/token_dec state dicts
+    for reuse across many `run_token_experiment` calls via its
+    `model_template_state` argument -- same rationale as the hist version: Phase 1
+    doesn't depend on anything a Phase-3 sweep varies, so pretraining once and
+    reusing the result keeps every sweep run's comparison clean (only Phase 3
+    differs between runs, not also a different random Phase-1 outcome), and avoids
+    redundantly re-pretraining an identical token encoder for every sweep point.
+    """
+    import copy
+    template_model = DualAutoencoder(**model_kwargs)
+    pretrain_token_autoencoder(template_model, token_emb_all, cell_meta, **pretrain_kwargs, device=device)
+    return {
+        "token_enc": copy.deepcopy(template_model.token_enc.state_dict()),
+        "token_dec": copy.deepcopy(template_model.token_dec.state_dict()),
+    }
+
+
 def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_all, patch_meta,
                     n_slides, n_svg, hist_dim, log_path, checkpoint_dir=None, seed=0, device="cuda"):
     """
@@ -2043,6 +2074,155 @@ def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_
           f"leakage={metrics['hist_leakage_mean']:.4f} (chance={metrics['hist_leakage_chance']:.4f})")
 
     return metrics, model
+
+
+def run_token_experiment(run_id, config, model_template_state, data, loader, hist_emb_all, patch_meta,
+                          token_emb_all, cell_meta, n_slides, n_svg, hist_dim, token_dim,
+                          cell_type_labels, log_path, checkpoint_dir=None, seed=0, device="cuda",
+                          leakage_subsample=20_000):
+    """
+    Token-branch analogue of `run_experiment`: runs ONE Phase-3 joint training run
+    for the cell-level (trans<->token) contrastive branch and logs the result.
+
+    Starts from:
+      - a shared, ALREADY-pretrained token_enc/token_dec (`model_template_state`,
+        from `pretrain_token_once`) -- reused across every sweep point so Phase-1
+        variance never confounds the comparison, same rationale as
+        `run_experiment`'s hist template.
+      - hist_enc/hist_dec at random init, immediately frozen (`freeze_hist_encoder`)
+        -- harmless as long as `config["max_contrast_weight"]` is 0.0 (the
+        validated setting while patch-level alignment isn't being trained, see
+        train_autoenc_token.py's CONFIG comment); `DualAutoencoder` still needs a
+        hist_enc/hist_dec to exist structurally even when that branch isn't the
+        thing being swept.
+
+    `config`: dict of the complete parameter set for this run, logged in full
+      with a `cfg__` prefix (same convention as `run_experiment`, so the log
+      stays self-documenting no matter how the swept keys change over time).
+      Expected keys: latent_dim, proj_dim, pool_type, encoder, n_epochs, lr,
+      warmup_epochs, temperature, weight_reconstruction_by_patch_freq,
+      max_contrast_weight (usually 0.0), patch_anchor_sim_threshold (usually
+      None), freeze_token, token_lr_mult, max_local_contrast_weight,
+      local_warmup_epochs, local_anchor_sim_threshold, hist_condition_on_slide,
+      token_condition_on_slide.
+
+    `cell_type_labels`: independent cluster/cell-type labels (e.g.
+      `pd.factorize(trans_sub.obs["clusters"])[0]`), row-aligned to `data`/
+      `cell_meta` -- forwarded to `token_retrieval_accuracy` for the
+      cluster-tolerant top-1 metric (see that function's docstring: strict
+      exact-cell top-1 is a harsh metric when many cells are genuine biological
+      near-duplicates).
+
+    `seed`: FIXED (default 0, same every call) -- trans_enc/pool/projection heads
+      are freshly initialized here on every call. Keep the same across every run
+      in one sweep so the swept config is the only thing that differs.
+
+    `leakage_subsample`: cell-level Slide_ID leakage (`evaluate_latent_leakage`)
+      runs cross-validated logistic regression, which gets slow at full dataset
+      size (1M+ cells) run once per sweep point -- subsampled to this many cells
+      (fixed seed) to keep sweep wall-clock bounded regardless of dataset size.
+
+    Metrics logged: cell_top1 / cell_cluster_top1 (via `token_retrieval_accuracy`),
+    token_leakage_mean/chance (via `evaluate_latent_leakage` on the token
+    embedding, same de-confounding rationale `run_experiment` already applies to
+    the hist branch), plus the LAST epoch's `local_frac_masked` and
+    `contrast_local` straight from `train()`'s returned history -- a collapsed
+    run shows up directly as a row in the sweep log (frac_masked near 1.0,
+    contrast_local near 0.0) rather than only being visible by scrolling that
+    run's stdout after the fact.
+
+    Returns (metrics_dict, trained_model, history) -- history is train()'s full
+    per-epoch record, so a suspicious final-epoch number can be traced back to
+    exactly when it happened without rerunning.
+    """
+    import copy, csv, time
+    from pathlib import Path
+
+    set_seed(seed)
+    model = DualAutoencoder(
+        n_svg=n_svg, hist_dim=hist_dim, token_dim=token_dim,
+        latent_dim=config["latent_dim"], proj_dim=config["proj_dim"],
+        n_slides=n_slides, pool_type=config["pool_type"], encoder_type=config["encoder"],
+        hist_condition_on_slide=config.get("hist_condition_on_slide", True),
+        token_condition_on_slide=config.get("token_condition_on_slide", True),
+    )
+    model.token_enc.load_state_dict(model_template_state["token_enc"])
+    model.token_dec.load_state_dict(model_template_state["token_dec"])
+    model.to(device)
+
+    freeze_hist_encoder(model, freeze_decoder=True)
+    if config.get("freeze_token", False):
+        freeze_token_encoder(model, freeze_decoder=True)
+
+    history = train(
+        model, loader, hist_emb_all, patch_meta,
+        n_epochs=config["n_epochs"], lr=config["lr"], warmup_epochs=config["warmup_epochs"],
+        max_contrast_weight=config.get("max_contrast_weight", 0.0), temperature=config["temperature"],
+        weight_reconstruction=config["weight_reconstruction_by_patch_freq"],
+        freeze_hist=True, device=device,
+        token_emb_all=token_emb_all, cell_meta=cell_meta,
+        max_local_contrast_weight=config["max_local_contrast_weight"],
+        local_warmup_epochs=config.get("local_warmup_epochs"),
+        freeze_token=config.get("freeze_token", False),
+        token_lr_mult=config.get("token_lr_mult", 1.0),
+        patch_anchor_sim_threshold=config.get("patch_anchor_sim_threshold"),
+        local_anchor_sim_threshold=config.get("local_anchor_sim_threshold"),
+    )
+
+    cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
+    eval_results = token_retrieval_accuracy(
+        model, data, token_emb_all, cell_meta_device, device=device,
+        cell_type_labels=cell_type_labels,
+    )
+
+    rng = np.random.default_rng(0)
+    n_cells = eval_results["z_token_cell_full"].shape[0]
+    sub_idx = rng.choice(n_cells, size=min(leakage_subsample, n_cells), replace=False)
+    token_leak = evaluate_latent_leakage(
+        eval_results["z_token_cell_full"][sub_idx], cell_meta["slide_id"].cpu().numpy()[sub_idx],
+    )
+
+    final_epoch = history[-1]
+    metrics = {
+        "run_id": run_id,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "cell_top1_retrieval": eval_results["mean_top1"],
+        "cell_cluster_top1_retrieval": eval_results["mean_cluster_top1"],
+        "token_leakage_mean": token_leak["leakage_mean"],
+        "token_leakage_chance": token_leak["leakage_chance"],
+        "final_local_frac_masked": final_epoch["local_frac_masked"],
+        "final_contrast_local": final_epoch["contrast_local"],
+        "final_recon_token": final_epoch["recon_token"],
+    }
+    row = {**{f"cfg__{k}": v for k, v in config.items()}, **metrics}
+
+    # Same union-column reconciliation as run_experiment -- see its docstring
+    # for why a plain DictWriter.writerow() silently corrupts the file once the
+    # config surface gains a new key between runs.
+    log_path = Path(log_path)
+    row_df = pd.DataFrame([row])
+    if log_path.exists():
+        existing = pd.read_csv(log_path)
+        combined = pd.concat([existing, row_df], ignore_index=True, sort=False)
+    else:
+        combined = row_df
+    combined.to_csv(log_path, index=False)
+
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"model_state_dict": model.state_dict(), "config": config, "metrics": metrics, "history": history},
+            checkpoint_dir / f"run_{run_id}.pt",
+        )
+
+    collapse_flag = " [POSSIBLE COLLAPSE]" if final_epoch["local_frac_masked"] > 0.5 else ""
+    print(f"[run {run_id}] cell_top1={metrics['cell_top1_retrieval']:.4f} "
+          f"cluster_top1={metrics['cell_cluster_top1_retrieval']:.4f} "
+          f"token_leakage={metrics['token_leakage_mean']:.4f} (chance={metrics['token_leakage_chance']:.4f}) "
+          f"frac_masked={metrics['final_local_frac_masked']:.4f}{collapse_flag}")
+
+    return metrics, model, history
 
 
 # ---- leave-one-slide-out evaluation ----------------------------------------

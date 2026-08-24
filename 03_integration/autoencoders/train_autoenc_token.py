@@ -15,7 +15,7 @@ unfiltered WSI_patch_token_embeddings.h5ad -- confirm both exist under
 data/{slide}/01_preprocessing/unimodel/metadata/ on the cluster before submitting.
 
 To change which slides/config this run uses, edit CONFIG below before submitting
-(same pattern as run_sweep.py/run_loso.py in this directory) -- e.g. duplicate
+(same pattern as run_token_sweep.py in this directory) -- e.g. duplicate
 this file or override CONFIG["sample"]/CONFIG["use_tokens"] per sbatch job rather
 than adding CLI flags, so each run's exact settings stay visible in the script
 itself alongside its output.
@@ -408,7 +408,15 @@ eval_results = retrieval_accuracy(model, data, hist_emb_t, patch_meta_device, de
 
 if CONFIG["use_tokens"]:
     cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
-    token_eval_results = token_retrieval_accuracy(model, data, token_emb_t, cell_meta_device, device=device)
+    # "clusters" is an independent transcriptomics-only clustering already present on
+    # the raw input adata (not derived from this model's own trans/token projections),
+    # so it's a valid independent label for cluster-level retrieval credit -- see
+    # token_retrieval_accuracy's cell_type_labels docstring for why that matters.
+    cluster_labels = pd.factorize(trans_sub.obs["clusters"])[0]
+    token_eval_results = token_retrieval_accuracy(
+        model, data, token_emb_t, cell_meta_device, device=device,
+        cell_type_labels=cluster_labels,
+    )
 
 # ---- save latents ----------------------------------------------------
 with torch.no_grad():
