@@ -17,6 +17,7 @@ embedding.
 
 from __future__ import annotations
 
+import gc
 from pathlib import Path
 
 import anndata as ad
@@ -517,12 +518,17 @@ def merge_anndatas(
         adatas, sample_ids, per_sample_var_cols, auto_detect_var_cols, reference_only_var_cols,
         per_sample_uns_moran_key, per_sample_pca_key, additional_per_sample_obsm_keys,
     )
+    n_new = len(adatas)
+    del adatas  # already folded into adata_merged -- the raw per-sample copies aren't needed again
+    gc.collect()
 
     if existing is not None:
         adata_merged = _extend_combined(existing, adata_merged)
-        print(f"Merged {len(adatas)} new sample(s) into the existing {len(existing_slides)} -> {out_path}")
+        del existing  # folded into the new adata_merged -- can be the full, possibly many-GB prior combined file
+        gc.collect()
+        print(f"Merged {n_new} new sample(s) into the existing {len(existing_slides)} -> {out_path}")
     else:
-        print(f"Merged {len(adatas)}/{len(samples)} sample(s) -> {out_path}")
+        print(f"Merged {n_new}/{len(samples)} sample(s) -> {out_path}")
 
     stray_nones = sanitize_uns(adata_merged)
     if stray_nones:
@@ -588,10 +594,14 @@ def merge_parquet(
         raise ValueError(f"No files named {filename!r} found to merge.")
 
     merged = pd.concat(parts, ignore_index=True)
+    existing_was_present = existing is not None
+    n_new = len(new_parts)
+    del parts, new_parts, existing  # already folded into merged
+    gc.collect()
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     merged.to_parquet(out_path, index=False)
-    print(f"Merged {len(new_parts)}/{len(samples_to_read)} new sample(s) -> {out_path}"
-          + (f" ({len(existing_slides)} already present, kept)" if existing is not None else ""))
+    print(f"Merged {n_new}/{len(samples_to_read)} new sample(s) -> {out_path}"
+          + (f" ({len(existing_slides)} already present, kept)" if existing_was_present else ""))
 
     return merged
