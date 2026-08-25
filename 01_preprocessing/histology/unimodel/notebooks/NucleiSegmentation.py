@@ -32,7 +32,7 @@ from stardist import export_imagej_rois
 
 def main(args):
 
-    Path("output").mkdir(parents=True, exist_ok=True)
+    Path(args.out).mkdir(parents=True, exist_ok=True)
 
     # Read full image
     img = imread(args.image)
