@@ -31,7 +31,6 @@ import os
 import random
 from pathlib import Path
 
-import cv2
 import numpy as np
 import pandas as pd
 import pyvips
@@ -140,7 +139,8 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
         dtype=np.uint8,
         shape=[cropped.height, cropped.width, cropped.bands],
     )
-    img = cv2.cvtColor(numpy_array, cv2.COLOR_RGB2BGR) if cropped.bands == 3 else numpy_array
+    # RGB -> BGR, matching what cv2.cvtColor(..., cv2.COLOR_RGB2BGR) would do
+    img = numpy_array[:, :, ::-1] if cropped.bands == 3 else numpy_array
     del numpy_array, cropped
     gc.collect()
 
