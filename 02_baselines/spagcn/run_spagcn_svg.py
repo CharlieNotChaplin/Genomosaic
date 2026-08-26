@@ -168,7 +168,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
     print(f"Wrote {nuclei_centroids_path} and {adj_path}")
 
 
-def run_search(dir_spagcn_data, n_clusters, p, seed):
+def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_max_run):
     adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
     adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
     adata.var_names_make_unique()
@@ -177,12 +177,38 @@ def run_search(dir_spagcn_data, n_clusters, p, seed):
     sc.pp.normalize_per_cell(adata)
     sc.pp.log1p(adata)
 
-    print("Searching for l (p =", p, ")...")
-    l = spg.search_l(p, adj, start=0.01, end=1000, tol=0.01, max_run=100)
+    # Diagnose the search range ourselves before calling spg.search_l: SpaGCN's own
+    # diagnostic prints ("l not found, try smaller/bigger ...") go to a block-buffered
+    # stdout and can be lost if the process later dies, leaving only the confusing
+    # downstream "l should not be set" ValueError with no explanation. flush=True here
+    # so this always lands in the log regardless of buffering.
+    p_low = spg.calculate_p(adj, l_start)
+    p_high = spg.calculate_p(adj, l_end)
+    print(f"Searching for l (p target = {p}); p(l={l_start}) = {p_low:.4f}, "
+          f"p(l={l_end}) = {p_high:.4f}", flush=True)
+    if p_low > p + l_tol:
+        raise RuntimeError(
+            f"p(l={l_start}) = {p_low:.4f} already exceeds target p={p} -- this sample's "
+            f"adjacency is denser than the default range assumes, pass a smaller --l-start"
+        )
+    if p_high < p - l_tol:
+        raise RuntimeError(
+            f"p(l={l_end}) = {p_high:.4f} is still below target p={p} -- "
+            f"pass a larger --l-end"
+        )
+
+    l = spg.search_l(p, adj, start=l_start, end=l_end, tol=l_tol, max_run=l_max_run)
+    if l is None:
+        raise RuntimeError(
+            f"spg.search_l did not converge within max_run={l_max_run} even though "
+            f"p={p} is bracketed by [{p_low:.4f}, {p_high:.4f}] -- try --l-max-run higher "
+            f"or --l-tol looser"
+        )
     with open(dir_spagcn_data / "l.txt", "w") as f:
         f.write(str(l))
+    print("l =", l, flush=True)
 
-    print(f"Searching for resolution giving {n_clusters} clusters...")
+    print(f"Searching for resolution giving {n_clusters} clusters...", flush=True)
     res = spg.search_res(
         adata, adj, l, n_clusters, start=0.7, step=0.1, tol=5e-3, lr=0.05,
         max_epochs=20, r_seed=seed, t_seed=seed, n_seed=seed,
@@ -268,6 +294,10 @@ def main():
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--p", type=float, default=0.5)
     parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--l-start", type=float, default=0.01, help="spg.search_l lower bound")
+    parser.add_argument("--l-end", type=float, default=1000, help="spg.search_l upper bound")
+    parser.add_argument("--l-tol", type=float, default=0.01, help="spg.search_l tolerance on p")
+    parser.add_argument("--l-max-run", type=int, default=100, help="spg.search_l bisection step cap")
     args = parser.parse_args()
 
     basedir = Path("../../data")
@@ -281,7 +311,8 @@ def main():
     if args.stage in ("search", "all"):
         build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
                                  dir_spagcn_data, dir_spagcn_results, args.sample, args.beta, args.alpha)
-        run_search(dir_spagcn_data, args.n_clusters, args.p, args.seed)
+        run_search(dir_spagcn_data, args.n_clusters, args.p, args.seed,
+                   args.l_start, args.l_end, args.l_tol, args.l_max_run)
 
     if args.stage in ("train", "all"):
         run_train(dir_spagcn_data, dir_spagcn_results, args.n_clusters, args.seed, args.svg_genes_only)
