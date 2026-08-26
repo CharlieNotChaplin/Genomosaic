@@ -25,24 +25,42 @@ def parse_args():
         "--data_dir",
         type=str,
         default="../../../../data",
+        # Base directory holding one subfolder per slide (e.g. data/CRC_P1/, data/CRC_P2/...).
+        # This script expects two things to already exist under it, produced by earlier
+        # pipeline steps:
+        #   1. data_dir/{sample}/01_preprocessing/unimodel/patches/*.png -- the 224x224
+        #      patch images, created by 01_patch_creation_uni.ipynb.
+        #   2. data_dir/combined/01_preprocessing/unimodel/metadata/WSI_patch_metadata.csv --
+        #      each patch's absolute pixel position in the original WSI, also written by
+        #      01_patch_creation_uni.ipynb. This script does NOT create patches or pixel
+        #      positions itself, only reads them.
         help="Path to base data directory.",
     )
     parser.add_argument(
         "--weights_dir",
         type=str,
         default="../weights",
+        # Must already contain the downloaded UNI2-h checkpoint file "pytorch_model.bin"
+        # (see 01_patch_creation_uni.ipynb's model-setup section for how to download it) --
+        # this script raises FileNotFoundError rather than auto-downloading if it's missing.
         help="Path to directory containing model weights.",
     )
     parser.add_argument(
         "--batch_size",
         type=int,
         default=16,
+        # How many 224x224 patch images are run through the model in one forward pass.
+        # Higher = faster (better GPU utilization) but more GPU memory; lower this if you
+        # hit a CUDA out-of-memory error.
         help="Batch size for DataLoader.",
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=12,
+        # CPU worker processes that load/decode patch PNGs from disk in the background
+        # while the GPU is busy on the previous batch -- purely an I/O speed knob, has
+        # nothing to do with the model itself.
         help="Number of workers for DataLoader.",
     )
     parser.add_argument("--seed", type=int, default=42, help="Global random seed.")
@@ -50,6 +68,15 @@ def parse_args():
         "--sample",
         type=str,
         default=None,
+        # The main "what to run" switch. Give a single Slide_ID (e.g. "CRC_P11mm") to
+        # process just that one sample's patches -- typical usage when adding one new
+        # slide without redoing everyone else. Leave unset (the default) to process every
+        # sample folder found under --data_dir in one run, EXCEPT for the hardcoded
+        # skip_samples list a few lines below in check_for_patches() -- that list is
+        # meant to exclude samples already processed in an earlier run, so double-check
+        # it still matches reality (add/remove names as needed) before running with
+        # --sample unset, or a sample you actually want processed could get silently
+        # skipped.
         help="Slide_ID of a single sample to process. If omitted, all valid "
         "samples under --data_dir are processed.",
     )
@@ -70,6 +97,11 @@ def set_seed(seed: int = 42):
 
 def check_for_patches(basedir: Path, skip_samples=None, only_sample=None):
     if skip_samples is None:
+        # Samples considered "already processed" and skipped whenever --sample is left
+        # unset (main()'s "process everyone" mode). This list is NOT updated
+        # automatically -- if you add a new sample and want it excluded from future
+        # bulk runs too, add its name here manually. Irrelevant when --sample is given
+        # explicitly (only_sample below takes priority).
         skip_samples = ["new", "CRC_P1", "CRC_P2", "CRC_P5", "Normal_P3", "Normal_P5"]
 
     if only_sample is not None:
