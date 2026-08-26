@@ -2228,7 +2228,8 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, his
 # ---- leave-one-slide-out evaluation ----------------------------------------
 
 def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
-                         svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True):
+                         svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True,
+                         f_token_adata=None, token_scaler=None, local_neighbor_radius=None):
     """
     Runs the SVG-mask -> spatial-graph -> pairing -> standardize -> patch-metadata
     -> PyG-data-and-loader pipeline (the same steps that live inline in
@@ -2260,9 +2261,23 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
       separate scaler on the held-out slide alone would let its own mean/std
       leak into "normalization," defeating the point of holding it out.
 
+    f_token_adata / token_scaler / local_neighbor_radius: token-branch
+      (cell<->token) analogue of the hist args above, entirely optional --
+      leave f_token_adata=None (default) to reproduce the original
+      hist/trans-only behavior exactly, including the returned dict's keys.
+      When given, f_token_adata should already be filtered/indexed the same
+      way f_trans_adata is (Slide_ID+id index, "matched" filtering already
+      applied -- see train_autoenc_token.py's data-loading section, which this
+      mirrors); this function itself does no token-specific slide filtering.
+      As with svg_scaler/hist_scaler, pass the TRAINING call's fitted
+      token_scaler when building the held-out slice so its own mean/std can't
+      leak into "normalization."
+
     Returns a dict with everything downstream code needs: svg_mask, svg_scaler,
     hist_scaler, X_svg, hist_emb, hist_emb_t, trans_sub, patch_meta,
-    patch_meta_df, data, loader, n_slides, n_svg, hist_dim.
+    patch_meta_df, data, loader, n_slides, n_svg, hist_dim, and -- only when
+    f_token_adata is given -- token_scaler, token_emb, token_emb_t, cell_meta,
+    token_dim.
     """
     if svg_mask is None:
         svg_mask = get_svg_union_mask(f_trans_adata)
@@ -2273,6 +2288,17 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
                                 n_neighs=CONFIG["n_neighs"], delaunay=False)
 
     keep_mask, patch_row_trans, hist_emb = build_pairing(f_trans_adata, f_hist_adata)
+
+    # token pairing: further restrict keep_mask to cells that also have token data --
+    # same rationale/order as train_autoenc_token.py's step 3b (restrict BEFORE
+    # trans_sub/conn_sub/X_svg are sliced, so every downstream array stays row-aligned).
+    if f_token_adata is not None:
+        has_token = f_trans_adata.obs_names.isin(f_token_adata.obs_names)
+        n_dropped = int(keep_mask.sum() - (keep_mask & has_token).sum())
+        if verbose and n_dropped:
+            print(f"  dropping {n_dropped} cells with a hist-patch match but no token match")
+        keep_mask = keep_mask & has_token
+
     trans_sub = f_trans_adata[keep_mask].copy()
     conn_sub = conn[keep_mask][:, keep_mask]
     X_svg = trans_sub.X[:, svg_mask]
@@ -2287,10 +2313,28 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
         X_svg = svg_scaler.transform(X_svg).astype(np.float32)
         hist_emb = hist_scaler.transform(hist_emb).astype(np.float32)
 
+    if f_token_adata is not None:
+        token_sub = f_token_adata[trans_sub.obs_names]
+        assert (token_sub.obs_names == trans_sub.obs_names).all(), "token/trans row alignment mismatch"
+        token_emb = np.concatenate(
+            [np.asarray(token_sub.obsm["X_token_footprint"]), np.asarray(token_sub.obsm["X_token_halo"])],
+            axis=1,
+        ).astype(np.float32)
+        if token_scaler is None:
+            token_scaler = StandardScaler()
+            token_emb = token_scaler.fit_transform(token_emb).astype(np.float32)
+        else:
+            token_emb = token_scaler.transform(token_emb).astype(np.float32)
+        if verbose:
+            print(f"  token_emb: {token_emb.shape}")
+
     cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
     patch_meta, patch_meta_df = compute_patch_metadata(
         patch_row_trans, cell_xy, f_hist_adata, neighbor_radius=CONFIG["neighbor_radius"],
     )
+
+    if f_token_adata is not None:
+        cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=local_neighbor_radius)
 
     data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
     patch_to_nodes = build_patch_to_nodes(data.patch_row)
@@ -2301,13 +2345,20 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     )
     hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
 
-    return {
+    result = {
         "svg_mask": svg_mask, "svg_scaler": svg_scaler, "hist_scaler": hist_scaler,
         "X_svg": X_svg, "hist_emb": hist_emb, "hist_emb_t": hist_emb_t,
         "trans_sub": trans_sub, "patch_meta": patch_meta, "patch_meta_df": patch_meta_df,
         "data": data, "loader": loader, "n_slides": n_slides,
         "n_svg": X_svg.shape[1], "hist_dim": hist_emb.shape[1],
     }
+    if f_token_adata is not None:
+        result.update({
+            "token_scaler": token_scaler, "token_emb": token_emb,
+            "token_emb_t": torch.tensor(token_emb, dtype=torch.float32),
+            "cell_meta": cell_meta, "token_dim": token_emb.shape[1],
+        })
+    return result
 
 
 def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans_coord,
@@ -2608,6 +2659,287 @@ def run_5fold_loso(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
     for held_out in all_slides:
         metrics, _ = run_leave_one_slide_out(
             held_out, f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
+            log_path=log_path, checkpoint_dir=checkpoint_dir, seed=seed, verbose=verbose,
+        )
+        results.append(metrics)
+    return pd.DataFrame(results)
+
+
+def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f_trans_coord,
+                                   f_token_adata, CONFIG, device, log_path=None, checkpoint_dir=None,
+                                   seed=0, verbose=True, run_tag="", leakage_subsample=20_000):
+    """
+    Token-branch (cell<->token) analogue of `run_leave_one_slide_out`: does
+    cell-level cross-modal retrieval generalize to a slide the model never saw
+    at any stage of training (not Phase 1b token pretraining, not Phase 3 joint
+    training)?
+
+    Same rationale as the patch-level version -- every cell-level retrieval
+    number produced so far (the 18-config sweep in token_sweep.py included) was
+    measured on data the model had already trained on. This is the actual test
+    of whether SAGEConv/TransformerConv's inductive capability, and the trained
+    token_enc, generalize to unseen tissue rather than just memorizing it.
+
+    Mirrors train_autoenc_token.py's validated regime: hist_enc/hist_dec left
+    at random init and frozen immediately (harmless as long as
+    CONFIG["max_contrast_weight"]=0.0 -- patch-level alignment isn't being
+    trained, see that script's CONFIG comment), token_enc/token_dec pretrained
+    ONCE on the training slides only via `pretrain_token_autoencoder`, then
+    Phase 3 trains the cell<->token contrastive term with whatever
+    max_local_contrast_weight/local_warmup_epochs/local_anchor_sim_threshold
+    CONFIG carries.
+
+    f_hist_adata / f_trans_adata / f_trans_coord / f_token_adata: already
+      loaded, concatenated, and index-set exactly the way
+      train_autoenc_token.py's data-loading section does (Slide_ID+id /
+      Slide_ID+Patch_ID index, f_token_adata already restricted to
+      obs["matched"]) -- this function does no loading of its own, only the
+      train/held-out slide split and the pipeline construction below it.
+
+    Reports cell-level top1/cluster_top1 retrieval on BOTH the training slides
+    (in-sample) and the held-out slide (the actual generalization number) --
+    the GAP between them is what tells you whether this generalizes, same as
+    the patch-level function.
+
+    Deliberately NOT reported for the held-out slide: token_leakage. Same
+    reason as the patch version's hist_leakage -- there's no other slide
+    within a single held-out slide to classify against.
+
+    leakage_subsample: `evaluate_latent_leakage` runs cross-validated logistic
+      regression, too slow at full cell-population size (1M+ cells) -- capped
+      the same way `run_token_experiment` caps it.
+
+    seed: FIXED (default 0) for the same reason `run_token_experiment` pins it
+      -- trans_enc/pooling/projection heads are freshly initialized here on
+      every call; an uncontrolled random init would confound a fold-to-fold
+      comparison.
+    """
+    import time
+    from pathlib import Path
+
+    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
+    if held_out_slide not in all_slides:
+        raise ValueError(f"held_out_slide {held_out_slide!r} not found among {all_slides}")
+    train_slides = [s for s in all_slides if s != held_out_slide]
+
+    if verbose:
+        print(f"[LOSO-token] held out: {held_out_slide} | train: {train_slides}")
+
+    hist_slide = f_hist_adata.obs["Slide_ID"].astype(str)
+    trans_slide = f_trans_adata.obs["Slide_ID"].astype(str)
+    coord_slide = f_trans_coord["Slide_ID"].astype(str)
+    token_slide = f_token_adata.obs["Slide_ID"].astype(str)
+
+    f_hist_train = f_hist_adata[hist_slide != held_out_slide].copy()
+    f_trans_train = f_trans_adata[trans_slide != held_out_slide].copy()
+    f_coord_train = f_trans_coord[coord_slide != held_out_slide]
+    f_token_train = f_token_adata[token_slide != held_out_slide].copy()
+
+    f_hist_held = f_hist_adata[hist_slide == held_out_slide].copy()
+    f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
+    f_coord_held = f_trans_coord[coord_slide == held_out_slide]
+    f_token_held = f_token_adata[token_slide == held_out_slide].copy()
+
+    # gene selection computed ONCE from TRAIN-only data -- same rationale as the
+    # patch-level function: computing it fresh on the held-out slide alone would leak
+    # its own variability pattern into what "counts" as a selected gene.
+    gene_selection = CONFIG.get("gene_selection", "svg")
+    gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection)
+    if verbose:
+        print(f"  gene selection ({gene_selection}): {gene_mask.sum()} genes")
+
+    if verbose:
+        print("  building training-slide pipeline data (hist + token)...")
+    train_pipe = build_pipeline_data(
+        f_hist_train, f_trans_train, f_coord_train, CONFIG, svg_mask=gene_mask,
+        f_token_adata=f_token_train, local_neighbor_radius=CONFIG.get("local_neighbor_radius"),
+        verbose=verbose,
+    )
+
+    if verbose:
+        print("  building held-out-slide pipeline data (reusing training svg_mask/scalers)...")
+    held_pipe = build_pipeline_data(
+        f_hist_held, f_trans_held, f_coord_held, CONFIG,
+        svg_mask=train_pipe["svg_mask"], svg_scaler=train_pipe["svg_scaler"],
+        hist_scaler=train_pipe["hist_scaler"], f_token_adata=f_token_held,
+        token_scaler=train_pipe["token_scaler"], local_neighbor_radius=CONFIG.get("local_neighbor_radius"),
+        verbose=verbose,
+    )
+
+    model_kwargs = dict(
+        n_svg=train_pipe["n_svg"], hist_dim=train_pipe["hist_dim"], token_dim=train_pipe["token_dim"],
+        latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
+        n_slides=train_pipe["n_slides"], pool_type=CONFIG["pool_type"], encoder_type=CONFIG["encoder"],
+        hist_condition_on_slide=CONFIG.get("hist_condition_on_slide", True),
+        token_condition_on_slide=CONFIG.get("token_condition_on_slide", True),
+    )
+    pretrain_kwargs = dict(
+        epochs=CONFIG["token_pretrain_epochs"], lr=CONFIG["token_pretrain_lr"],
+        weight_decay=CONFIG["token_pretrain_weight_decay"],
+        val_frac=CONFIG["token_pretrain_val_frac"], patience=CONFIG["token_pretrain_patience"],
+    )
+
+    set_seed(seed)
+    model = DualAutoencoder(**model_kwargs)
+    pretrain_info = pretrain_token_autoencoder(
+        model, train_pipe["token_emb_t"], train_pipe["cell_meta"],
+        device=device, verbose=verbose, **pretrain_kwargs,
+    )
+
+    # hist_enc/hist_dec always frozen at random init here -- harmless as long as
+    # max_contrast_weight=0.0 (see train_autoenc_token.py's CONFIG comment: patch-level
+    # alignment isn't being trained while this project's focus is the cell/token branch).
+    freeze_hist_encoder(model, freeze_decoder=True)
+    freeze_token = CONFIG.get("freeze_token", False)
+    if freeze_token:
+        freeze_token_encoder(model, freeze_decoder=True)
+
+    history = train(
+        model, train_pipe["loader"], train_pipe["hist_emb_t"], train_pipe["patch_meta"],
+        n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
+        max_contrast_weight=CONFIG.get("max_contrast_weight", 0.0), temperature=CONFIG["temperature"],
+        weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
+        freeze_hist=True, device=device,
+        token_emb_all=train_pipe["token_emb_t"], cell_meta=train_pipe["cell_meta"],
+        max_local_contrast_weight=CONFIG["max_local_contrast_weight"],
+        local_warmup_epochs=CONFIG.get("local_warmup_epochs"),
+        freeze_token=freeze_token, token_lr_mult=CONFIG.get("token_lr_mult", 1.0),
+        patch_anchor_sim_threshold=CONFIG.get("patch_anchor_sim_threshold"),
+        local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
+    )
+
+    # cluster labels (independent, pre-existing trans-only clustering) computed
+    # separately per side -- codes don't need to match between train/held-out since
+    # each is evaluated as its own closed candidate pool (see token_retrieval_accuracy).
+    train_cluster_labels = pd.factorize(train_pipe["trans_sub"].obs["clusters"])[0]
+    held_cluster_labels = pd.factorize(held_pipe["trans_sub"].obs["clusters"])[0]
+
+    train_cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
+                               for k, v in train_pipe["cell_meta"].items()}
+    if verbose:
+        print("  in-sample (training slides) cell<->token retrieval:")
+    train_eval = token_retrieval_accuracy(
+        model, train_pipe["data"], train_pipe["token_emb_t"], train_cell_meta_device,
+        device=device, cell_type_labels=train_cluster_labels,
+    )
+
+    held_cell_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
+                              for k, v in held_pipe["cell_meta"].items()}
+    if verbose:
+        print(f"  held-out ({held_out_slide}) cell<->token retrieval -- the actual generalization test:")
+    held_eval = token_retrieval_accuracy(
+        model, held_pipe["data"], held_pipe["token_emb_t"], held_cell_meta_device,
+        device=device, cell_type_labels=held_cluster_labels,
+    )
+
+    # token leakage on the TRAINING slides only (meaningful: n_slides-1 classes to
+    # distinguish), subsampled the same way run_token_experiment does -- cross-validated
+    # logistic regression is too slow at full cell-population size.
+    rng = np.random.default_rng(0)
+    n_train_cells = train_eval["z_token_cell_full"].shape[0]
+    train_sub_idx = rng.choice(n_train_cells, size=min(leakage_subsample, n_train_cells), replace=False)
+    train_leak_token = evaluate_latent_leakage(
+        train_eval["z_token_cell_full"][train_sub_idx],
+        train_pipe["cell_meta"]["slide_id"].cpu().numpy()[train_sub_idx],
+    )
+    if verbose:
+        print(f"  train-slide token leakage: {train_leak_token['leakage_mean']:.3f} "
+              f"(chance = {train_leak_token['leakage_chance']:.3f})")
+
+    # held-out-vs-train leakage: does a classifier separate the held-out slide's cells
+    # out as their own obviously-distinct cluster, or do they blend in like just another
+    # training slide would? Needs string Slide_ID labels (not the numeric slide_id codes,
+    # which are factorized separately within each build_pipeline_data call) -- trans_sub
+    # carries the actual Slide_ID strings, row-aligned to z_token_cell_full the same way
+    # patch_meta_df is for the patch-level version (no unique_patches indexing needed here
+    # since every kept cell becomes exactly one graph node, unlike patches which can be
+    # dropped/deduplicated).
+    n_held_cells = held_eval["z_token_cell_full"].shape[0]
+    held_sub_idx = rng.choice(n_held_cells, size=min(leakage_subsample, n_held_cells), replace=False)
+    combined_z = np.concatenate([
+        train_eval["z_token_cell_full"][train_sub_idx], held_eval["z_token_cell_full"][held_sub_idx],
+    ])
+    combined_slide_name = np.concatenate([
+        train_pipe["trans_sub"].obs["Slide_ID"].values[train_sub_idx],
+        held_pipe["trans_sub"].obs["Slide_ID"].values[held_sub_idx],
+    ])
+    combined_leak_token = evaluate_latent_leakage(combined_z, combined_slide_name)
+    if verbose:
+        print(f"  held-out-vs-train token leakage (n_slides={len(all_slides)}): "
+              f"{combined_leak_token['leakage_mean']:.3f} (chance = {combined_leak_token['leakage_chance']:.3f})")
+
+    metrics = {
+        "run_id": f"loso_token_{held_out_slide}{run_tag}",
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "held_out_slide": held_out_slide,
+        "train_slides": ",".join(train_slides),
+        "train_cell_top1_retrieval": train_eval["mean_top1"],
+        "train_cell_cluster_top1_retrieval": train_eval["mean_cluster_top1"],
+        "held_out_cell_top1_retrieval": held_eval["mean_top1"],
+        "held_out_cell_cluster_top1_retrieval": held_eval["mean_cluster_top1"],
+        "token_pretrain_best_val_mse": pretrain_info["best_val_mse"],
+        "token_pretrain_stopped_epoch": pretrain_info["stopped_epoch"],
+        "train_token_leakage_mean": train_leak_token["leakage_mean"],
+        "train_token_leakage_chance": train_leak_token["leakage_chance"],
+        "combined_token_leakage_mean": combined_leak_token["leakage_mean"],
+        "combined_token_leakage_chance": combined_leak_token["leakage_chance"],
+        "final_local_frac_masked": history[-1]["local_frac_masked"],
+        "final_contrast_local": history[-1]["contrast_local"],
+    }
+
+    if log_path is not None:
+        row = {**{f"cfg__{k}": v for k, v in CONFIG.items()}, **metrics}
+        row_df = pd.DataFrame([row])
+        log_path = Path(log_path)
+        if log_path.exists():
+            existing = pd.read_csv(log_path)
+            combined_log = pd.concat([existing, row_df], ignore_index=True, sort=False)
+        else:
+            combined_log = row_df
+        combined_log.to_csv(log_path, index=False)
+
+    if checkpoint_dir is not None:
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {"model_state_dict": model.state_dict(), "config": CONFIG, "metrics": metrics, "history": history},
+            checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}.pt",
+        )
+        # Full (uncapped) cell embeddings, saved alongside the checkpoint as the actual
+        # deliverable (same rationale as the patch-level function) -- can be large (a
+        # multi-hundred-MB .npz) when the training pool is 1M+ cells.
+        np.savez(
+            checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}_embeddings.npz",
+            train_z_trans=train_eval["z_trans_cell_full"], train_z_token=train_eval["z_token_cell_full"],
+            train_slide_name=train_pipe["trans_sub"].obs["Slide_ID"].values,
+            held_out_z_trans=held_eval["z_trans_cell_full"], held_out_z_token=held_eval["z_token_cell_full"],
+        )
+
+    if verbose:
+        gap = metrics["train_cell_top1_retrieval"] - metrics["held_out_cell_top1_retrieval"]
+        cluster_gap = metrics["train_cell_cluster_top1_retrieval"] - metrics["held_out_cell_cluster_top1_retrieval"]
+        print(f"[LOSO-token {held_out_slide}] train_top1={metrics['train_cell_top1_retrieval']:.4f} "
+              f"held_out_top1={metrics['held_out_cell_top1_retrieval']:.4f} (gap={gap:.4f}) | "
+              f"train_cluster={metrics['train_cell_cluster_top1_retrieval']:.4f} "
+              f"held_out_cluster={metrics['held_out_cell_cluster_top1_retrieval']:.4f} (gap={cluster_gap:.4f})")
+
+    return metrics, model, history
+
+
+def run_5fold_loso_token(f_hist_adata, f_trans_adata, f_trans_coord, f_token_adata, CONFIG, device,
+                          log_path=None, checkpoint_dir=None, seed=0, verbose=True):
+    """
+    Runs `run_leave_one_slide_out_token` once per slide (full leave-one-slide-out CV
+    for the cell/token branch). Expensive: trains Phase 1b (token pretrain) + Phase 3
+    from scratch once per slide -- run a single held-out slide first via
+    `run_leave_one_slide_out_token` directly and sanity check it before committing
+    to this.
+    """
+    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
+    results = []
+    for held_out in all_slides:
+        metrics, _, _ = run_leave_one_slide_out_token(
+            held_out, f_hist_adata, f_trans_adata, f_trans_coord, f_token_adata, CONFIG, device,
             log_path=log_path, checkpoint_dir=checkpoint_dir, seed=seed, verbose=verbose,
         )
         results.append(metrics)
