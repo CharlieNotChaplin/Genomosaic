@@ -35,8 +35,15 @@ import numpy as np
 import pandas as pd
 import pyvips
 import scanpy as sc
+import scipy.sparse as sp
 import SpaGCN as spg
 import torch
+
+# SpaGCN (SpaGCN.py, util.py) still uses the old `.A` shorthand for sparse -> dense
+# conversion, which scipy removed in favor of `.toarray()`. Restore it globally
+# rather than patching vendored code in site-packages.
+if not hasattr(sp.spmatrix, "A"):
+    sp.spmatrix.A = property(lambda self: self.toarray())
 import warnings
 
 warnings.filterwarnings("ignore")
