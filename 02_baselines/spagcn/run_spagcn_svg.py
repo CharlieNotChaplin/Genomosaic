@@ -44,6 +44,48 @@ import torch
 # rather than patching vendored code in site-packages.
 if not hasattr(sp.spmatrix, "A"):
     sp.spmatrix.A = property(lambda self: self.toarray())
+
+
+def _calculate_adj_matrix_patched(x, y, x_pixel=None, y_pixel=None, image=None, beta=49, alpha=1, histology=True):
+    # Same fix already applied once in this repo's local SpaGCN_package/SpaGCN/calculate_adj.py
+    # (git commit 85f879a, Nov 2025) but never carried into a fresh `pip install SpaGCN` on the
+    # cluster: stock SpaGCN's calculate_adj_matrix does a plain np.mean over each nucleus's beta
+    # window with no guard for an out-of-bounds/empty/all-background crop. One such nucleus makes
+    # c0/c1/c2 contain a NaN, which poisons np.var(c0) (etc.) for every nucleus at once -> the
+    # whole z coordinate becomes NaN -> every entry of adj becomes NaN.
+    if histology:
+        assert (x_pixel is not None) and (y_pixel is not None) and (image is not None)
+        assert (len(x) == len(x_pixel)) and (len(y) == len(y_pixel))
+        print("Calculateing adj matrix using histology image...")
+        beta_half = round(beta / 2)
+        g = []
+        for i in range(len(x_pixel)):
+            max_x = image.shape[0]
+            max_y = image.shape[1]
+            nbs = image[max(0, x_pixel[i] - beta_half):min(max_x, x_pixel[i] + beta_half + 1),
+                        max(0, y_pixel[i] - beta_half):min(max_y, y_pixel[i] + beta_half + 1)]
+            if nbs.size == 0 or np.isnan(nbs).all():
+                g.append([0, 0, 0])
+            else:
+                g.append(np.nanmean(np.nanmean(nbs, axis=0), axis=0))
+        c0 = np.array([i[0] for i in g])
+        c1 = np.array([i[1] for i in g])
+        c2 = np.array([i[2] for i in g])
+        print("Var of c0,c1,c2 = ", np.var(c0), np.var(c1), np.var(c2))
+        c3 = (c0 * np.var(c0) + c1 * np.var(c1) + c2 * np.var(c2)) / (np.var(c0) + np.var(c1) + np.var(c2))
+        c4 = (c3 - np.mean(c3)) / np.std(c3)
+        z_scale = np.max([np.std(x), np.std(y)]) * alpha
+        z = (c4 * z_scale).tolist()
+        print("Var of x,y,z = ", np.var(x), np.var(y), np.var(z))
+        X = np.array([x, y, z]).T.astype(np.float32)
+    else:
+        print("Calculateing adj matrix using xy only...")
+        X = np.array([x, y]).T.astype(np.float32)
+    return spg.pairwise_distance(X)
+
+
+spg.calculate_adj_matrix = _calculate_adj_matrix_patched
+
 import warnings
 
 warnings.filterwarnings("ignore")
