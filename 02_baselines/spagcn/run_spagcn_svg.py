@@ -92,14 +92,19 @@ warnings.filterwarnings("ignore")
 
 
 def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
-                             dir_spagcn_data, dir_spagcn_results, sample, beta, alpha):
+                             dir_spagcn_data, dir_spagcn_results, sample, beta, alpha,
+                             force_recompute=False):
     nuclei_centroids_path = dir_spagcn_data / "nuclei_centroids_svg.h5ad"
     adj_path = dir_spagcn_data / "adj.npy"
 
     if nuclei_centroids_path.exists() and adj_path.exists():
-        print(f"Found existing {nuclei_centroids_path.name} and adj.npy, skipping prep "
-              "(delete them to force recompute)")
-        return
+        if not force_recompute:
+            print(f"Found existing {nuclei_centroids_path.name} and adj.npy, skipping prep "
+                  "(pass --force-recompute, or delete them, to force recompute)")
+            return
+        print(f"--force-recompute set: deleting existing {nuclei_centroids_path.name} and adj.npy")
+        nuclei_centroids_path.unlink()
+        adj_path.unlink()
 
     # get_svg.py annotates and writes back to the same count_area_filtered_adata.h5ad
     # it reads (var['spatially_variable'], var['moranI'], obsm['spatial']) -- there is
@@ -340,6 +345,8 @@ def main():
     parser.add_argument("--l-end", type=float, default=1000, help="spg.search_l upper bound")
     parser.add_argument("--l-tol", type=float, default=0.01, help="spg.search_l tolerance on p")
     parser.add_argument("--l-max-run", type=int, default=100, help="spg.search_l bisection step cap")
+    parser.add_argument("--force-recompute", action="store_true",
+                         help="delete and rebuild cached nuclei_centroids_svg.h5ad/adj.npy even if present")
     args = parser.parse_args()
 
     basedir = Path("../../data")
@@ -352,7 +359,8 @@ def main():
 
     if args.stage in ("search", "all"):
         build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
-                                 dir_spagcn_data, dir_spagcn_results, args.sample, args.beta, args.alpha)
+                                 dir_spagcn_data, dir_spagcn_results, args.sample, args.beta, args.alpha,
+                                 force_recompute=args.force_recompute)
         run_search(dir_spagcn_data, args.n_clusters, args.p, args.seed,
                    args.l_start, args.l_end, args.l_tol, args.l_max_run)
 
