@@ -9,9 +9,19 @@ opposed to every cell_top1/cell_cluster_top1 number produced so far (the
 model had already been trained on.
 
 Run this ONCE with a single held-out slide first (default below) and sanity
-check the result before committing to the full N-fold version (see the
-commented-out block at the bottom) -- N-fold means training Phase 1b + Phase 3
-from scratch once per slide, N times the cost of a single run.
+check the result before committing to the full N-fold version -- N-fold means
+training Phase 1b + Phase 3 from scratch once per slide, N times the cost of
+a single run.
+
+--held_out_slide selects the fold (default "CRC_P1", matches the original
+single-slide sanity check). For the full N-fold run, submit one array task per
+slide via submit_run_loso_array.sbatch rather than looping in-process (see
+that file) -- each task calls this script with a different --held_out_slide,
+running genuinely in parallel instead of N times the wall-clock of one run.
+log_path is named per held-out slide specifically so concurrent array tasks
+never write to the same CSV (a shared log would race: each task reads-modifies-
+writes the whole file, so concurrent writers can silently drop each other's
+rows) -- merge_loso_logs.py combines the per-slide logs afterward.
 
 CONFIG here matches the validated settings from train_autoenc_token.py's
 CONFIG (see that script's comments for the full rationale/history of each
@@ -25,6 +35,8 @@ in autoencoder_functions_new.py.
 """
 
 # ---- imports ----------------------------------------------------------
+import argparse
+
 import anndata as ad
 import geopandas as gpd
 import numpy as np
@@ -38,7 +50,7 @@ from plyer import notification
 from autoencoder_functions_new import *
 
 
-def run_it():
+def run_it(held_out_slide="CRC_P1"):
     set_seed(42)
 
     # ---- CONFIG -------------------------------------------------------------
@@ -116,8 +128,8 @@ def run_it():
         local_warmup_epochs=10,           # (see train_autoenc_token.py for the full history)
     )
 
-    # ---- WHICH SLIDE TO HOLD OUT (single-slide test) ---------------------------
-    HELD_OUT_SLIDE = "CRC_P1"   # change this to test a different slide
+    # ---- WHICH SLIDE TO HOLD OUT ------------------------------------------------
+    HELD_OUT_SLIDE = held_out_slide
 
     # ---- output dirs ----------------------------------------------------------
     basedir = Path("../../data")
@@ -185,8 +197,12 @@ def run_it():
     # patch-level run_leave_one_slide_out -- and moot anyway since hist_enc never trains
     # in this regime (max_contrast_weight=0.0).
 
-    # ---- single held-out slide, run first --------------------------------------
-    log_path = dir_output / "loso_token_log.csv"
+    # ---- single held-out slide ---------------------------------------------------
+    # Named per held-out slide (not a shared "loso_token_log.csv") so that running
+    # every slide's fold concurrently as a SLURM array (submit_run_loso_array.sbatch)
+    # never has two processes read-modify-write the same CSV at once -- see this
+    # script's docstring. merge_loso_logs.py combines them afterward.
+    log_path = dir_output / f"loso_token_log_{HELD_OUT_SLIDE}.csv"
     checkpoint_dir = dir_output / "loso_token_checkpoints"
 
     # run_tag disambiguates run_id/checkpoint filename when comparing regimes on the
@@ -227,23 +243,29 @@ def run_it():
     print(f"Cell embeddings (trans/token, train + held-out) saved to "
           f"{checkpoint_dir / f'loso_token_{HELD_OUT_SLIDE}{RUN_TAG}_embeddings.npz'}")
 
-    notification.notify(
-        title='Jupyter Notebook Alert',
-        message=f'LOSO-token run for {HELD_OUT_SLIDE} finished!',
-        app_name='Python',
-        timeout=5,
-    )
-
-    # ---- FULL N-FOLD (uncomment once the single-slide result above looks sane) ----
-    # WARNING: trains Phase 1b (token pretrain) + Phase 3 from scratch once per
-    # slide -- N x the cost of the single run above (N = number of slides).
-    #
-    # results_df = run_5fold_loso_token(
-    #     f_hist_adata, f_trans_adata, f_trans_coord, f_token_adata, CONFIG, device,
-    #     log_path=log_path, checkpoint_dir=checkpoint_dir, seed=0, verbose=True,
-    # )
-    # print(results_df[["held_out_slide", "train_cell_top1_retrieval", "held_out_cell_top1_retrieval"]])
+    # Best-effort only: plyer's Linux backend needs notify-send/dbus, neither of which
+    # exist on a headless cluster node -- confirmed to raise NotImplementedError there
+    # (see loso_err.txt from the CRC_P1 run). That happened AFTER the real work and the
+    # CSV/checkpoint writes above, so it never lost anything, but it did leave every job
+    # exiting on an uncaught traceback -- confusing across an 8-task array where you're
+    # scanning for which folds actually failed. Swallowed here since the notification
+    # itself is a non-essential convenience.
+    try:
+        notification.notify(
+            title='Jupyter Notebook Alert',
+            message=f'LOSO-token run for {HELD_OUT_SLIDE} finished!',
+            app_name='Python',
+            timeout=5,
+        )
+    except Exception as e:
+        print(f"(desktop notification skipped: {e})")
 
 
 if __name__ == "__main__":
-    run_it()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--held_out_slide", default="CRC_P1",
+                         help="Slide to hold out for this fold (default: CRC_P1). "
+                              "submit_run_loso_array.sbatch sets this per array task "
+                              "for the full N-fold run.")
+    args = parser.parse_args()
+    run_it(held_out_slide=args.held_out_slide)
