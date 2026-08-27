@@ -7,31 +7,43 @@
 #SBATCH -c 20
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-6
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
-# Full N-fold leave-one-slide-out (token branch): one array task per slide, each
-# holding out a different one -- run_leave_one_slide_out_token retrains Phase 1b +
-# Phase 3 from scratch per fold, so this runs all 8 folds genuinely in parallel
-# instead of 8x the wall-clock of the single CRC_P1 sanity check (which took ~46
-# min end to end -- --time above is padded to 2h for margin, not a rerun of that
-# job's own timing math).
+# CRC_P11mm-EXCLUDED experiment: run_loso.py's own EXCLUDE_SLIDES=["CRC_P11mm"] removes
+# it from every training pool AND from being a held-out target -- so this array only
+# needs the remaining 7 slides (--array=0-6, was 0-7 for the all-8 baseline). CRC_P11mm
+# is ~4x the physical tissue size of every other slide, mostly neoplasm (vs. the mixed
+# composition elsewhere), and PatchGroupedLoader gives it a proportionally huge share of
+# every training epoch's batches -- this tests whether the OTHER slides generalize
+# better once its outsized, low-diversity influence is removed from training (see
+# conversation notes -- it was also the worst-generalizing of all 8 folds itself).
+# CRC_P6_5mm stays IN deliberately, one variable at a time.
+#
+# Baseline (all 8 slides) results already archived to
+# data/combined/03_integration/autoencoders/002um/loso_token_baseline_all8slides/ so
+# this run's outputs (loso_token_log_{slide}_excl_CRC_P11mm.csv etc., automatically
+# tagged by run_loso.py's RUN_TAG) can't collide with them.
 #
 # Requires: run_loso.py, autoencoder_functions_new.py, and this .sbatch file all in
 # the SAME flat directory (no scripts/ subdirectory) when the job actually runs --
 # that's what makes `from autoencoder_functions_new import *` resolve without any
-# PYTHONPATH tricks. Deploy accordingly before submitting.
-SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P5 CRC_P6_5mm Normal_P3 Normal_P5)
+# PYTHONPATH tricks. Deploy accordingly before submitting, and run `sbatch` from
+# that same directory (see the cd below -- $SLURM_SUBMIT_DIR captures it).
+SLIDES=(CRC_P1 CRC_P11mm_2_cut CRC_P2 CRC_P5 CRC_P6_5mm Normal_P3 Normal_P5)
 HELD_OUT_SLIDE="${SLIDES[$SLURM_ARRAY_TASK_ID]}"
 
 # Load Conda environment
 source /beegfs/home/cwolf/miniconda3/etc/profile.d/conda.sh
 conda activate autoencoder
 
-# Working directory = wherever this script itself lives (the flat deployment
-# folder), regardless of where `sbatch` was invoked from.
-cd "$(dirname "$0")"
+# SLURM copies this script into a per-job spool directory before running it, so
+# $0/dirname "$0" points there, NOT at your actual deployment folder -- that's what
+# caused "can't open file '.../job59828/run_loso.py'" (permission-denied mkdir was
+# the same root cause: it landed in that read-only spool dir). $SLURM_SUBMIT_DIR is
+# the directory `sbatch` was actually invoked FROM -- cd there instead.
+cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
 echo "=================================================="

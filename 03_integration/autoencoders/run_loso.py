@@ -131,6 +131,25 @@ def run_it(held_out_slide="CRC_P1"):
     # ---- WHICH SLIDE TO HOLD OUT ------------------------------------------------
     HELD_OUT_SLIDE = held_out_slide
 
+    # ---- slides excluded from the dataset entirely (not just held out) ---------
+    # Testing whether CRC_P11mm should be in the training pool at all: it's ~4x the
+    # physical tissue size of every other slide and mostly neoplasm (vs. the more
+    # mixed composition of the other regions) -- 708k of the combined ~1.28M cells,
+    # so PatchGroupedLoader (which allocates batches per slide proportional to that
+    # slide's own patch count) gives it a hugely disproportionate share of every
+    # training epoch's gradient updates. It also turned out to be extremely
+    # transcriptionally homogeneous (76% of cells in one cluster -- see conversation
+    # notes), meaning much of that oversized share is spent on low-information,
+    # near-duplicate contrastive pairs. It was also the worst-generalizing of all 8
+    # LOSO folds by both cell_top1 and chance-adjusted cluster_top1 lift. This list
+    # excludes it from BOTH the training pool and the held-out targets entirely (not
+    # just skipped as a held-out choice) so the remaining 7 slides' own generalization
+    # can be re-measured without its influence. CRC_P6_5mm stays IN for this run
+    # deliberately -- one variable at a time -- even though it was flagged as another
+    # weak fold, so any change in the other slides' numbers can be attributed to
+    # CRC_P11mm's removal specifically, not conflated with a second change.
+    EXCLUDE_SLIDES = ["CRC_P11mm"]
+
     # ---- output dirs ----------------------------------------------------------
     basedir = Path("../../data")
     dir_histology = basedir / "combined/01_preprocessing/unimodel/metadata"
@@ -157,6 +176,17 @@ def run_it(held_out_slide="CRC_P1"):
     if not hist_global_id.is_unique:
         raise ValueError("Cannot set Slide_ID+Patch_ID as index: contains duplicates")
     f_hist_adata.obs = f_hist_adata.obs.set_index(hist_global_id)
+
+    # ---- apply EXCLUDE_SLIDES (see its own comment above) -- BEFORE token loading, ----
+    # ---- so slides_needed below never even looks for their token files ----------------
+    if EXCLUDE_SLIDES:
+        if HELD_OUT_SLIDE in EXCLUDE_SLIDES:
+            raise ValueError(f"HELD_OUT_SLIDE={HELD_OUT_SLIDE!r} is also in EXCLUDE_SLIDES "
+                              f"{EXCLUDE_SLIDES} -- pick a held-out slide that isn't excluded.")
+        print(f"Excluding from the dataset entirely (not just as a held-out choice): {EXCLUDE_SLIDES}")
+        f_hist_adata = f_hist_adata[~f_hist_adata.obs["Slide_ID"].isin(EXCLUDE_SLIDES)].copy()
+        f_trans_adata = f_trans_adata[~f_trans_adata.obs["Slide_ID"].astype(str).isin(EXCLUDE_SLIDES)].copy()
+        f_trans_coord = f_trans_coord[~f_trans_coord["Slide_ID"].isin(EXCLUDE_SLIDES)].copy()
 
     # ---- load token data --------------------------------------------------------
     # Same loading logic as train_autoenc_token.py's step "load token data": reads each
@@ -198,14 +228,9 @@ def run_it(held_out_slide="CRC_P1"):
     # in this regime (max_contrast_weight=0.0).
 
     # ---- single held-out slide ---------------------------------------------------
-    # Named per held-out slide (not a shared "loso_token_log.csv") so that running
-    # every slide's fold concurrently as a SLURM array (submit_run_loso_array.sbatch)
-    # never has two processes read-modify-write the same CSV at once -- see this
-    # script's docstring. merge_loso_logs.py combines them afterward.
-    log_path = dir_output / f"loso_token_log_{HELD_OUT_SLIDE}.csv"
     checkpoint_dir = dir_output / "loso_token_checkpoints"
 
-    # run_tag disambiguates run_id/checkpoint filename when comparing regimes on the
+    # run_tag disambiguates run_id/checkpoint/log filename when comparing regimes on the
     # same held_out_slide -- otherwise a second run silently overwrites the first run's
     # checkpoint (same collision class run_sweep.py's BATCH_TAG fixed). Built from
     # whichever non-default regimes are active, so it composes as new toggles get added.
@@ -214,7 +239,19 @@ def run_it(held_out_slide="CRC_P1"):
         _tag_parts.append("frozen_token")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
+    if EXCLUDE_SLIDES:
+        _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
+
+    # Named per held-out slide AND run_tag (not a shared "loso_token_log.csv") so that
+    # (a) running every slide's fold concurrently as a SLURM array
+    # (submit_run_loso_array.sbatch) never has two processes read-modify-write the same
+    # CSV at once, and (b) a different regime (e.g. this EXCLUDE_SLIDES experiment) on
+    # the SAME held-out slide gets its own log file instead of silently overwriting the
+    # baseline's row -- this was a real gap before (checkpoints already carried RUN_TAG,
+    # the log filename didn't). merge_loso_logs.py combines per-slide logs afterward;
+    # point it at whichever regime's files you want merged.
+    log_path = dir_output / f"loso_token_log_{HELD_OUT_SLIDE}{RUN_TAG}.csv"
 
     print(f"\n=== Leave-one-slide-out (token branch): holding out {HELD_OUT_SLIDE} "
           f"(freeze_token={CONFIG['freeze_token']}) ===\n")

@@ -16,7 +16,12 @@ import pandas as pd
 basedir = Path("../../data")
 dir_output = basedir / "combined/03_integration/autoencoders/002um"
 
-logs = sorted(dir_output.glob("loso_token_log_*.csv"))
+out_path = dir_output / "loso_token_log_combined.csv"
+# Excludes out_path itself: it matches this same glob once it exists, so a second
+# run would otherwise feed its own prior output back in as an "input" and duplicate
+# every row already merged (caught when CRC_P11mm's rerun produced 15 rows instead
+# of 8 -- 7 stale rows from the first merge's own output, re-ingested).
+logs = sorted(p for p in dir_output.glob("loso_token_log_*.csv") if p != out_path)
 if not logs:
     sys.exit(f"No loso_token_log_*.csv files found under {dir_output}")
 
@@ -25,7 +30,6 @@ for p in logs:
     print(f"  {p.name}")
 
 combined = pd.concat([pd.read_csv(p) for p in logs], ignore_index=True, sort=False)
-out_path = dir_output / "loso_token_log_combined.csv"
 combined.to_csv(out_path, index=False)
 print(f"\nWrote combined table ({len(combined)} row(s)) to {out_path}")
 
