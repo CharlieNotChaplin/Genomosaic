@@ -507,7 +507,7 @@ def extract_cell_xy(trans_sub, f_trans_coord=None):
  
 def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row=None,
                             trans_sub=None, slide_col="Slide_ID", patch_col="Patch_ID",
-                            neighbor_radius=None):
+                            neighbor_radius=None, slide_categories=None):
     """
     Builds one row of metadata per unique histology patch, aligned by integer
     `patch_row` id (the same id used everywhere else in this script, i.e. row index
@@ -525,6 +525,22 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
         instead of just "close distance", so cross-slide pairs are never
         incorrectly excluded from the negative set.
     Also returns a plain pandas DataFrame version for saving/inspection.
+
+    slide_categories: canonical, ordered list of slide names to code against (pass
+      the SAME `slide_uniques` that `pd.factorize(trans_sub.obs["Slide_ID"])`
+      produced for the cell/graph side). Without this, this function used to run
+      its own independent `pd.factorize` here -- harmless-looking, but two
+      factorizations of "the same" slide set computed over different objects
+      (this function's per-PATCH `hist_adata` vs. the per-CELL `trans_sub` used
+      elsewhere) assign codes in order of first appearance in EACH object, which
+      can differ. In a LOSO run this occasionally produced a patch-level
+      `slide_id` whose max code equaled or exceeded the model's `n_slides` (sized
+      from the cell-side factorize alone), crashing `hist_dec`'s
+      `F.one_hot(slide_code, num_classes=n_slides)` with a device-side CUDA
+      assert (confirmed via CUDA_LAUNCH_BLOCKING=1 on the CRC_P1-held-out fold).
+      Coding against the shared `slide_categories` list instead guarantees this
+      function's codes reference the exact same slide->code mapping as the rest
+      of the pipeline, with every code guaranteed < len(slide_categories) == n_slides.
     """
     n_hist_patches = hist_adata.shape[0]
  
@@ -547,7 +563,16 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
     weight[nonzero] = weight[nonzero] / weight[nonzero].mean()  # normalize so mean weight ~= 1
  
     if slide_col in hist_adata.obs:
-        slide_id, _slide_uniques = pd.factorize(hist_adata.obs[slide_col].values)
+        if slide_categories is not None:
+            slide_id = pd.Categorical(
+                hist_adata.obs[slide_col].astype(str), categories=list(slide_categories)
+            ).codes.astype(np.int64)
+            assert (slide_id >= 0).all(), (
+                "hist_adata has a Slide_ID not present in slide_categories -- "
+                "the two objects' slide sets have diverged."
+            )
+        else:
+            slide_id, _slide_uniques = pd.factorize(hist_adata.obs[slide_col].values)
     else:
         slide_id = np.zeros(n_hist_patches, dtype=np.int64)  # single-slide fallback
 
@@ -2352,6 +2377,7 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
     patch_meta, patch_meta_df = compute_patch_metadata(
         patch_row_trans, cell_xy, f_hist_adata, neighbor_radius=CONFIG["neighbor_radius"],
+        slide_categories=slide_uniques,
     )
 
     if f_token_adata is not None:
@@ -2845,6 +2871,19 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         f"cell_meta['slide_id'] has {len(train_pipe['cell_meta']['slide_id'])} entries "
         f"but the training graph has {n_nodes} nodes -- train_step's "
         f"cell_meta['slide_id'][seed_global_ids] gather would go out of bounds."
+    )
+    # Guards the actual bug hit on the CRC_P1-held-out fold: patch_meta["slide_id"]
+    # used to come from its own independent pd.factorize inside compute_patch_metadata,
+    # which could assign codes >= n_slides (sized from the cell-side factorize alone)
+    # when the two objects' slides appeared in a different order -- crashing
+    # hist_dec's F.one_hot(slide_code, num_classes=n_slides). Now fixed at the source
+    # (compute_patch_metadata takes slide_categories= to share one canonical mapping),
+    # but this stays as a cheap, permanent guard against the same class of bug
+    # reappearing anywhere upstream.
+    n_slides = train_pipe["n_slides"]
+    assert train_pipe["patch_meta"]["slide_id"].max().item() < n_slides, (
+        f"patch_meta['slide_id'] has a code >= n_slides ({n_slides}) -- "
+        f"hist_dec's F.one_hot(slide_code, num_classes=n_slides) would go out of bounds."
     )
 
     history = train(

@@ -299,6 +299,7 @@ cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
 patch_meta, patch_meta_df = compute_patch_metadata(
     patch_row_trans, cell_xy, f_hist_adata,
     neighbor_radius=CONFIG["neighbor_radius"],
+    slide_categories=slide_uniques,
 )
 patch_meta_df.to_csv(dir_output / "patch_metadata.csv", index=False)
 
