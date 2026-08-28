@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH -c 60
 #SBATCH --mem=128G
-#SBATCH --output=CRC11.out
-#SBATCH --error=CRC11.err
+#SBATCH --output=CRC4.out
+#SBATCH --error=CRC4.err
 #SBATCH --job-name=svg_CRC11
 #SBATCH --partition=gpu_node
 #SBATCH --gres=gpu:1
