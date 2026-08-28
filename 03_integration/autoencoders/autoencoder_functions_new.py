@@ -2830,6 +2830,23 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     if freeze_token:
         freeze_token_encoder(model, freeze_decoder=True)
 
+    # Fail fast with a clear Python error instead of an opaque, asynchronously-reported
+    # CUDA "index out of bounds" assert (ScatterGatherKernel) if train_step's
+    # `token_emb_all[seed_global_ids]`/`cell_meta["slide_id"][seed_global_ids]` gathers
+    # would go out of range -- both are indexed by `batch.n_id`, which ranges over
+    # [0, data.num_nodes), so they must have exactly that many rows.
+    n_nodes = train_pipe["data"].num_nodes
+    assert train_pipe["token_emb_t"].shape[0] == n_nodes, (
+        f"token_emb_t has {train_pipe['token_emb_t'].shape[0]} rows but the training "
+        f"graph has {n_nodes} nodes -- train_step's token_emb_all[seed_global_ids] "
+        f"gather would go out of bounds."
+    )
+    assert len(train_pipe["cell_meta"]["slide_id"]) == n_nodes, (
+        f"cell_meta['slide_id'] has {len(train_pipe['cell_meta']['slide_id'])} entries "
+        f"but the training graph has {n_nodes} nodes -- train_step's "
+        f"cell_meta['slide_id'][seed_global_ids] gather would go out of bounds."
+    )
+
     history = train(
         model, train_pipe["loader"], train_pipe["hist_emb_t"], train_pipe["patch_meta"],
         n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
