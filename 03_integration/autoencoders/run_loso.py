@@ -126,29 +126,34 @@ def run_it(held_out_slide="CRC_P1"):
         freeze_token=False,
         max_local_contrast_weight=1.0,   # winner of run_token_sweep.py's 18-config sweep
         local_warmup_epochs=10,           # (see train_autoenc_token.py for the full history)
+
+        # CAPPED-BATCHES experiment (see EXCLUDE_SLIDES/max_patches_per_slide comments
+        # below for the full story): PatchGroupedLoader gives each slide a per-epoch
+        # batch count proportional to its OWN patch count, so CRC_P11mm's 29,959 patches
+        # (vs. 8,063-10,983 for every other slide -- from filtered_WSI_patch_embeddings.h5ad's
+        # own Slide_ID counts) previously got a hugely disproportionate share of every
+        # epoch's gradient updates. 11000 sits just above the next-largest slide
+        # (CRC_P6_5mm, 10,983) -- i.e. it's a genuine no-op for every slide except
+        # CRC_P11mm, which is exactly the point: cap the one outlier down to
+        # normal-slide scale, leave everyone else's regime untouched. None disables
+        # capping entirely (original, uncapped behavior for every slide).
+        max_patches_per_slide=11000,
     )
 
     # ---- WHICH SLIDE TO HOLD OUT ------------------------------------------------
     HELD_OUT_SLIDE = held_out_slide
 
     # ---- slides excluded from the dataset entirely (not just held out) ---------
-    # Testing whether CRC_P11mm should be in the training pool at all: it's ~4x the
-    # physical tissue size of every other slide and mostly neoplasm (vs. the more
-    # mixed composition of the other regions) -- 708k of the combined ~1.28M cells,
-    # so PatchGroupedLoader (which allocates batches per slide proportional to that
-    # slide's own patch count) gives it a hugely disproportionate share of every
-    # training epoch's gradient updates. It also turned out to be extremely
-    # transcriptionally homogeneous (76% of cells in one cluster -- see conversation
-    # notes), meaning much of that oversized share is spent on low-information,
-    # near-duplicate contrastive pairs. It was also the worst-generalizing of all 8
-    # LOSO folds by both cell_top1 and chance-adjusted cluster_top1 lift. This list
-    # excludes it from BOTH the training pool and the held-out targets entirely (not
-    # just skipped as a held-out choice) so the remaining 7 slides' own generalization
-    # can be re-measured without its influence. CRC_P6_5mm stays IN for this run
-    # deliberately -- one variable at a time -- even though it was flagged as another
-    # weak fold, so any change in the other slides' numbers can be attributed to
-    # CRC_P11mm's removal specifically, not conflated with a second change.
-    EXCLUDE_SLIDES = ["CRC_P11mm"]
+    # Prior experiment (see conversation notes / loso_token_baseline_all8slides vs.
+    # loso_excl_CRC_P11mm): fully EXCLUDING CRC_P11mm from training measurably reduced
+    # token leakage and roughly doubled in-sample retrieval fit, but held-out
+    # generalization stayed flat while the train/held-out gap roughly doubled too --
+    # an overfitting signature (less data, same n_epochs, more effective exposure per
+    # remaining slide), not a real fix. This run instead keeps CRC_P11mm IN the pool
+    # (EXCLUDE_SLIDES empty) and caps its per-epoch batch share instead (see
+    # max_patches_per_slide in CONFIG above) -- the more surgical fix the exclusion
+    # experiment's overfitting side effect motivated.
+    EXCLUDE_SLIDES = []
 
     # ---- output dirs ----------------------------------------------------------
     basedir = Path("../../data")
@@ -241,6 +246,8 @@ def run_it(held_out_slide="CRC_P1"):
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
         _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
+    if CONFIG.get("max_patches_per_slide") is not None:
+        _tag_parts.append(f"cap{CONFIG['max_patches_per_slide']}")
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
 
     # Named per held-out slide AND run_tag (not a shared "loso_token_log.csv") so that

@@ -648,11 +648,28 @@ class PatchGroupedLoader:
     """
 
     def __init__(self, data, patch_to_nodes, patch_slide_id, num_neighbors=(10, 10),
-                 patches_per_batch=16, max_cells_per_patch=64, shuffle=True):
+                 patches_per_batch=16, max_cells_per_patch=64, shuffle=True,
+                 max_patches_per_slide=None):
+        """
+        max_patches_per_slide: caps how many of a slide's OWN patches feed into batches
+          per epoch (None = no cap, every patch used every epoch, original behavior).
+          Motivated by a slide that's disproportionately large relative to the rest of
+          the training pool (e.g. CRC_P11mm at 29,959 patches vs. 8,063-10,983 for every
+          other slide in this project's dataset -- see conversation notes): since
+          __len__/__iter__ give each slide a batch count proportional to its OWN patch
+          count, an outsized slide gets a proportionally outsized share of every epoch's
+          gradient updates. Capping truncates that slide's (reshuffled) patch list before
+          chunking into batches, so it still contributes a full batch quota like everyone
+          else, not zero -- and because __iter__ reshuffles every epoch, a DIFFERENT
+          random subset of its patches is used each time, so the full patch pool still
+          gets exposure across the course of training, just not all at once. Applies
+          per-slide, so any slide below the cap is completely unaffected.
+        """
         self.patch_to_nodes = patch_to_nodes
         self.patches_per_batch = patches_per_batch
         self.max_cells_per_patch = max_cells_per_patch
         self.shuffle = shuffle
+        self.max_patches_per_slide = max_patches_per_slide
 
         # group patches by slide up front; `patch_slide_id` is indexed the same way
         # as `patch_meta["slide_id"]` (one entry per patch_row id)
@@ -672,7 +689,8 @@ class PatchGroupedLoader:
     def __len__(self):
         total = 0
         for plist in self.patches_by_slide.values():
-            total += (len(plist) + self.patches_per_batch - 1) // self.patches_per_batch
+            n = len(plist) if self.max_patches_per_slide is None else min(len(plist), self.max_patches_per_slide)
+            total += (n + self.patches_per_batch - 1) // self.patches_per_batch
         return total
 
     def __iter__(self):
@@ -684,6 +702,8 @@ class PatchGroupedLoader:
             plist = plist.copy()
             if self.shuffle:
                 random.shuffle(plist)
+            if self.max_patches_per_slide is not None:
+                plist = plist[:self.max_patches_per_slide]
             for start in range(0, len(plist), self.patches_per_batch):
                 all_batches.append(plist[start:start + self.patches_per_batch])
 
@@ -2229,7 +2249,8 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, his
 
 def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
                          svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True,
-                         f_token_adata=None, token_scaler=None, local_neighbor_radius=None):
+                         f_token_adata=None, token_scaler=None, local_neighbor_radius=None,
+                         max_patches_per_slide=None):
     """
     Runs the SVG-mask -> spatial-graph -> pairing -> standardize -> patch-metadata
     -> PyG-data-and-loader pipeline (the same steps that live inline in
@@ -2341,7 +2362,7 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     loader = PatchGroupedLoader(
         data, patch_to_nodes, patch_meta["slide_id"],
         num_neighbors=CONFIG["num_neighbors"], patches_per_batch=CONFIG["patches_per_batch"],
-        max_cells_per_patch=CONFIG["max_cells_per_patch"],
+        max_cells_per_patch=CONFIG["max_cells_per_patch"], max_patches_per_slide=max_patches_per_slide,
     )
     hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
 
@@ -2689,6 +2710,17 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     max_local_contrast_weight/local_warmup_epochs/local_anchor_sim_threshold
     CONFIG carries.
 
+    CONFIG["max_patches_per_slide"] (optional, default None via .get()): forwarded to
+      the TRAINING pipeline's PatchGroupedLoader to cap any one training slide's
+      per-epoch batch share -- see that class's docstring. Motivated by a slide that's
+      disproportionately large relative to the rest of the training pool (conversation
+      notes): fully excluding such a slide measurably reduced token leakage and roughly
+      doubled in-sample retrieval fit, but left held-out generalization flat while the
+      train/held-out gap roughly doubled too (an overfitting signature, not a fix) --
+      capping instead of excluding keeps that slide's data available across epochs
+      (reshuffled each epoch, so a different subset is seen every time) without letting
+      it dominate the gradient budget.
+
     f_hist_adata / f_trans_adata / f_trans_coord / f_token_adata: already
       loaded, concatenated, and index-set exactly the way
       train_autoenc_token.py's data-loading section does (Slide_ID+id /
@@ -2750,10 +2782,14 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
 
     if verbose:
         print("  building training-slide pipeline data (hist + token)...")
+    # max_patches_per_slide only matters for the TRAINING pipeline's loader (it caps
+    # per-epoch batch share -- see PatchGroupedLoader's docstring); the held-out pipe's
+    # own loader (built below) is never iterated over during training or eval, only its
+    # "data" is used, so capping it would be a no-op left at CONFIG's default (None).
     train_pipe = build_pipeline_data(
         f_hist_train, f_trans_train, f_coord_train, CONFIG, svg_mask=gene_mask,
         f_token_adata=f_token_train, local_neighbor_radius=CONFIG.get("local_neighbor_radius"),
-        verbose=verbose,
+        max_patches_per_slide=CONFIG.get("max_patches_per_slide"), verbose=verbose,
     )
 
     if verbose:
