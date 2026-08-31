@@ -7,35 +7,42 @@
 #SBATCH -c 20
 #SBATCH --mem=64G
 #SBATCH --time=02:00:00
-#SBATCH --array=0-7
+#SBATCH --array=0-9
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
-# CAPPED-BATCHES experiment: CRC_P11mm is back IN the training pool for every fold
-# (run_loso.py's EXCLUDE_SLIDES is now empty) -- back to all 8 slides, --array=0-7.
-# Instead of removing it, run_loso.py's CONFIG["max_patches_per_slide"]=11000 caps how
-# many of ITS patches (29,959, vs. 8,063-10,983 for every other slide) feed into batches
-# per epoch, via PatchGroupedLoader -- a no-op for every other slide, since none of them
-# exceed the cap. Motivated by the prior EXCLUDED experiment's result (see conversation
-# notes / loso_excl_CRC_P11mm): full exclusion nearly doubled in-sample fit and reduced
-# token leakage, but held-out generalization stayed flat while the train/held-out gap
-# roughly doubled too -- an overfitting signature from a smaller training pool, not a
-# real fix. Capping keeps CRC_P11mm's full patch pool available (a different random
-# subset up to the cap each epoch, since PatchGroupedLoader reshuffles every epoch)
-# without letting it dominate the gradient budget.
+# 10-SLIDE + OVERSAMPLED-NORMAL experiment: CRC_P3_SMAP/CRC_P4_SMAP's preprocessing
+# (incl. token_preprocessing.py) is now verified complete, so run_loso.py's
+# EXCLUDE_SLIDES is empty and both are deliberately IN the pool for every fold --
+# --array=0-9 covers all 10 slides (8 tumor / 2 normal). This is a NEW baseline, not
+# comparable fold-by-fold against the earlier 8-slide capped-batches results
+# (loso_token_run_cap_per_epoch_patch_size) -- different training pool AND different
+# n_slides/decoder width.
+#
+# Also carries CONFIG["max_patches_per_slide"]=11000 (unchanged, still caps CRC_P11mm's
+# 29,959 patches -- a no-op for every other slide) AND the new
+# CONFIG["oversample_slides"]: evaluate_disease_signal (conversation notes) showed the
+# model didn't reliably generalize "normal tissue" to a second unseen normal patient
+# even after rebalancing the diagnostic classifier itself (Normal_P5 stayed near
+# chance) -- with only 2 normal vs. 8 tumor slides, their COMBINED per-epoch patch
+# exposure is ~16,400 vs. ~96,000 despite each normal slide being individually a
+# normal size (~8,000 patches). oversample_slides resamples each normal slide (with
+# replacement, real cells only) up to ~24,000 draws/epoch, roughly matching the tumor
+# side's total. See PatchGroupedLoader's oversample_target docstring for the mechanism.
 #
 # Baseline (all 8 slides, uncapped) results already archived to
-# data/combined/03_integration/autoencoders/002um/loso_token_baseline_all8slides/, and
-# the CRC_P11mm-excluded experiment's results to .../loso_excl_CRC_P11mm/ -- this run's
-# outputs (loso_token_log_{slide}_cap11000.csv etc., automatically tagged by
-# run_loso.py's RUN_TAG) can't collide with either.
+# data/combined/03_integration/autoencoders/002um/loso_token_baseline_all8slides/, the
+# CRC_P11mm-excluded experiment's to .../loso_excl_CRC_P11mm/, and the 8-slide
+# capped-batches results to .../loso_token_run_cap_per_epoch_patch_size/ -- this run's
+# outputs (loso_token_log_{slide}_cap11000_oversample_normal.csv etc., automatically
+# tagged by run_loso.py's RUN_TAG) can't collide with any of those.
 #
 # Requires: run_loso.py, autoencoder_functions_new.py, and this .sbatch file all in
 # the SAME flat directory (no scripts/ subdirectory) when the job actually runs --
 # that's what makes `from autoencoder_functions_new import *` resolve without any
 # PYTHONPATH tricks. Deploy accordingly before submitting, and run `sbatch` from
 # that same directory (see the cd below -- $SLURM_SUBMIT_DIR captures it).
-SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P5 CRC_P6_5mm Normal_P3 Normal_P5)
+SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P3_SMAP CRC_P4_SMAP CRC_P5 CRC_P6_5mm Normal_P3 Normal_P5)
 HELD_OUT_SLIDE="${SLIDES[$SLURM_ARRAY_TASK_ID]}"
 
 # Load Conda environment

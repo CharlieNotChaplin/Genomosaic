@@ -674,7 +674,7 @@ class PatchGroupedLoader:
 
     def __init__(self, data, patch_to_nodes, patch_slide_id, num_neighbors=(10, 10),
                  patches_per_batch=16, max_cells_per_patch=64, shuffle=True,
-                 max_patches_per_slide=None):
+                 max_patches_per_slide=None, oversample_target=None):
         """
         max_patches_per_slide: caps how many of a slide's OWN patches feed into batches
           per epoch (None = no cap, every patch used every epoch, original behavior).
@@ -689,12 +689,33 @@ class PatchGroupedLoader:
           random subset of its patches is used each time, so the full patch pool still
           gets exposure across the course of training, just not all at once. Applies
           per-slide, so any slide below the cap is completely unaffected.
+
+        oversample_target: dict[int, int], slide code -> minimum number of patch draws
+          per epoch (WITH replacement), for slides whose class is underrepresented at
+          the SLIDE-COUNT level even though their own patch count is unremarkable (the
+          mirror-image problem to max_patches_per_slide's "one slide too big" -- here
+          it's "too few slides of a class," e.g. this project's 2 normal slides vs. 8
+          tumor slides: each normal slide has a typical ~8,000 patches on its own, but
+          only 2 of them exist, so their COMBINED per-epoch exposure is a small
+          fraction of the tumor slides' combined total -- motivated by
+          evaluate_disease_signal showing the model didn't reliably generalize "normal
+          tissue" to a second, genuinely unseen normal patient; see conversation notes).
+          A slide below its target gets padded (via random.choices, sampling with
+          replacement from its own real patches) up to that count before chunking into
+          batches -- not synthetic data, just repeated real draws, each still passing
+          through this loader's own per-batch cell subsampling and the model's
+          gene/edge dropout, so a repeat isn't a byte-identical training example.
+          None (default, or a slide simply absent from the dict) leaves that slide at
+          its own natural count, original behavior. Applied AFTER max_patches_per_slide,
+          so the two can't contradict each other (a slide below its own oversample
+          target is, by definition, also below any cap).
         """
         self.patch_to_nodes = patch_to_nodes
         self.patches_per_batch = patches_per_batch
         self.max_cells_per_patch = max_cells_per_patch
         self.shuffle = shuffle
         self.max_patches_per_slide = max_patches_per_slide
+        self.oversample_target = oversample_target or {}
 
         # group patches by slide up front; `patch_slide_id` is indexed the same way
         # as `patch_meta["slide_id"]` (one entry per patch_row id)
@@ -713,8 +734,9 @@ class PatchGroupedLoader:
 
     def __len__(self):
         total = 0
-        for plist in self.patches_by_slide.values():
+        for sid, plist in self.patches_by_slide.items():
             n = len(plist) if self.max_patches_per_slide is None else min(len(plist), self.max_patches_per_slide)
+            n = max(n, self.oversample_target.get(sid, 0))
             total += (n + self.patches_per_batch - 1) // self.patches_per_batch
         return total
 
@@ -729,6 +751,14 @@ class PatchGroupedLoader:
                 random.shuffle(plist)
             if self.max_patches_per_slide is not None:
                 plist = plist[:self.max_patches_per_slide]
+            target = self.oversample_target.get(sid)
+            if target is not None and len(plist) < target:
+                # pad up to target by resampling this slide's own patches WITH
+                # replacement -- plist is already shuffled, so every real patch is
+                # used at least once before any repeats occur
+                plist = plist + random.choices(plist, k=target - len(plist))
+                if self.shuffle:
+                    random.shuffle(plist)
             for start in range(0, len(plist), self.patches_per_batch):
                 all_batches.append(plist[start:start + self.patches_per_batch])
 
@@ -1833,7 +1863,7 @@ def evaluate_latent_spatial_autocorr(z, centroids, n_neighs=6):
 
 
 def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
-                             tumor_prefix="CRC", max_iter=5000):
+                             tumor_prefix="CRC", max_iter=5000, class_weight=None):
     """
     Tests whether an embedding captures real tumor-vs-normal biological signal --
     reframes part of the Slide_ID leakage problem as a feature, not purely a bug: with
@@ -1862,6 +1892,17 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
         fraction of its patches got classified as its own known true label", not a
         two-sided discriminative accuracy the way train_loso_acc is -- read the two
         together, not `held_out_acc` alone.
+
+    class_weight: forwarded to sklearn's LogisticRegression (e.g. "balanced" to counteract
+      training-pool class imbalance -- e.g. only 1 normal slide remains among 7 training
+      slides when a normal slide is held out, in a cohort with just 2 normal slides total).
+      None (default) reproduces the original unweighted behavior. This classifier is fit
+      post-hoc on already-computed, frozen embeddings, so rebalancing it only moves ITS
+      decision boundary -- it can't change what the encoder itself learned. Use it to tell
+      apart a genuine embedding-quality gap from an artifact of this diagnostic's own
+      imbalance: if held_out_acc recovers substantially once balanced, the embeddings were
+      fine all along; if it stays low, the embeddings themselves don't represent the
+      minority class well.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import LeaveOneGroupOut
@@ -1880,14 +1921,14 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
         for tr_idx, te_idx in LeaveOneGroupOut().split(z_train, y_train, groups=groups):
             if len(np.unique(y_train[tr_idx])) < 2:
                 continue  # degenerate fold: training portion left with only one class
-            clf_fold = LogisticRegression(max_iter=max_iter)
+            clf_fold = LogisticRegression(max_iter=max_iter, class_weight=class_weight)
             clf_fold.fit(z_train[tr_idx], y_train[tr_idx])
             fold_scores.append(clf_fold.score(z_train[te_idx], y_train[te_idx]))
     train_loso_acc = float(np.mean(fold_scores)) if fold_scores else None
 
     held_out_acc = None
     if len(y_held) and len(np.unique(y_train)) >= 2:
-        clf = LogisticRegression(max_iter=max_iter)
+        clf = LogisticRegression(max_iter=max_iter, class_weight=class_weight)
         clf.fit(z_train, y_train)
         held_out_acc = float((clf.predict(z_held) == y_held).mean())
 
@@ -2275,7 +2316,7 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, his
 def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
                          svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True,
                          f_token_adata=None, token_scaler=None, local_neighbor_radius=None,
-                         max_patches_per_slide=None):
+                         max_patches_per_slide=None, oversample_slides=None):
     """
     Runs the SVG-mask -> spatial-graph -> pairing -> standardize -> patch-metadata
     -> PyG-data-and-loader pipeline (the same steps that live inline in
@@ -2361,6 +2402,18 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     slide_codes, slide_uniques = pd.factorize(trans_sub.obs["Slide_ID"])
     n_slides = len(slide_uniques)
 
+    # oversample_slides: {slide_name: target_patch_draws_per_epoch} -> resolved to
+    # {slide_code: target} against THIS call's own slide_uniques (a name absent from
+    # this slice -- e.g. the held-out slide, or a slide dropped upstream -- is simply
+    # ignored rather than erroring, since PatchGroupedLoader.oversample_target only
+    # needs to cover slides that are actually present).
+    oversample_target = None
+    if oversample_slides:
+        name_to_code = {name: code for code, name in enumerate(slide_uniques)}
+        oversample_target = {
+            name_to_code[name]: target for name, target in oversample_slides.items() if name in name_to_code
+        }
+
     if svg_scaler is None or hist_scaler is None:
         X_svg, hist_emb, svg_scaler, hist_scaler = standardize_modalities(X_svg, hist_emb)
     else:
@@ -2397,6 +2450,7 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
         data, patch_to_nodes, patch_meta["slide_id"],
         num_neighbors=CONFIG["num_neighbors"], patches_per_batch=CONFIG["patches_per_batch"],
         max_cells_per_patch=CONFIG["max_cells_per_patch"], max_patches_per_slide=max_patches_per_slide,
+        oversample_target=oversample_target,
     )
     hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
 
@@ -2816,14 +2870,16 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
 
     if verbose:
         print("  building training-slide pipeline data (hist + token)...")
-    # max_patches_per_slide only matters for the TRAINING pipeline's loader (it caps
-    # per-epoch batch share -- see PatchGroupedLoader's docstring); the held-out pipe's
-    # own loader (built below) is never iterated over during training or eval, only its
-    # "data" is used, so capping it would be a no-op left at CONFIG's default (None).
+    # max_patches_per_slide/oversample_slides only matter for the TRAINING pipeline's
+    # loader (they reshape per-epoch batch share -- see PatchGroupedLoader's
+    # docstring); the held-out pipe's own loader (built below) is never iterated over
+    # during training or eval, only its "data" is used, so both are no-ops left at
+    # CONFIG's default (None) for that call.
     train_pipe = build_pipeline_data(
         f_hist_train, f_trans_train, f_coord_train, CONFIG, svg_mask=gene_mask,
         f_token_adata=f_token_train, local_neighbor_radius=CONFIG.get("local_neighbor_radius"),
-        max_patches_per_slide=CONFIG.get("max_patches_per_slide"), verbose=verbose,
+        max_patches_per_slide=CONFIG.get("max_patches_per_slide"),
+        oversample_slides=CONFIG.get("oversample_slides"), verbose=verbose,
     )
 
     if verbose:

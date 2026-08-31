@@ -138,6 +138,23 @@ def run_it(held_out_slide="CRC_P1"):
         # normal-slide scale, leave everyone else's regime untouched. None disables
         # capping entirely (original, uncapped behavior for every slide).
         max_patches_per_slide=11000,
+
+        # OVERSAMPLING experiment: evaluate_disease_signal (see conversation notes) showed
+        # the model doesn't reliably generalize "normal tissue" to a second, genuinely
+        # unseen normal patient -- Normal_P5's held-out tumor/normal accuracy stayed near
+        # chance (0.53) even after rebalancing the diagnostic classifier itself, unlike
+        # Normal_P3 (0.34 -> 0.91), ruling out pure classifier-calibration as the whole
+        # story. Each normal slide has a typical ~8,000 patches on its own (comparable to
+        # most tumor slides individually), but with only 2 normal vs. 8 tumor slides in
+        # this 10-slide run, their COMBINED per-epoch exposure is ~16,400 patches vs.
+        # ~96,000 for tumor -- a ~5.9:1 imbalance from slide COUNT alone, not per-slide
+        # size. 24000 per normal slide (~3x its own count) brings combined normal exposure
+        # to ~48,000, roughly matching the tumor side's total for an even tumor/normal
+        # split per epoch -- a starting point, not a tuned value; adjust if the next LOSO
+        # run's disease-signal check doesn't move. Real cells only, resampled with
+        # replacement (see PatchGroupedLoader's oversample_target docstring) -- not
+        # synthetic augmentation.
+        oversample_slides={"Normal_P3": 24000, "Normal_P5": 24000},
     )
 
     # ---- WHICH SLIDE TO HOLD OUT ------------------------------------------------
@@ -154,16 +171,15 @@ def run_it(held_out_slide="CRC_P1"):
     # max_patches_per_slide in CONFIG above) -- the more surgical fix the exclusion
     # experiment's overfitting side effect motivated.
     #
-    # CRC_P3_SMAP / CRC_P4_SMAP: two newly added slides, excluded here so this run's
-    # training pool stays identical to the 7 already-completed capped-batches folds
-    # (loso_token_run_cap_per_epoch_patch_size) for a like-for-like comparison. Without
-    # this, the "restrict to slides with token data" fallback further down would
-    # silently pull whichever of the two happens to have token data ready by the time
-    # this runs into the pool -- changing both the training data AND n_slides (hence
-    # the decoder one-hot width) relative to the other folds. Remove once both slides'
-    # preprocessing is verified correct and you deliberately re-run the FULL LOSO suite
-    # as a new, internally-consistent 10-slide baseline (not mixed in fold-by-fold).
-    EXCLUDE_SLIDES = ["CRC_P3_SMAP", "CRC_P4_SMAP"]
+    # CRC_P3_SMAP / CRC_P4_SMAP: preprocessing (incl. token_preprocessing.py) is now
+    # verified complete for both, so this run deliberately includes them -- a new,
+    # internally-consistent 10-slide (8 tumor / 2 normal) baseline, combined with the
+    # oversample_slides experiment above. NOT comparable fold-by-fold against the
+    # earlier 8-slide capped-batches results (loso_token_run_cap_per_epoch_patch_size)
+    # -- different training pool AND different n_slides/decoder width. Re-add a slide
+    # here (or reuse this pattern) if a slide's preprocessing ever needs to be held
+    # back from a run again.
+    EXCLUDE_SLIDES = []
 
     # ---- output dirs ----------------------------------------------------------
     basedir = Path("../../data")
@@ -258,6 +274,8 @@ def run_it(held_out_slide="CRC_P1"):
         _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
     if CONFIG.get("max_patches_per_slide") is not None:
         _tag_parts.append(f"cap{CONFIG['max_patches_per_slide']}")
+    if CONFIG.get("oversample_slides"):
+        _tag_parts.append("oversample_normal")
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
 
     # Named per held-out slide AND run_tag (not a shared "loso_token_log.csv") so that
