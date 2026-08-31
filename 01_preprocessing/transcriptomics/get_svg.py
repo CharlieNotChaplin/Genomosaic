@@ -131,5 +131,8 @@ stray_nones = sanitize_uns(count_area_filtered_adata)
 if stray_nones:
     print("Sanitized stray null uns entries before saving:", stray_nones)
 
-count_area_filtered_adata.write(dir_result_output / "custom_binning/count_area_filtered_adata_test_svg.h5ad")
+count_area_filtered_adata.write(
+    dir_result_output / "custom_binning/count_area_filtered_adata_test_svg.h5ad",
+    compression="gzip",
+)
 print("unique var_names in count_area_filtered_adata: ", count_area_filtered_adata.var_names.is_unique)
