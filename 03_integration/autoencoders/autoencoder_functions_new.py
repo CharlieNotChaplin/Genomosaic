@@ -2343,6 +2343,14 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
         n_dropped = int(keep_mask.sum() - (keep_mask & has_token).sum())
         if verbose and n_dropped:
             print(f"  dropping {n_dropped} cells with a hist-patch match but no token match")
+        # patch_row_trans is row-aligned to keep_mask's True entries (one entry per
+        # hist-paired cell, in order) -- must be narrowed by the same further token-based
+        # restriction, or it goes stale relative to trans_sub/cell_xy below. Harmless (and
+        # so never caught) as long as every hist-paired cell also has token data; a slide
+        # with a large token/trans id mismatch (e.g. CRC_P3_SMAP, 295906/295975 cells with
+        # no token match) exposes it as a hard length-mismatch crash in
+        # compute_patch_metadata's pd.DataFrame(...) construction.
+        patch_row_trans = patch_row_trans[has_token[keep_mask]]
         keep_mask = keep_mask & has_token
 
     trans_sub = f_trans_adata[keep_mask].copy()

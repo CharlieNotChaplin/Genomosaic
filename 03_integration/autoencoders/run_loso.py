@@ -150,10 +150,20 @@ def run_it(held_out_slide="CRC_P1"):
     # generalization stayed flat while the train/held-out gap roughly doubled too --
     # an overfitting signature (less data, same n_epochs, more effective exposure per
     # remaining slide), not a real fix. This run instead keeps CRC_P11mm IN the pool
-    # (EXCLUDE_SLIDES empty) and caps its per-epoch batch share instead (see
+    # (EXCLUDE_SLIDES empty otherwise) and caps its per-epoch batch share instead (see
     # max_patches_per_slide in CONFIG above) -- the more surgical fix the exclusion
     # experiment's overfitting side effect motivated.
-    EXCLUDE_SLIDES = []
+    #
+    # CRC_P3_SMAP / CRC_P4_SMAP: two newly added slides, excluded here so this run's
+    # training pool stays identical to the 7 already-completed capped-batches folds
+    # (loso_token_run_cap_per_epoch_patch_size) for a like-for-like comparison. Without
+    # this, the "restrict to slides with token data" fallback further down would
+    # silently pull whichever of the two happens to have token data ready by the time
+    # this runs into the pool -- changing both the training data AND n_slides (hence
+    # the decoder one-hot width) relative to the other folds. Remove once both slides'
+    # preprocessing is verified correct and you deliberately re-run the FULL LOSO suite
+    # as a new, internally-consistent 10-slide baseline (not mixed in fold-by-fold).
+    EXCLUDE_SLIDES = ["CRC_P3_SMAP", "CRC_P4_SMAP"]
 
     # ---- output dirs ----------------------------------------------------------
     basedir = Path("../../data")
