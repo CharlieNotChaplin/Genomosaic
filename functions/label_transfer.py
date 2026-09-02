@@ -319,6 +319,63 @@ def load_grid_bin_counts(sample: str, data_dir: Path = DATA_DIR) -> ad.AnnData:
     return adata
 
 
+def aggregate_expression_to_grid(
+    sample: str, group_size: int = 4, data_dir: Path = DATA_DIR,
+) -> ad.AnnData:
+    """
+    Fallback for `load_grid_bin_counts` when a sample has no native
+    square_008um SpaceRanger output: manually sums square_002um raw counts
+    into group_size x group_size blocks (default 4 -> 8um) instead.
+
+    Not an approximation -- per aggregate_bin_annotation_to_grid's docstring,
+    Visium HD's bin grids are hierarchically nested (each 8um bin is exactly a
+    4x4 block of 2um bins by array coordinate), so summing counts within
+    (array_row // group_size, array_col // group_size) groups reproduces
+    exactly what SpaceRanger's own square_008um binning would have produced.
+
+    Same output contract as load_grid_bin_counts (obs.array_row/array_col are
+    the group's own row/col, equal to a native 8um bin's; obsm["spatial"] is
+    the mean [pxl_col, pxl_row] of the bins in each group) -- a drop-in
+    replacement wherever that native output is missing.
+    """
+    adata = sc.read_10x_h5(data_dir / SPATIAL_DIR_TEMPLATE.format(sample) / "filtered_feature_bc_matrix.h5")
+    adata.var_names_make_unique()
+
+    positions = pd.read_parquet(
+        data_dir / SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "tissue_positions.parquet"
+    ).set_index("barcode")
+    positions = positions.loc[positions["in_tissue"] == 1]
+
+    adata = adata[adata.obs_names.isin(positions.index)].copy()
+    positions = positions.loc[adata.obs_names]
+
+    grid_row = (positions["array_row"].to_numpy() // group_size)
+    grid_col = (positions["array_col"].to_numpy() // group_size)
+    group_id, group_keys = pd.factorize(pd.MultiIndex.from_arrays([grid_row, grid_col]))
+    n_groups = len(group_keys)
+
+    indicator = sparse.coo_matrix(
+        (np.ones(len(group_id), dtype=np.float32), (group_id, np.arange(len(group_id)))),
+        shape=(n_groups, adata.n_obs),
+    ).tocsr()
+    summed_X = indicator @ adata.X
+    group_n_bins = np.asarray(indicator.sum(axis=1)).ravel()
+    pxl_row_mean = (indicator @ positions["pxl_row_in_fullres"].to_numpy()) / group_n_bins
+    pxl_col_mean = (indicator @ positions["pxl_col_in_fullres"].to_numpy()) / group_n_bins
+
+    grid_row_vals, grid_col_vals = zip(*group_keys) if n_groups else ([], [])
+    grid_adata = ad.AnnData(
+        X=sparse.csr_matrix(summed_X),
+        var=adata.var.copy(),
+        obs=pd.DataFrame(
+            {"array_row": np.asarray(grid_row_vals), "array_col": np.asarray(grid_col_vals)},
+            index=[f"{sample}_grid_{r}_{c}" for r, c in zip(grid_row_vals, grid_col_vals)],
+        ),
+    )
+    grid_adata.obsm["spatial"] = np.column_stack([pxl_col_mean, pxl_row_mean])
+    return grid_adata
+
+
 def aggregate_tokens_to_grid(
     sample: str, bin_coords: np.ndarray, radius_px: float, data_dir: Path = DATA_DIR, batch_size: int = 20_000
 ) -> np.ndarray:
@@ -651,6 +708,7 @@ def predict_classifier(
     device: torch.device,
     suppress_classes: list[str] | None = None,
     suppress_weight: float = 0.0,
+    batch_size: int = 50_000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Returns (predicted label strings, top-class confidence).
 
@@ -659,6 +717,12 @@ def predict_classifier(
     healthy-donor slide), then renormalize. suppress_weight=0.0 (default
     when suppress_classes is given) is a hard mask; e.g. 0.1 instead
     soft-downweights rather than ruling it out entirely.
+
+    batch_size: chunks the MLP forward pass (no effect on the knn path) --
+    a whole grid-level target sample can be 500,000+ rows, which moved to
+    GPU in one shot caused a CUDA OOM on an 8um-grid run (CRC_P11mm_2_cut,
+    7.65GB GPU) that every smaller/patch-level sample had fit fine. No
+    BatchNorm in MLPClassifier, so chunking here is exact, not approximate.
     """
     if sparse.issparse(X):
         X = np.asarray(X.todense())
@@ -671,8 +735,11 @@ def predict_classifier(
         model = fit["model"]
         model.eval()
         with torch.no_grad():
-            logits = model(torch.tensor(X_scaled, device=device))
-            probs = torch.softmax(logits, dim=1).cpu().numpy()
+            chunks = []
+            for start in range(0, len(X_scaled), batch_size):
+                batch = torch.tensor(X_scaled[start:start + batch_size], device=device)
+                chunks.append(torch.softmax(model(batch), dim=1).cpu().numpy())
+            probs = np.concatenate(chunks, axis=0)
 
     if suppress_classes:
         classes = list(fit["label_encoder"].classes_)
@@ -719,6 +786,7 @@ def main(
     neoplasm_prior_weight_on_normal: float | None = NEOPLASM_PRIOR_WEIGHT_ON_NORMAL,
     model_type: str = MODEL_TYPE,
     use_harmony: bool = False,
+    targets: list[str] | None = None,
 ):
     """Run the full pipeline. All knobs default to the module-level
     constants above, but can be overridden per call -- e.g. from a notebook:
@@ -735,11 +803,16 @@ def main(
     "{sample}_patch_predictions_harmony.h5ad" instead of the usual
     "{sample}_patch_predictions.h5ad", so both are kept side by side for
     comparison; the transcriptomics classifier is unaffected either way.
+
+    targets: restrict to these samples instead of every `discover_target_samples()`
+    result -- e.g. when new slides are added and existing samples' predictions
+    (from a separately-trained, non-deterministic MLP) shouldn't be touched/
+    overwritten just to pick up the new ones.
     """
     device = get_device()
     print(f"Using device: {device}")
 
-    targets = discover_target_samples()
+    targets = targets if targets is not None else discover_target_samples()
     print(f"Target samples: {targets}")
 
     harmony_emb = None
@@ -833,6 +906,11 @@ def main(
 
 def _microns_per_pixel(sample: str, data_dir: Path = DATA_DIR) -> float:
     path = data_dir / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "scalefactors_json.json"
+    if not path.exists():
+        # No native square_008um output -- microns_per_pixel is a property of the
+        # WSI image, not the bin size, so square_002um's own scalefactors carry
+        # the identical value (verified identical for samples that have both).
+        path = data_dir / SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "scalefactors_json.json"
     with open(path) as f:
         return json.load(f)["microns_per_pixel"]
 
@@ -843,6 +921,8 @@ def main_grid(
     neoplasm_prior_weight_on_normal: float | None = NEOPLASM_PRIOR_WEIGHT_ON_NORMAL,
     model_type: str = MODEL_TYPE,
     radius_factor: float = 0.8,
+    targets: list[str] | None = None,
+    token_batch_size: int = 20_000,
 ):
     """
     Same idea as main(), but label transfer at a coarser grid resolution --
@@ -862,11 +942,19 @@ def main_grid(
 
     Writes "{sample}_grid_predictions.h5ad" per target sample, mirroring
     "{sample}_patch_predictions.h5ad" from main().
+
+    targets: restrict to these samples instead of every `discover_target_samples()`
+    result -- see main()'s targets docstring for why.
+
+    token_batch_size: forwarded to aggregate_tokens_to_grid -- lower this if a
+    run gets OOM-killed (a denser tissue region can pull an unusually large
+    unique-token set into one batch; smaller batches cap that peak at the cost
+    of more, smaller h5py reads).
     """
     device = get_device()
     print(f"Using device: {device}")
 
-    targets = discover_target_samples()
+    targets = targets if targets is not None else discover_target_samples()
     print(f"Target samples: {targets}")
 
     grid_um = group_size * 2.0
@@ -892,7 +980,9 @@ def main_grid(
 
     radius_px = grid_um / _microns_per_pixel(REFERENCE_SAMPLE) * radius_factor
     print(f"\nAggregating reference raw-token image features (radius={radius_px:.1f}px)...")
-    X_ref_img = aggregate_tokens_to_grid(REFERENCE_SAMPLE, ref_adata.obsm["spatial"][labeled], radius_px)
+    X_ref_img = aggregate_tokens_to_grid(
+        REFERENCE_SAMPLE, ref_adata.obsm["spatial"][labeled], radius_px, batch_size=token_batch_size,
+    )
     print("\nTraining image-based classifier...")
     img_fit = train_classifier(X_ref_img, y_ref, device, model_type=model_type, name="image")
 
@@ -910,10 +1000,12 @@ def main_grid(
     for sample in targets:
         print(f"\n--- {sample} ---")
         grid_h5_path = DATA_DIR / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "filtered_feature_bc_matrix.h5"
-        if not grid_h5_path.exists():
-            print(f"  WARNING: no local square_008um output for {sample} ({grid_h5_path}) -- skipping.")
-            continue
-        adata = load_grid_bin_counts(sample)
+        if grid_h5_path.exists():
+            adata = load_grid_bin_counts(sample)
+        else:
+            print(f"  no native square_008um output for {sample} -- "
+                  f"aggregating {grid_um:g}um bins from square_002um instead")
+            adata = aggregate_expression_to_grid(sample, group_size=group_size)
 
         apply_neoplasm_prior = (
             neoplasm_prior_weight_on_normal is not None and get_disease_status(sample) == "Normal"
@@ -922,7 +1014,7 @@ def main_grid(
             print(f"  disease_status=Normal: suppressing Neoplasm (weight={neoplasm_prior_weight_on_normal})")
 
         radius_px = grid_um / _microns_per_pixel(sample) * radius_factor
-        img_input = aggregate_tokens_to_grid(sample, adata.obsm["spatial"], radius_px)
+        img_input = aggregate_tokens_to_grid(sample, adata.obsm["spatial"], radius_px, batch_size=token_batch_size)
         img_suppress = classes_containing(img_fit, "Neoplasm") if apply_neoplasm_prior else None
         img_labels, img_conf = predict_classifier(
             img_fit, img_input, device,
@@ -962,4 +1054,19 @@ def main_grid(
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["patch", "grid"], default="patch",
+                         help="patch-level main() (default) or 8um-grid main_grid()")
+    parser.add_argument("--targets", nargs="+", default=None,
+                         help="restrict to these samples instead of every discover_target_samples() result "
+                              "(e.g. for a per-slide cluster array job -- see main()'s targets docstring)")
+    parser.add_argument("--token-batch-size", type=int, default=20_000,
+                         help="grid mode only -- forwarded to main_grid's token_batch_size")
+    args = parser.parse_args()
+
+    if args.mode == "grid":
+        main_grid(targets=args.targets, token_batch_size=args.token_batch_size)
+    else:
+        main(targets=args.targets)

@@ -1,24 +1,16 @@
 """
 Cluster entry point for the token-augmented dual autoencoder (autoenc_token.ipynb),
-adapted to run headless via `sbatch`/`python train_autoenc_token.py` instead of a
-Jupyter kernel. Same three-branch model (cell transcriptomics + patch histology +
-cell-level token histology) and same phases (pretrain hist -> pretrain token ->
-freeze both -> joint contrastive training -> eval -> save), just without notebook
-magics or inline plotting.
+adapted to run headless via `sbatch`/`python train_autoenc_token.py`. Same
+three-branch model and phases (pretrain hist -> pretrain token -> freeze both ->
+joint contrastive training -> eval -> save), no notebook magics/plotting.
 
 Before running: per-slide token data must exist at
-data/{slide}/01_preprocessing/unimodel/metadata/cell_token_embeddings.h5ad,
-produced by `token_preprocessing.py --slide <slide>` (run separately, once per
-slide -- not part of this script). That script itself reads the smaller,
-already-QC'd raw token file, WSI_patch_token_embeddings_filtered.h5ad, not the
-unfiltered WSI_patch_token_embeddings.h5ad -- confirm both exist under
-data/{slide}/01_preprocessing/unimodel/metadata/ on the cluster before submitting.
+data/{slide}/01_preprocessing/unimodel/metadata/cell_token_embeddings.h5ad
+(from `token_preprocessing.py --slide <slide>`, run separately).
 
-To change which slides/config this run uses, edit CONFIG below before submitting
-(same pattern as run_token_sweep.py in this directory) -- e.g. duplicate
-this file or override CONFIG["sample"]/CONFIG["use_tokens"] per sbatch job rather
-than adding CLI flags, so each run's exact settings stay visible in the script
-itself alongside its output.
+To change slides/config, edit CONFIG below before submitting -- duplicate this
+file or override per sbatch job rather than adding CLI flags, so each run's
+settings stay visible alongside its output.
 """
 
 # ---- imports ----------------------------------------------------------
@@ -65,20 +57,14 @@ CONFIG = dict(
     temperature=0.07,
     neighbor_radius=2912,     # 2x patch diameter, currently 224x224 px
 
-    # false-negative protection: exclude transcriptomically near-duplicate,
-    # non-matching patches/cells from the hard-negative set (cosine-similarity
-    # cutoff on the trans-side projection), same rationale as neighbor_radius
-    # but gated on expression similarity instead of spatial distance -- see
-    # `patch_level_infonce`'s docstring. Set to None to disable.
+    # false-negative protection: excludes transcriptomically near-duplicate,
+    # non-matching patches/cells from hard negatives (see patch_level_infonce).
+    # None disables.
     patch_anchor_sim_threshold=0.9,
-    # None (was 0.9): run_token_sweep.py's 18-config sweep (max_local_contrast_weight
-    # x local_warmup_epochs x local_anchor_sim_threshold) showed this masking doesn't
-    # clearly help -- None beat 0.9 in most matched pairs (e.g. weight=1.0/warmup=10:
-    # cell_top1 0.0663 vs 0.0579) and never lost by much when it didn't. Also the
-    # mechanism that caused the original collapse (this masking checks the model's
-    # OWN live projections, so drifting projections got progressively masked out of
-    # the negative set) -- disabling it removes that failure mode entirely, and the
-    # sweep confirms nothing is being traded away to do so.
+    # None (was 0.9): the 18-config sweep showed this masking doesn't clearly help
+    # (None beat 0.9 in most pairs, e.g. weight=1.0/warmup=10: cell_top1 0.0663 vs
+    # 0.0579) and it was the collapse mechanism (checks the model's own live
+    # projections, so drifting projections get masked out of the negative set).
     local_anchor_sim_threshold=None,
 
     weight_reconstruction_by_patch_freq=True,
@@ -106,68 +92,41 @@ CONFIG = dict(
     token_pretrain_weight_decay=1e-5,
     token_pretrain_val_frac=0.1,
     token_pretrain_patience=15,
-    # token_lr_mult<1.0: token_enc/token_dec are already well-pretrained (Phase 1b,
-    # pure reconstruction) -- once unfrozen below, they get a reduced LR relative
-    # to trans_enc/trans_dec so the joint contrastive+reconstruction objective
-    # fine-tunes that pretrained structure gently rather than overwriting it at
-    # the same rate as trans_enc, which is being trained from scratch this phase.
+    # token_enc/token_dec are already well-pretrained (Phase 1b) -- reduced LR so
+    # the joint objective fine-tunes gently rather than overwriting that structure
+    # at the same rate as trans_enc (training from scratch this phase).
     token_lr_mult=0.3,
-    # False (was True): downstream goal is predicting trans embeddings from
-    # histology alone (see conversation notes) -- that needs token_enc's actual
-    # OUTPUT (X_dae_token_cell, saved post-training) to move toward trans_enc's
-    # embedding space, not just the narrow proj_token/proj_trans_local heads used
-    # inside the contrastive loss. With freeze_token=True, token_enc never
-    # received gradient in Phase 3 at all regardless of this flag or
-    # max_local_contrast_weight (train_autoenc_token.py's Phase 2 called
-    # freeze_token_encoder() unconditionally) -- fixed below so this flag now
-    # actually controls it. token_dec stays attached (not separately frozen) so
-    # loss_recon_token keeps regularizing token_enc against collapsing to a
-    # degenerate, purely-retrieval-optimized solution while it moves toward
-    # trans_enc's space.
+    # False (was True): goal is predicting trans embeddings from histology alone,
+    # which needs token_enc's actual output to move toward trans_enc's embedding
+    # space, not just the narrow contrastive projection heads. freeze_token=True
+    # previously blocked all Phase-3 gradient to token_enc regardless of this flag
+    # (a bug, now fixed) -- token_dec stays attached so loss_recon_token keeps
+    # regularizing against collapse while token_enc moves.
     freeze_token=False,
 
-    local_neighbor_radius=100,          # px -- cell-level analogue of neighbor_radius (2912 for
-                                         # patches). Median nearest-cell spacing measured ~27px in
-                                         # this dataset. Was 50 (~1.85x spacing) -- too small: cells
-                                         # a few widths apart (still very likely the same local
-                                         # tissue/cell-type) were still treated as hard negatives,
-                                         # producing a fine checkerboard-like alternation in the
-                                         # resulting clusters (see conversation notes). 100 (~3.7x
-                                         # spacing) is a first attempt at giving more room before
-                                         # anything gets pushed apart -- worth iterating on.
-    # History: 1.0/5-epoch-warmup collapsed (contrast_local crashed to 0.0000 for
-    # ~90 epochs, top-1 retrieval=0.000 on all 7 slides -- root cause: unfreezing
-    # token_enc AND raising this weight to full strength within just 5 epochs let
-    # token_enc's projections drift together fast, and local_anchor_sim_threshold's
-    # masking is circular (checks the model's OWN live projections), so drifting
-    # pairs got masked OUT of the negative set, removing the corrective gradient --
-    # self-reinforcing, no way back out). Reverted to 0.5/20 epochs, confirmed
-    # stable (local_frac_masked flat ~0.012 for the full 100-epoch run, real
-    # retrieval signal: cell_top1=0.088).
-    #
-    # run_token_sweep.py's 18-config sweep (see its token_sweep_log.csv) then
-    # tested 1.0 again, but with warmup>=10 instead of 5, and it was NOT the
-    # weight itself that was dangerous -- every warmup>=10 config stayed stable
-    # (local_frac_masked settled into the same healthy 0.011-0.017 band
-    # regardless of weight), and both higher weight and shorter warmup
-    # monotonically improved retrieval within the sweep's grid. Best of 18:
-    # weight=1.0, warmup=10 -> cell_top1=0.0663, cluster_top1=0.5015 (vs.
-    # 0.0532/0.4923 at the old 0.5/20 setting) -- so back to full strength, just
-    # with warmup=10 instead of the 5 that actually caused the collapse.
+    # cell-level analogue of neighbor_radius (2912 for patches); median nearest-
+    # cell spacing ~27px. Was 50 (~1.85x spacing) -- too small, produced a
+    # checkerboard-like cluster artifact from near cells still being treated as
+    # hard negatives. 100 (~3.7x) is a first attempt at more room.
+    local_neighbor_radius=100,
+
+    # History: 1.0/5-epoch-warmup collapsed (contrast_local -> 0 for ~90 epochs,
+    # top-1=0 on all 7 slides) -- unfreezing token_enc while ramping to full
+    # strength in 5 epochs let its projections drift together fast, and
+    # local_anchor_sim_threshold's masking is circular (checks the model's own
+    # live projections), so drifting pairs got masked out of the negative set,
+    # a self-reinforcing loop. Reverted to 0.5/20, stable (cell_top1=0.088). The
+    # 18-config sweep then found the weight itself wasn't the danger -- every
+    # warmup>=10 config stayed stable, and higher weight + shorter warmup both
+    # improved retrieval. Best of 18: weight=1.0/warmup=10 -> cell_top1=0.0663,
+    # cluster_top1=0.5015 (vs. 0.0532/0.4923 at 0.5/20).
     max_local_contrast_weight=1.0,
     local_warmup_epochs=10,
 
-    # skip Phase 1a (histology-patch pretraining) entirely -- with
-    # max_contrast_weight=0.0 above, the patch-level trans<->hist alignment
-    # never trains anyway, so hist_enc/hist_dec/pool/proj_trans/proj_hist never
-    # receive any gradient in Phase 3 either (their only path is
-    # contrast_weight * loss_contrast, which is always zero) -- X_dae_hist_patch
-    # would be a real pretrained-but-unaligned embedding either way, but
-    # X_dae_trans_patch (pool output) is already untrained noise regardless of
-    # whether Phase 1a runs. Skipping it saves a real, dedicated
-    # hist_pretrain_epochs-epoch training loop for output nothing here uses.
-    # Flip back to False once patch-level alignment is actually being trained
-    # (max_contrast_weight > 0).
+    # Skips Phase 1a (histology-patch pretraining): with max_contrast_weight=0.0,
+    # the patch-level branch never gets gradient in Phase 3 either way, so this
+    # just saves a training loop for output nothing here uses. Flip back to False
+    # once patch-level alignment is actually being trained (max_contrast_weight>0).
     skip_hist_pretrain=True,
 )
 
@@ -357,14 +316,10 @@ if CONFIG["use_tokens"]:
     )
 
 # ---- Phase 2: freeze histology branches -------------------------------
-# hist_enc always freezes here regardless of CONFIG (max_contrast_weight=0.0
-# means it never trains in Phase 3 anyway -- see Phase 1a's skip message).
-# token_enc freezing is now gated on CONFIG["freeze_token"] -- previously
-# called unconditionally, which meant freeze_token/max_local_contrast_weight/
-# token_lr_mult had no way to actually let token_enc adapt during Phase 3, no
-# matter how they were set (see conversation notes: downstream goal is a
-# trans-predictive token embedding, which needs token_enc's actual output to
-# move, not just the projection heads used inside the contrastive loss).
+# hist_enc always freezes (max_contrast_weight=0.0 means it never trains anyway).
+# token_enc freezing is gated on CONFIG["freeze_token"] -- previously called
+# unconditionally, a bug that gave freeze_token/max_local_contrast_weight/
+# token_lr_mult no way to actually let token_enc adapt in Phase 3.
 freeze_hist_encoder(model, freeze_decoder=True)
 if CONFIG["use_tokens"] and CONFIG["freeze_token"]:
     freeze_token_encoder(model, freeze_decoder=True)

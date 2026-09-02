@@ -1,37 +1,22 @@
 """
 Leave-one-slide-out generalization test -- TOKEN BRANCH (cell<->token retrieval).
 
-Does cell-level cross-modal retrieval (cell transcriptomics <-> per-cell UNI
-tokens) generalize to a slide the model has NEVER seen at any stage of
-training (not Phase 1b token pretraining, not Phase 3 joint training) -- as
-opposed to every cell_top1/cell_cluster_top1 number produced so far (the
-18-config sweep in token_sweep.py included), which was measured on data the
-model had already been trained on.
+Tests whether cell-level cross-modal retrieval generalizes to a slide never
+seen during training, unlike every other cell_top1/cluster_top1 number
+produced so far (measured in-sample).
 
-Run this ONCE with a single held-out slide first (default below) and sanity
-check the result before committing to the full N-fold version -- N-fold means
-training Phase 1b + Phase 3 from scratch once per slide, N times the cost of
-a single run.
+--held_out_slide picks the fold (default "CRC_P1"). For the full N-fold run,
+submit one array task per slide via submit_run_loso_array.sbatch (parallel,
+not N x the wall-clock of one run) -- each task's log is named per held-out
+slide so concurrent writers don't race on one shared CSV; merge_loso_logs.py
+combines them after.
 
---held_out_slide selects the fold (default "CRC_P1", matches the original
-single-slide sanity check). For the full N-fold run, submit one array task per
-slide via submit_run_loso_array.sbatch rather than looping in-process (see
-that file) -- each task calls this script with a different --held_out_slide,
-running genuinely in parallel instead of N times the wall-clock of one run.
-log_path is named per held-out slide specifically so concurrent array tasks
-never write to the same CSV (a shared log would race: each task reads-modifies-
-writes the whole file, so concurrent writers can silently drop each other's
-rows) -- merge_loso_logs.py combines the per-slide logs afterward.
-
-CONFIG here matches the validated settings from train_autoenc_token.py's
-CONFIG (see that script's comments for the full rationale/history of each
-value): max_local_contrast_weight=1.0, local_warmup_epochs=10,
-local_anchor_sim_threshold=None -- the winner of run_token_sweep.py's
-18-config sweep. Patch-level (hist<->trans) alignment stays OFF
-(max_contrast_weight=0.0, hist_enc/hist_dec left at random init and frozen) --
-this project's current focus is entirely the cell/token branch; a
-patch-level version of this test already exists as run_leave_one_slide_out
-in autoencoder_functions_new.py.
+CONFIG mirrors train_autoenc_token.py's validated settings (max_local_contrast_
+weight=1.0, local_warmup_epochs=10, local_anchor_sim_threshold=None -- the
+18-config sweep winner). Patch-level (hist<->trans) alignment stays OFF
+(max_contrast_weight=0.0, hist_enc/hist_dec frozen at random init) -- this
+project's focus is the cell/token branch; the patch-level LOSO test is
+run_leave_one_slide_out in autoencoder_functions_new.py.
 """
 
 # ---- imports ----------------------------------------------------------
@@ -54,17 +39,12 @@ def run_it(held_out_slide="CRC_P1"):
     set_seed(42)
 
     # ---- CONFIG -------------------------------------------------------------
-    # Mirrors train_autoenc_token.py's validated CONFIG -- see that script for the
-    # full rationale behind each value. Only the keys run_leave_one_slide_out_token
-    # (and the build_pipeline_data / DualAutoencoder / train() calls it makes) actually
-    # reads are included; hist_pretrain_* and skip_hist_pretrain are omitted entirely
-    # because that function never calls pretrain_hist_autoencoder at all (hist_enc is
-    # always left at random init and frozen immediately, harmless as long as
-    # max_contrast_weight stays 0.0 -- same regime skip_hist_pretrain=True encodes).
+    # Mirrors train_autoenc_token.py's validated CONFIG -- see that script for full
+    # rationale. hist_pretrain_*/skip_hist_pretrain omitted: this function never calls
+    # pretrain_hist_autoencoder, hist_enc just stays at random init and frozen.
     CONFIG = dict(
-        sample="combined",     # kept for consistency with train_autoenc_token.py's CONFIG shape;
-                                # NOT used to filter here -- run_leave_one_slide_out_token does its
-                                # own slide filtering (train vs held-out) internally
+        sample="combined",     # unused here -- slide filtering happens inside
+                                # run_leave_one_slide_out_token itself
         bin_size="002um",
         dir_cellseg="cell_seg_stardist",
         loss_fct="ntxent",
@@ -74,16 +54,9 @@ def run_it(held_out_slide="CRC_P1"):
         proj_dim=32,
         pool_type="attention",
         encoder="transconv",
-        # hist_condition_on_slide / token_condition_on_slide left unset -> both default
-        # True in DualAutoencoder, matching train_autoenc_token.py (which also never
-        # overrides them).
 
-        # which genes feed trans_enc -- "svg" (default, validated) selects for spatial
-        # patterning within a slide, the signal the alignment task actually needs.
-        # train_autoenc_token.py always uses this implicitly (calls get_svg_union_mask
-        # directly); exposed here as a knob since run_leave_one_slide_out_token supports
-        # it via get_gene_mask, same as the patch-level LOSO function does.
-        gene_selection="svg",   # "svg" | "hvg" | "intersection"
+        gene_selection="svg",   # "svg" | "hvg" | "intersection" -- spatial patterning,
+                                 # the signal the alignment task needs
 
         # graph / batching
         n_neighs=6,
@@ -93,22 +66,17 @@ def run_it(held_out_slide="CRC_P1"):
 
         # loss
         temperature=0.07,
-        neighbor_radius=2912,      # patch-level neighbor tolerance -- irrelevant here
-                                    # (max_contrast_weight=0.0) but still required by
-                                    # compute_patch_metadata/build_pipeline_data.
-        local_neighbor_radius=100,  # cell-level analogue, see train_autoenc_token.py's
-                                     # CONFIG comment -- first attempt, worth iterating on.
+        neighbor_radius=2912,       # patch-level; irrelevant while max_contrast_weight=0
+        local_neighbor_radius=100,  # cell-level analogue, first attempt
 
-        patch_anchor_sim_threshold=0.9,   # irrelevant while max_contrast_weight=0.0,
-                                           # kept for fidelity with train_autoenc_token.py.
-        local_anchor_sim_threshold=None,  # validated: sweep showed this masking doesn't
-                                           # clearly help and was the collapse mechanism's
-                                           # entry point -- see train_autoenc_token.py.
+        patch_anchor_sim_threshold=0.9,   # irrelevant while max_contrast_weight=0
+        local_anchor_sim_threshold=None,  # sweep showed masking here doesn't help and
+                                           # triggers collapse -- see train_autoenc_token.py
 
         weight_reconstruction_by_patch_freq=True,
 
-        # patch-level (hist<->trans) alignment -- OFF. hist_enc/hist_dec are built but
-        # never trained; DualAutoencoder still needs them to exist structurally.
+        # patch-level (hist<->trans) alignment OFF -- hist_enc/hist_dec built but never
+        # trained (DualAutoencoder needs them to exist structurally)
         max_contrast_weight=0.0,
 
         # training (Phase 3)
@@ -125,35 +93,25 @@ def run_it(held_out_slide="CRC_P1"):
         token_lr_mult=0.3,
         freeze_token=False,
         max_local_contrast_weight=1.0,   # winner of run_token_sweep.py's 18-config sweep
-        local_warmup_epochs=10,           # (see train_autoenc_token.py for the full history)
+        local_warmup_epochs=10,
 
-        # CAPPED-BATCHES experiment (see EXCLUDE_SLIDES/max_patches_per_slide comments
-        # below for the full story): PatchGroupedLoader gives each slide a per-epoch
-        # batch count proportional to its OWN patch count, so CRC_P11mm's 29,959 patches
-        # (vs. 8,063-10,983 for every other slide -- from filtered_WSI_patch_embeddings.h5ad's
-        # own Slide_ID counts) previously got a hugely disproportionate share of every
-        # epoch's gradient updates. 11000 sits just above the next-largest slide
-        # (CRC_P6_5mm, 10,983) -- i.e. it's a genuine no-op for every slide except
-        # CRC_P11mm, which is exactly the point: cap the one outlier down to
-        # normal-slide scale, leave everyone else's regime untouched. None disables
-        # capping entirely (original, uncapped behavior for every slide).
+        # Caps CRC_P11mm's per-epoch batch share: PatchGroupedLoader allocates batches
+        # proportional to each slide's own patch count, and CRC_P11mm's 29,959 (vs.
+        # 8,063-10,983 elsewhere) dominated every epoch. 11000 sits just above the next
+        # largest slide -- a no-op for everyone except CRC_P11mm. None = uncapped.
+        # (Tried fully EXCLUDING CRC_P11mm instead: reduced leakage and ~doubled in-sample
+        # fit, but held-out generalization stayed flat and the train/held-out gap widened
+        # -- an overfitting signature, not a fix. Capping is the better tradeoff.)
         max_patches_per_slide=11000,
 
-        # OVERSAMPLING experiment: evaluate_disease_signal (see conversation notes) showed
-        # the model doesn't reliably generalize "normal tissue" to a second, genuinely
-        # unseen normal patient -- Normal_P5's held-out tumor/normal accuracy stayed near
-        # chance (0.53) even after rebalancing the diagnostic classifier itself, unlike
-        # Normal_P3 (0.34 -> 0.91), ruling out pure classifier-calibration as the whole
-        # story. Each normal slide has a typical ~8,000 patches on its own (comparable to
-        # most tumor slides individually), but with only 2 normal vs. 8 tumor slides in
-        # this 10-slide run, their COMBINED per-epoch exposure is ~16,400 patches vs.
-        # ~96,000 for tumor -- a ~5.9:1 imbalance from slide COUNT alone, not per-slide
-        # size. 24000 per normal slide (~3x its own count) brings combined normal exposure
-        # to ~48,000, roughly matching the tumor side's total for an even tumor/normal
-        # split per epoch -- a starting point, not a tuned value; adjust if the next LOSO
-        # run's disease-signal check doesn't move. Real cells only, resampled with
-        # replacement (see PatchGroupedLoader's oversample_target docstring) -- not
-        # synthetic augmentation.
+        # Boosts the 2 normal slides' per-epoch exposure: evaluate_disease_signal showed
+        # the model doesn't reliably generalize "normal tissue" to a second unseen normal
+        # patient (Normal_P5 stayed near chance even after rebalancing the diagnostic
+        # classifier, unlike Normal_P3). Each normal slide is a typical size on its own
+        # (~8,000 patches) but only 2 exist vs. 8 tumor slides, so combined exposure is
+        # ~16,400 vs. ~96,000. 24000/slide (~3x) roughly balances the two classes per
+        # epoch -- a starting point, not tuned. Resampling real cells with replacement
+        # (see PatchGroupedLoader.oversample_target), not synthetic augmentation.
         oversample_slides={"Normal_P3": 24000, "Normal_P5": 24000},
     )
 
@@ -161,24 +119,9 @@ def run_it(held_out_slide="CRC_P1"):
     HELD_OUT_SLIDE = held_out_slide
 
     # ---- slides excluded from the dataset entirely (not just held out) ---------
-    # Prior experiment (see conversation notes / loso_token_baseline_all8slides vs.
-    # loso_excl_CRC_P11mm): fully EXCLUDING CRC_P11mm from training measurably reduced
-    # token leakage and roughly doubled in-sample retrieval fit, but held-out
-    # generalization stayed flat while the train/held-out gap roughly doubled too --
-    # an overfitting signature (less data, same n_epochs, more effective exposure per
-    # remaining slide), not a real fix. This run instead keeps CRC_P11mm IN the pool
-    # (EXCLUDE_SLIDES empty otherwise) and caps its per-epoch batch share instead (see
-    # max_patches_per_slide in CONFIG above) -- the more surgical fix the exclusion
-    # experiment's overfitting side effect motivated.
-    #
-    # CRC_P3_SMAP / CRC_P4_SMAP: preprocessing (incl. token_preprocessing.py) is now
-    # verified complete for both, so this run deliberately includes them -- a new,
-    # internally-consistent 10-slide (8 tumor / 2 normal) baseline, combined with the
-    # oversample_slides experiment above. NOT comparable fold-by-fold against the
-    # earlier 8-slide capped-batches results (loso_token_run_cap_per_epoch_patch_size)
-    # -- different training pool AND different n_slides/decoder width. Re-add a slide
-    # here (or reuse this pattern) if a slide's preprocessing ever needs to be held
-    # back from a run again.
+    # CRC_P3_SMAP/CRC_P4_SMAP's preprocessing is now complete, so both are included --
+    # a new 10-slide (8 tumor/2 normal) baseline, not comparable fold-by-fold against
+    # the earlier 8-slide capped-batches results (different pool, different n_slides).
     EXCLUDE_SLIDES = []
 
     # ---- output dirs ----------------------------------------------------------
@@ -208,8 +151,8 @@ def run_it(held_out_slide="CRC_P1"):
         raise ValueError("Cannot set Slide_ID+Patch_ID as index: contains duplicates")
     f_hist_adata.obs = f_hist_adata.obs.set_index(hist_global_id)
 
-    # ---- apply EXCLUDE_SLIDES (see its own comment above) -- BEFORE token loading, ----
-    # ---- so slides_needed below never even looks for their token files ----------------
+    # apply EXCLUDE_SLIDES before token loading, so slides_needed below never looks
+    # for their token files
     if EXCLUDE_SLIDES:
         if HELD_OUT_SLIDE in EXCLUDE_SLIDES:
             raise ValueError(f"HELD_OUT_SLIDE={HELD_OUT_SLIDE!r} is also in EXCLUDE_SLIDES "
@@ -220,11 +163,9 @@ def run_it(held_out_slide="CRC_P1"):
         f_trans_coord = f_trans_coord[~f_trans_coord["Slide_ID"].isin(EXCLUDE_SLIDES)].copy()
 
     # ---- load token data --------------------------------------------------------
-    # Same loading logic as train_autoenc_token.py's step "load token data": reads each
-    # slide's cell_token_embeddings.h5ad (from token_preprocessing.py), concatenates,
-    # and -- if some slides don't have token data yet -- restricts EVERYTHING (hist,
-    # trans, coord) to the slides that do, so run_leave_one_slide_out_token never sees
-    # a slide with hist/trans data but no token data.
+    # Reads each slide's cell_token_embeddings.h5ad, concatenates, and -- if some
+    # slides don't have token data yet -- restricts hist/trans/coord to the slides
+    # that do.
     slides_needed = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique())
     token_adatas, slides_with_tokens = [], []
     for s in slides_needed:
@@ -254,17 +195,11 @@ def run_it(held_out_slide="CRC_P1"):
     f_token_adata = f_token_adata[f_token_adata.obs["matched"].astype(bool)].copy()
     print(f"Loaded token data: {f_token_adata.n_obs} cells across {len(slides_with_tokens)} slide(s)")
 
-    # NOTE: hist_batch_correct (Harmony) is intentionally not supported here, same as the
-    # patch-level run_leave_one_slide_out -- and moot anyway since hist_enc never trains
-    # in this regime (max_contrast_weight=0.0).
-
     # ---- single held-out slide ---------------------------------------------------
     checkpoint_dir = dir_output / "loso_token_checkpoints"
 
-    # run_tag disambiguates run_id/checkpoint/log filename when comparing regimes on the
-    # same held_out_slide -- otherwise a second run silently overwrites the first run's
-    # checkpoint (same collision class run_sweep.py's BATCH_TAG fixed). Built from
-    # whichever non-default regimes are active, so it composes as new toggles get added.
+    # run_tag disambiguates checkpoint/log filenames between regimes on the same
+    # held_out_slide, so a second run doesn't overwrite the first's outputs
     _tag_parts = []
     if CONFIG["freeze_token"]:
         _tag_parts.append("frozen_token")
@@ -278,14 +213,9 @@ def run_it(held_out_slide="CRC_P1"):
         _tag_parts.append("oversample_normal")
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""
 
-    # Named per held-out slide AND run_tag (not a shared "loso_token_log.csv") so that
-    # (a) running every slide's fold concurrently as a SLURM array
-    # (submit_run_loso_array.sbatch) never has two processes read-modify-write the same
-    # CSV at once, and (b) a different regime (e.g. this EXCLUDE_SLIDES experiment) on
-    # the SAME held-out slide gets its own log file instead of silently overwriting the
-    # baseline's row -- this was a real gap before (checkpoints already carried RUN_TAG,
-    # the log filename didn't). merge_loso_logs.py combines per-slide logs afterward;
-    # point it at whichever regime's files you want merged.
+    # Named per held-out slide AND run_tag so concurrent array tasks never race on one
+    # CSV, and a different regime on the same held-out slide gets its own file instead
+    # of overwriting another run's row. merge_loso_logs.py combines them after.
     log_path = dir_output / f"loso_token_log_{HELD_OUT_SLIDE}{RUN_TAG}.csv"
 
     print(f"\n=== Leave-one-slide-out (token branch): holding out {HELD_OUT_SLIDE} "
@@ -296,12 +226,16 @@ def run_it(held_out_slide="CRC_P1"):
     )
 
     print("\n=== Result ===")
-    print(f"In-sample (training slides) cell top-1 retrieval:     {metrics['train_cell_top1_retrieval']:.4f} "
-          f"(cluster top-1 {metrics['train_cell_cluster_top1_retrieval']:.4f})")
-    print(f"Held-out ({HELD_OUT_SLIDE}) cell top-1 retrieval:        {metrics['held_out_cell_top1_retrieval']:.4f} "
-          f"(cluster top-1 {metrics['held_out_cell_cluster_top1_retrieval']:.4f})")
-    print(f"Gap (train - held-out): top1={metrics['train_cell_top1_retrieval'] - metrics['held_out_cell_top1_retrieval']:.4f} "
-          f"cluster_top1={metrics['train_cell_cluster_top1_retrieval'] - metrics['held_out_cell_cluster_top1_retrieval']:.4f}")
+    # cluster_top1 (hit = retrieved cell shares the query's independent cluster label) is
+    # the headline number, not raw top1: with 100,000s of cells, many are near-duplicates
+    # biologically, so exact-cell top1 penalizes a correct-but-not-exact match as a miss.
+    # Raw top1 is kept alongside as a secondary diagnostic, not the primary read.
+    print(f"In-sample (training slides) cell cluster top-1 retrieval:     {metrics['train_cell_cluster_top1_retrieval']:.4f} "
+          f"(exact-cell top-1 {metrics['train_cell_top1_retrieval']:.4f})")
+    print(f"Held-out ({HELD_OUT_SLIDE}) cell cluster top-1 retrieval:        {metrics['held_out_cell_cluster_top1_retrieval']:.4f} "
+          f"(exact-cell top-1 {metrics['held_out_cell_top1_retrieval']:.4f})")
+    print(f"Gap (train - held-out): cluster_top1={metrics['train_cell_cluster_top1_retrieval'] - metrics['held_out_cell_cluster_top1_retrieval']:.4f} "
+          f"top1={metrics['train_cell_top1_retrieval'] - metrics['held_out_cell_top1_retrieval']:.4f}")
     print(f"Token pretrain: best val MSE {metrics['token_pretrain_best_val_mse']:.5f} "
           f"(stopped epoch {metrics['token_pretrain_stopped_epoch']})")
     print(f"Train-slide token leakage: {metrics['train_token_leakage_mean']:.4f} "
@@ -315,13 +249,9 @@ def run_it(held_out_slide="CRC_P1"):
     print(f"Cell embeddings (trans/token, train + held-out) saved to "
           f"{checkpoint_dir / f'loso_token_{HELD_OUT_SLIDE}{RUN_TAG}_embeddings.npz'}")
 
-    # Best-effort only: plyer's Linux backend needs notify-send/dbus, neither of which
-    # exist on a headless cluster node -- confirmed to raise NotImplementedError there
-    # (see loso_err.txt from the CRC_P1 run). That happened AFTER the real work and the
-    # CSV/checkpoint writes above, so it never lost anything, but it did leave every job
-    # exiting on an uncaught traceback -- confusing across an 8-task array where you're
-    # scanning for which folds actually failed. Swallowed here since the notification
-    # itself is a non-essential convenience.
+    # Best-effort: plyer's Linux backend needs notify-send/dbus, unavailable on a
+    # headless cluster node -- swallow rather than let a non-essential notification
+    # fail the job after all real work is already done.
     try:
         notification.notify(
             title='Jupyter Notebook Alert',
