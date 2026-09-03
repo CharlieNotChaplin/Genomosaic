@@ -75,14 +75,12 @@ CHECKPOINT_DIR = Path("../../data/combined/03_integration/autoencoders/002um/tok
 # ---- base config: everything NOT being swept, held at
 # train_autoenc_token.py's currently-validated values -------------------------
 BASE_CONFIG = dict(
-    latent_dim=64, proj_dim=32, pool_type="attention", encoder="transconv",
+    latent_dim=64, proj_dim=32, encoder="transconv",
     n_epochs=REDUCED_EPOCHS, lr=1e-3, warmup_epochs=5,
-    max_contrast_weight=0.0,           # patch-level branch stays off -- see conversation notes
     temperature=0.07,
     weight_reconstruction_by_patch_freq=True,
-    patch_anchor_sim_threshold=None,   # irrelevant while max_contrast_weight=0.0
     freeze_token=False, token_lr_mult=0.3,
-    hist_condition_on_slide=True, token_condition_on_slide=True,
+    token_condition_on_slide=True,
 )
 
 # ---- load data (identical to train_autoenc_token.py's data-prep block) -----
@@ -194,9 +192,9 @@ cluster_labels = pd.factorize(trans_sub.obs["clusters"])[0]
 # ---- Phase 1: pretrain token_enc/token_dec ONCE, shared across every grid point
 print("\n=== pretraining shared token_enc/token_dec (once for the whole sweep) ===")
 model_kwargs = dict(
-    n_svg=X_svg.shape[1], hist_dim=hist_emb.shape[1], token_dim=token_emb.shape[1],
+    n_svg=X_svg.shape[1], token_dim=token_emb.shape[1],
     latent_dim=BASE_CONFIG["latent_dim"], proj_dim=BASE_CONFIG["proj_dim"],
-    n_slides=n_slides, pool_type=BASE_CONFIG["pool_type"], encoder_type=BASE_CONFIG["encoder"],
+    n_slides=n_slides, encoder_type=BASE_CONFIG["encoder"],
 )
 model_template_state = pretrain_token_once(
     model_kwargs, token_emb_t, cell_meta,
@@ -224,8 +222,8 @@ for i, combo in enumerate(combos):
 
     print(f"\n--- [{i + 1}/{len(combos)}] run_id={run_id} ---")
     run_token_experiment(
-        run_id, config, model_template_state, data, loader, hist_emb_t, patch_meta,
-        token_emb_t, cell_meta, n_slides, X_svg.shape[1], hist_emb.shape[1], token_emb.shape[1],
+        run_id, config, model_template_state, data, loader, patch_meta,
+        token_emb_t, cell_meta, n_slides, X_svg.shape[1], token_emb.shape[1],
         cluster_labels, log_path=LOG_PATH, checkpoint_dir=CHECKPOINT_DIR, device=device,
     )
 

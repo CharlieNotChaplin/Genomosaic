@@ -13,10 +13,8 @@ combines them after.
 
 CONFIG mirrors train_autoenc_token.py's validated settings (max_local_contrast_
 weight=1.0, local_warmup_epochs=10, local_anchor_sim_threshold=None -- the
-18-config sweep winner). Patch-level (hist<->trans) alignment stays OFF
-(max_contrast_weight=0.0, hist_enc/hist_dec frozen at random init) -- this
-project's focus is the cell/token branch; the patch-level LOSO test is
-run_leave_one_slide_out in autoencoder_functions_new.py.
+18-config sweep winner). Cell-level (trans<->token) only -- the patch-level
+(hist<->trans) branch has been removed from this project entirely.
 """
 
 # ---- imports ----------------------------------------------------------
@@ -40,8 +38,8 @@ def run_it(held_out_slide="CRC_P1"):
 
     # ---- CONFIG -------------------------------------------------------------
     # Mirrors train_autoenc_token.py's validated CONFIG -- see that script for full
-    # rationale. hist_pretrain_*/skip_hist_pretrain omitted: this function never calls
-    # pretrain_hist_autoencoder, hist_enc just stays at random init and frozen.
+    # rationale. hist_pretrain_*/skip_hist_pretrain omitted: the patch-level branch
+    # (and its Phase-1 pretraining) has been removed from the project entirely.
     CONFIG = dict(
         sample="combined",     # unused here -- slide filtering happens inside
                                 # run_leave_one_slide_out_token itself
@@ -52,7 +50,6 @@ def run_it(held_out_slide="CRC_P1"):
         # model
         latent_dim=64,
         proj_dim=32,
-        pool_type="attention",
         encoder="transconv",
 
         gene_selection="svg",   # "svg" | "hvg" | "intersection" -- spatial patterning,
@@ -66,18 +63,14 @@ def run_it(held_out_slide="CRC_P1"):
 
         # loss
         temperature=0.07,
-        neighbor_radius=2912,       # patch-level; irrelevant while max_contrast_weight=0
+        neighbor_radius=2912,       # still required by compute_patch_metadata/
+                                     # build_pipeline_data's shared patch-batching path
         local_neighbor_radius=100,  # cell-level analogue, first attempt
 
-        patch_anchor_sim_threshold=0.9,   # irrelevant while max_contrast_weight=0
         local_anchor_sim_threshold=None,  # sweep showed masking here doesn't help and
                                            # triggers collapse -- see train_autoenc_token.py
 
         weight_reconstruction_by_patch_freq=True,
-
-        # patch-level (hist<->trans) alignment OFF -- hist_enc/hist_dec built but never
-        # trained (DualAutoencoder needs them to exist structurally)
-        max_contrast_weight=0.0,
 
         # training (Phase 3)
         n_epochs=100,

@@ -86,42 +86,18 @@ class SVGGraphEncoder_TransConv(nn.Module):
         return self.out(h)
  
  
-class AttentionPool(nn.Module):
-    """
-    Gated attention pooling (Ilse et al., 2018 style) over cells within a patch.
-    Learns which cells drive the patch's histology-aligned identity -- attention
-    weights are interpretable per cell (e.g. can be cross-referenced against cell
-    type annotations to see which populations anchor a patch's morphology).
-    """
- 
-    def __init__(self, in_dim, hidden_dim=64):
-        super().__init__()
-        self.attn_V = nn.Linear(in_dim, hidden_dim)
-        self.attn_U = nn.Linear(in_dim, hidden_dim)
-        self.attn_w = nn.Linear(hidden_dim, 1)
- 
-    def forward(self, z_cells, patch_index, num_patches):
-        a = torch.tanh(self.attn_V(z_cells)) * torch.sigmoid(self.attn_U(z_cells))
-        scores = self.attn_w(a).squeeze(-1)
-        attn_weights = segment_softmax(scores, patch_index, num_patches)
-        pooled = segment_sum(z_cells * attn_weights.unsqueeze(-1), patch_index, num_patches)
-        return pooled, attn_weights
- 
- 
 class MLPDecoder(nn.Module):
     """
     Optionally conditions on slide identity, one-hot-concatenated onto the latent
     before decoding. Conditioning alone only gives the decoder a "free" channel to
-    explain away which slide a patch came from -- it removes the *requirement* for
-    the encoder to keep that in its bottleneck, without directly penalizing it for
-    keeping it anyway. The actual incentive to drop it comes from weight_decay on
-    the encoder's optimizer (see `DualAutoencoder`'s `hist_condition_on_slide`
-    docstring for the full mechanism and the measured effect): once conditioning
-    makes slide identity unnecessary for reconstruction, L2 regularization pushes
-    the optimizer toward not encoding it anyway. `condition_on_slide=True` (this
-    class's default) is the validated setting for `hist_dec`, paired with
-    `pretrain_hist_autoencoder`'s weight_decay -- Slide_ID leakage 0.495 vs 0.900
-    unconditioned, same data/seed/regime.
+    explain away which cell/patch's slide it came from -- it removes the
+    *requirement* for the encoder to keep that in its bottleneck, without directly
+    penalizing it for keeping it anyway. The actual incentive to drop it comes
+    from weight_decay on the encoder's optimizer: once conditioning makes slide
+    identity unnecessary for reconstruction, L2 regularization pushes the
+    optimizer toward not encoding it anyway. `condition_on_slide=True` (this
+    class's default) is the validated setting, paired with weight_decay on
+    whichever encoder feeds this decoder (trans_enc/token_enc).
     """
     def __init__(self, latent_dim, hidden_dims, out_dim, n_slides=5, condition_on_slide=True):
         super().__init__()
@@ -171,32 +147,22 @@ class ProjectionHead(nn.Module):
  
  
 class DualAutoencoder(nn.Module):
-    def __init__(self, n_svg, hist_dim, latent_dim=64, proj_dim=32, n_slides=5,
-                 pool_type="attention", encoder_type="sage", transconv_heads=4,
-                 hist_condition_on_slide=True, token_dim=None, token_hidden=(512, 128),
+    def __init__(self, n_svg, latent_dim=64, proj_dim=32, n_slides=5,
+                 encoder_type="sage", transconv_heads=4,
+                 token_dim=None, token_hidden=(512, 128),
                  token_condition_on_slide=True):
         """
         token_dim: dimensionality of the per-cell local histology token feature
             (footprint+halo ViT token embedding, see `token_preprocessing.py`).
-            None (default) builds the model with no token branch, unaffecting
-            existing checkpoints/pipelines. Passing a value adds a third branch
-            (`token_enc`/`token_dec`/`proj_token`, mirroring `hist_enc`/`hist_dec`/
-            `proj_hist`), plus `proj_trans_local` kept separate from `proj_trans`
-            so the cell-level and patch-level contrastive objectives don't share
-            one projection subspace.
+            None (default) builds the model with no token branch. Passing a
+            value adds `token_enc`/`token_dec`/`proj_token`, plus
+            `proj_trans_local` kept separate from the cell reconstruction path
+            so the cell-level contrastive objective doesn't share `trans_dec`'s
+            projection subspace.
 
             Token embeddings are per-CELL, not per-patch -- no pooling/broadcast,
             since footprint/halo aggregation already makes the correspondence
             close to one-to-one (median nucleus ~21px vs. 14px tokens).
-
-        hist_condition_on_slide: whether `hist_dec` also gets the slide one-hot
-            concatenated onto z. Default True (previously False, on the theory
-            that conditioning only removes the *requirement* to encode slide
-            identity without penalizing it -- incomplete reasoning, since
-            `pretrain_hist_autoencoder`'s weight_decay actively pushes the
-            encoder to drop now-unnecessary information, not just permits it).
-            Measured, same data/seed: condition_on_slide=True -> Slide_ID
-            leakage 0.495; False -> 0.900 (chance=0.20). Keep True.
         """
         super().__init__()
         if encoder_type == "sage":
@@ -206,14 +172,6 @@ class DualAutoencoder(nn.Module):
         else:
             raise ValueError(f"Unsupported ecnoder_type: '{encoder_type}'. Choose from 'sage', 'transconv'.")
         self.trans_dec = MLPDecoder(latent_dim, [256, 512], n_svg, n_slides)
-        self.hist_enc = MLPEncoder(hist_dim, [512, 128], latent_dim)
-        self.hist_dec = MLPDecoder(latent_dim, [128, 512], hist_dim, n_slides,
-                                    condition_on_slide=hist_condition_on_slide)
-        self.proj_trans = ProjectionHead(latent_dim, proj_dim)
-        self.proj_hist = ProjectionHead(latent_dim, proj_dim)
-
-        self.pool_type = pool_type
-        self.pool = AttentionPool(latent_dim) if pool_type == "attention" else None
 
         self.token_dim = token_dim
         if token_dim is not None:
@@ -325,65 +283,18 @@ def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delauna
     return conn
  
  
-def harmonize_hist_embeddings(hist_adata, batch_key="Slide_ID", n_pcs=50, random_state=42):
-    """
-    Runs Harmony (harmonypy) batch correction on the raw histology foundation-model
-    embeddings, keyed on `batch_key` (typically Slide_ID) -- attacks the confound
-    at its source (the frozen UNI embeddings already carry strong acquisition/
-    center signal, see conversation notes / the Robustness Index literature)
-    rather than only fighting it from the autoencoder/training side.
-
-    PCA-reduces to `n_pcs` first: standard Harmony usage (it's a clustering-based
-    correction, more effective and much cheaper in a moderate-dim space than
-    running it directly on the full 1536-dim embedding), and downstream `hist_enc`
-    was always going to compress further anyway.
-
-    Meant to be run ONCE on the full, unique-patch `f_hist_adata` right after
-    loading it:
-        f_hist_adata.obsm["X_harmony"] = harmonize_hist_embeddings(f_hist_adata)
-    then pass `hist_use_rep="X_harmony"` to `build_pairing` to use this corrected
-    representation as the autoencoder's histology input instead of the raw
-    embedding.
-
-    Returns:
-      X_harmony: (n_obs, n_pcs) float32 array, aligned to hist_adata.obs row order
-    """
-    import harmonypy
-    from sklearn.decomposition import PCA
-
-    X = hist_adata.X
-    X = X.toarray() if sp.issparse(X) else np.asarray(X)
-    X = StandardScaler().fit_transform(X).astype(np.float32)
-
-    pca = PCA(n_components=n_pcs, random_state=random_state)
-    X_pca = pca.fit_transform(X)
-
-    meta = hist_adata.obs[[batch_key]].copy()
-    ho = harmonypy.run_harmony(X_pca, meta, [batch_key], random_state=random_state)
-    # harmonypy 2.0.0's Z_corr comes back in the same (N, n_pcs) orientation the
-    # input was given in (verified empirically -- older harmonypy versions
-    # returned (n_pcs, N) and needed a transpose here; this one doesn't).
-    X_harmony = np.asarray(ho.Z_corr).astype(np.float32)
-    assert X_harmony.shape == X_pca.shape, (
-        f"unexpected harmonypy output orientation: got {X_harmony.shape}, expected {X_pca.shape}"
-    )
-    return X_harmony
-
-
 def build_pairing(trans_adata, hist_adata, trans_patch_col="Patch_ID", hist_patch_col="Patch_ID",
-                   slide_col="Slide_ID", hist_use_rep=None):
+                   slide_col="Slide_ID"):
     """
+    Matches each nucleus to the histology patch it falls in -- shared batching
+    infrastructure (PatchGroupedLoader groups cells by patch regardless of
+    whether a patch-level embedding is trained on), not itself patch-branch-only.
+
     Returns:
       keep_mask: (n_trans,) bool array, nuclei with a matching histology patch
       patch_row_trans: (n_kept,) int array, which unique histology-patch row each
                         kept nucleus belongs to
       hist_emb: (n_unique_patches, hist_dim) float32 array, one row per unique patch
-
-    hist_use_rep: if given (e.g. "X_harmony"), pulls hist_emb from
-      `hist_adata.obsm[hist_use_rep]` instead of `hist_adata.X` -- use this to feed
-      a batch-corrected representation (see `harmonize_hist_embeddings`) to the
-      autoencoder instead of the raw foundation-model embedding. None preserves
-      the original behavior.
     """
     trans_key = (
         trans_adata.obs[slide_col].astype(str) + "_" + trans_adata.obs[trans_patch_col].astype(str)
@@ -404,12 +315,9 @@ def build_pairing(trans_adata, hist_adata, trans_patch_col="Patch_ID", hist_patc
     patch_key_trans = trans_key.values[keep_mask]
     patch_row_trans = np.array([key_to_hist_row[k] for k in patch_key_trans])
 
-    if hist_use_rep is not None:
-        hist_emb = np.asarray(hist_adata.obsm[hist_use_rep], dtype=np.float32)
-    else:
-        hist_X = hist_adata.X
-        hist_emb = hist_X.toarray() if sp.issparse(hist_X) else np.asarray(hist_X)
-        hist_emb = hist_emb.astype(np.float32)
+    hist_X = hist_adata.X
+    hist_emb = hist_X.toarray() if sp.issparse(hist_X) else np.asarray(hist_X)
+    hist_emb = hist_emb.astype(np.float32)
 
     return keep_mask, patch_row_trans, hist_emb
  
@@ -513,8 +421,9 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
       same `slide_uniques` used for the cell/graph side). Previously this ran its own
       independent `pd.factorize` here, which could assign different codes than the
       cell-side factorize (different objects, different first-appearance order),
-      occasionally producing a patch-level slide_id >= n_slides and crashing hist_dec's
-      one-hot with a device-side CUDA assert. Coding against the shared list fixes this.
+      occasionally producing a patch-level slide_id >= n_slides and crashing a decoder's
+      one-hot (F.one_hot(slide_code, n_slides)) with a device-side CUDA assert. Coding
+      against the shared list fixes this.
     """
     n_hist_patches = hist_adata.shape[0]
  
@@ -772,30 +681,8 @@ def encode_full_graph_batched(encoder, data, device, num_neighbors=(10, 10), bat
 
 # ---- segment (group-wise) ops, self-contained (no torch_scatter dependency) ----
  
-def segment_sum(src, index, num_segments):
-    out_shape = (num_segments,) + tuple(src.shape[1:])
-    out = torch.zeros(out_shape, device=src.device, dtype=src.dtype)
-    out.index_add_(0, index, src)
-    return out
- 
- 
-def segment_mean_pool(z, index, num_segments):
-    s = segment_sum(z, index, num_segments)
-    counts = segment_sum(torch.ones(z.shape[0], 1, device=z.device, dtype=z.dtype), index, num_segments)
-    return s / counts.clamp(min=1.0)
- 
- 
-def segment_softmax(scores, index, num_segments):
-    seg_max = torch.full((num_segments,), float("-inf"), device=scores.device, dtype=scores.dtype)
-    seg_max.scatter_reduce_(0, index, scores, reduce="amax", include_self=True)
-    scores = scores - seg_max[index]
-    exp_scores = scores.exp()
-    seg_sum = segment_sum(exp_scores, index, num_segments)
-    return exp_scores / (seg_sum[index] + 1e-12)
- 
- 
 # ---- loss ----
- 
+
 def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
                          neighbor_radius=None, weight=None, anchor_sim_threshold=None,
                          return_stats=False):
@@ -936,147 +823,21 @@ def vicreg_regularizer(z, var_target=1.0, eps=1e-4):
     return loss_var + loss_cov
 
 
-def pretrain_hist_autoencoder(model, hist_emb_all, patch_meta, epochs=100, batch_size=256,
-                               lr=1e-3, weight_decay=1e-5, val_frac=0.1, patience=15,
-                               device="cuda", verbose=True, seed=0):
-    """
-    Phase-1 pretraining: hist_enc/hist_dec only -- no graph machinery, no
-    contrastive loss, no trans branch (plain full-dataset MLP training loop).
-
-    Rebuilt to match a known-good external baseline that preserved anatomical
-    structure well, where the original version (fixed LR, no validation, no
-    early stopping) didn't:
-      - pure MSE only -- avoids the unprincipled-combined-loss gradient-conflict
-        problem. Add `vicreg_regularizer` deliberately if wanted; not wired in
-        by default since pure MSE alone matched the working baseline.
-      - AdamW with real weight decay, instead of unregularized Adam.
-      - ReduceLROnPlateau instead of one fixed LR throughout.
-      - a genuine validation split (`val_frac`), early stopping (`patience`),
-        restoring the best-val-loss checkpoint at the end.
-
-    Leave `hist_condition_on_slide=True` (default) -- see DualAutoencoder's
-    docstring for the measured effect.
-
-    Meant to run before `train()`. Follow with `freeze_hist_encoder(model)` and
-    `train(..., freeze_hist=True)` for the joint phase.
-    """
-    import copy
-
-    model.to(device)
-    opt = torch.optim.AdamW(
-        list(model.hist_enc.parameters()) + list(model.hist_dec.parameters()),
-        lr=lr, weight_decay=weight_decay,
-    )
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=5)
-
-    hist_emb_all = hist_emb_all.to(device)
-    slide_id = patch_meta["slide_id"].to(device)
-    N = hist_emb_all.shape[0]
-
-    n_val = max(1, int(N * val_frac))
-    perm = torch.randperm(N, generator=torch.Generator().manual_seed(seed))
-    val_idx = perm[:n_val]
-    train_idx = perm[n_val:]
-
-    best_val = float("inf")
-    best_state = None
-    epochs_no_improve = 0
-
-    for epoch in range(epochs):
-        model.hist_enc.train()
-        model.hist_dec.train()
-        train_perm = train_idx[torch.randperm(len(train_idx))]
-        tot_recon, nb = 0.0, 0
-        for start in range(0, len(train_perm), batch_size):
-            idx = train_perm[start:start + batch_size]
-            x = hist_emb_all[idx]
-            sid = slide_id[idx]
-            z = model.hist_enc(x)
-            recon = model.hist_dec(z, slide_code=sid)
-            loss = F.mse_loss(recon, x)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            tot_recon += loss.item() * len(idx)
-            nb += len(idx)
-        train_loss = tot_recon / nb
-
-        model.hist_enc.eval()
-        model.hist_dec.eval()
-        with torch.no_grad():
-            x = hist_emb_all[val_idx]
-            sid = slide_id[val_idx]
-            z = model.hist_enc(x)
-            recon = model.hist_dec(z, slide_code=sid)
-            val_loss = F.mse_loss(recon, x).item()
-        scheduler.step(val_loss)
-
-        if verbose and (epoch % 5 == 0 or epoch == epochs - 1):
-            print(f"[hist pretrain] epoch {epoch:4d} | train MSE {train_loss:.5f} | "
-                  f"val MSE {val_loss:.5f} | lr {opt.param_groups[0]['lr']:.2e}")
-
-        if val_loss < best_val - 1e-6:
-            best_val = val_loss
-            best_state = {
-                "hist_enc": copy.deepcopy(model.hist_enc.state_dict()),
-                "hist_dec": copy.deepcopy(model.hist_dec.state_dict()),
-            }
-            epochs_no_improve = 0
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= patience:
-                if verbose:
-                    print(f"[hist pretrain] early stopping at epoch {epoch} (best val MSE {best_val:.5f})")
-                break
-
-    if best_state is not None:
-        model.hist_enc.load_state_dict(best_state["hist_enc"])
-        model.hist_dec.load_state_dict(best_state["hist_dec"])
-        if verbose:
-            print(f"[hist pretrain] restored best checkpoint (val MSE {best_val:.5f})")
-
-    return {"best_val_mse": best_val, "stopped_epoch": epoch}
-
-
-def freeze_hist_encoder(model, freeze_decoder=True):
-    """
-    Freezes hist_enc (and, by default, hist_dec) in place: sets requires_grad=False
-    on their parameters so `train()`'s optimizer (which filters on requires_grad,
-    see below) never updates them, and marks them .eval() so BatchNorm running
-    stats stop updating too (requires_grad=False alone does NOT freeze BatchNorm's
-    running mean/var -- those update from forward-pass statistics regardless of
-    gradient flags, so both need to be handled).
-
-    Call after `pretrain_hist_autoencoder`, before the joint/contrastive `train()`
-    phase. `train_step`/`train`'s `freeze_hist=True` re-applies .eval() to these
-    submodules each step (since `model.train()` at the top of `train_step`
-    otherwise flips every submodule, including frozen ones, back to train mode).
-    """
-    for p in model.hist_enc.parameters():
-        p.requires_grad_(False)
-    model.hist_enc.eval()
-    if freeze_decoder:
-        for p in model.hist_dec.parameters():
-            p.requires_grad_(False)
-        model.hist_dec.eval()
-
 
 def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batch_size=1024,
                                 lr=1e-3, weight_decay=1e-5, val_frac=0.1, patience=15,
                                 device="cuda", verbose=True, seed=0):
     """
-    Phase-1 pretraining for the token branch (`token_enc`/`token_dec`) -- CELL-level
-    analogue of `pretrain_hist_autoencoder`, same rationale and same recipe (pure
-    MSE, AdamW+weight_decay, ReduceLROnPlateau, held-out val split, early stopping,
-    restore best checkpoint). Batched over CELLS via `cell_meta["slide_id"]`
-    instead of over patches via `patch_meta["slide_id"]` -- everything else is
-    identical in structure.
+    Phase-1 pretraining for the token branch (`token_enc`/`token_dec`): no graph
+    machinery, no contrastive loss, no trans branch -- pure MSE, AdamW+weight_decay,
+    ReduceLROnPlateau, a genuine held-out validation split, early stopping,
+    restoring the best-val-loss checkpoint at the end. Batched over cells via
+    `cell_meta["slide_id"]`.
 
     Requires `model.token_enc`/`model.token_dec` to exist, i.e. `DualAutoencoder`
     was constructed with `token_dim` set.
 
-    Meant to run BEFORE `train()`, alongside (order doesn't matter relative to)
-    `pretrain_hist_autoencoder`. Follow with `freeze_token_encoder(model)` and
+    Meant to run before `train()`. Follow with `freeze_token_encoder(model)` and
     `train(..., freeze_token=True)` for the joint phase.
     """
     import copy
@@ -1162,10 +923,12 @@ def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batc
 
 def freeze_token_encoder(model, freeze_decoder=True):
     """
-    Freezes `token_enc` (and, by default, `token_dec`) in place -- CELL-level
-    analogue of `freeze_hist_encoder`, same mechanism (requires_grad=False +
-    .eval() for BatchNorm). Call after `pretrain_token_autoencoder`, before the
-    joint `train(..., freeze_token=True)` phase.
+    Freezes `token_enc` (and, by default, `token_dec`) in place: sets
+    requires_grad=False so `train()`'s optimizer (which filters on
+    requires_grad) never updates them, and marks them .eval() so BatchNorm
+    running stats stop updating too (requires_grad=False alone does NOT freeze
+    those). Call after `pretrain_token_autoencoder`, before the joint
+    `train(..., freeze_token=True)` phase.
     """
     if model.token_enc is None:
         return
@@ -1178,22 +941,24 @@ def freeze_token_encoder(model, freeze_decoder=True):
         model.token_dec.eval()
 
 
-def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
-               temperature=0.07, weight_reconstruction=True,
-               freeze_hist=False, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
+def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstruction=True,
+               edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
                token_emb_all=None, cell_meta=None, local_contrast_weight=0.0, freeze_token=False,
-               patch_anchor_sim_threshold=None, local_anchor_sim_threshold=None):
+               local_anchor_sim_threshold=None):
     """
-    token_emb_all / cell_meta / local_contrast_weight / freeze_token: cell-level
-    analogue of hist_emb_all/patch_meta/contrast_weight/freeze_hist. token_emb_all
-    and cell_meta["xy"]/["slide_id"] must be row-aligned with data.x -- seed cells
-    are looked up via batch.n_id[:n_seed] (NeighborLoader puts seed nodes first).
-    Defaults reproduce pre-token behavior for models with no token branch.
+    patch_meta is still needed here even though the patch-level (histology)
+    branch is gone: `weight_reconstruction`'s per-patch inverse-frequency
+    weighting of the CELL reconstruction loss, and the batch's own patch-grouped
+    structure (PatchGroupedLoader), are shared batching infrastructure, not
+    part of that removed branch.
 
-    patch_anchor_sim_threshold / local_anchor_sim_threshold: forwarded to
-    patch_level_infonce for the patch- and cell-level calls respectively -- two
-    separate thresholds since pooled per-patch expression is smoother/more
-    separable than raw per-cell expression. Both default to None (off).
+    token_emb_all / cell_meta: token_emb_all and cell_meta["xy"]/["slide_id"]
+    must be row-aligned with data.x -- seed cells are looked up via
+    batch.n_id[:n_seed] (NeighborLoader puts seed nodes first).
+
+    local_anchor_sim_threshold: forwarded to patch_level_infonce -- cosine-
+    similarity cutoff excluding transcriptomically near-duplicate, non-matching
+    cells from hard negatives (see patch_level_infonce's docstring).
 
     edge_dropout_p / gene_dropout_p: denoising-style corruption applied only to
     what trans_enc sees (reconstruction target stays clean). Targets two Slide_ID
@@ -1204,22 +969,16 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
     separate real biological signal from technical at this sample size).
     """
     model.train()
-    if freeze_hist:
+    if freeze_token and model.token_enc is not None:
         # model.train() re-enabled BatchNorm on every submodule -- pin back to eval
         # only the ones actually frozen (checked directly, since freeze_decoder=False
-        # can leave hist_dec trainable while hist_enc is frozen).
-        if not any(p.requires_grad for p in model.hist_enc.parameters()):
-            model.hist_enc.eval()
-        if not any(p.requires_grad for p in model.hist_dec.parameters()):
-            model.hist_dec.eval()
-    if freeze_token and model.token_enc is not None:
-        # same reasoning as the freeze_hist block above, mirrored for the token branch
+        # can leave token_dec trainable while token_enc is frozen).
         if not any(p.requires_grad for p in model.token_enc.parameters()):
             model.token_enc.eval()
         if not any(p.requires_grad for p in model.token_dec.parameters()):
             model.token_dec.eval()
     opt.zero_grad()
- 
+
     x = batch.x.to(device)
     edge_index = batch.edge_index.to(device)
     n_seed = batch.local_patch_index.shape[0]
@@ -1230,12 +989,12 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
     z_full = model.trans_enc(x_in, edge_index_in)
     z_cells = z_full[:n_seed]  # cell-level latents for seed cells only
 
-    # --- cell-level reconstruction (unchanged in spirit: still per cell) ---
+    # --- cell-level reconstruction ---
     # target is the CLEAN x, not x_in -- see docstring above
     slide_code = batch.slide_code[:n_seed].to(device)
     x_recon = model.trans_dec(z_cells, slide_code)
     recon_per_cell = F.mse_loss(x_recon, x[:n_seed], reduction="none").mean(dim=1)
- 
+
     if weight_reconstruction:
         batch_patch_ids = batch.batch_patch_ids.to(device)
         local_patch_index = batch.local_patch_index.to(device)
@@ -1244,51 +1003,10 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         loss_recon_trans = (recon_per_cell * cell_weight).sum() / cell_weight.sum().clamp(min=1e-8)
     else:
         loss_recon_trans = recon_per_cell.mean()
- 
-    # --- patch-level branch (histology pooling/encoding + patch-level contrastive) ---
-    # Skipped when frozen AND zero-weighted: neither loss term can produce a nonzero
-    # gradient then, so the pooling/hist_enc/hist_dec/proj forward passes were pure
-    # wasted compute (this project's regime always runs freeze_hist=True,
-    # max_contrast_weight=0.0 -- kept in the architecture only for old checkpoints /
-    # patch-level eval code). Mirrors the token branch's own "else: zero tensor" case.
-    skip_patch_branch = freeze_hist and contrast_weight == 0
-    if not skip_patch_branch:
-        # pool cell latents into one patch latent per patch present in this batch
-        local_patch_index = batch.local_patch_index.to(device)
-        num_local_patches = batch.batch_patch_ids.shape[0]
-        if model.pool_type == "attention":
-            z_patch_trans, _attn_w = model.pool(z_cells, local_patch_index, num_local_patches)
-        else:
-            z_patch_trans = segment_mean_pool(z_cells, local_patch_index, num_local_patches)
-
-        # histology side: one embedding per patch already, no duplication needed
-        batch_patch_ids = batch.batch_patch_ids.to(device)
-        batch_slide_ids = patch_meta["slide_id"][batch_patch_ids]
-        hist_batch = hist_emb_all[batch_patch_ids]
-        z_patch_hist = model.hist_enc(hist_batch)
-        hist_recon = model.hist_dec(z_patch_hist, slide_code=batch_slide_ids)
-        loss_recon_hist = F.mse_loss(hist_recon, hist_batch)
-
-        # patch-level contrastive alignment
-        p_trans_patch = model.proj_trans(z_patch_trans)
-        p_hist_patch = model.proj_hist(z_patch_hist)
-
-        centroids = patch_meta["centroid"][batch_patch_ids]
-        weights = patch_meta["weight"][batch_patch_ids]
-        loss_contrast = patch_level_infonce(
-            p_trans_patch, p_hist_patch, centroids, slide_ids=batch_slide_ids,
-            temperature=temperature, neighbor_radius=patch_meta["neighbor_radius"], weight=weights,
-            anchor_sim_threshold=patch_anchor_sim_threshold,
-        )
-    else:
-        loss_recon_hist = z_cells.new_tensor(0.0)
-        loss_contrast = z_cells.new_tensor(0.0)
 
     # --- token side: CELL-level local branch, genuinely one-to-one, no pooling ---
-    # Always computed (mirrors loss_recon_hist's unconditional-even-when-frozen
-    # pattern above, kept for logging/monitoring parity) whenever the model has a
-    # token branch and token data was supplied; contributes zero gradient to
-    # token_enc/token_dec once frozen, same as loss_recon_hist does for hist_enc/dec.
+    # Always computed (contributes zero gradient to token_enc/token_dec once frozen)
+    # whenever the model has a token branch and token data was supplied.
     if model.token_enc is not None and token_emb_all is not None:
         seed_global_ids = batch.n_id[:n_seed].to(device)
         token_x = token_emb_all[seed_global_ids]
@@ -1313,79 +1031,57 @@ def train_step(model, batch, hist_emb_all, patch_meta, opt, contrast_weight,
         loss_contrast_local = z_cells.new_tensor(0.0)
         local_frac_masked = 0.0
 
-    loss = (loss_recon_trans + loss_recon_hist + contrast_weight * loss_contrast
-            + loss_recon_token + local_contrast_weight * loss_contrast_local)
+    loss = loss_recon_trans + loss_recon_token + local_contrast_weight * loss_contrast_local
     loss.backward()
     opt.step()
 
     return {
         "loss": loss.item(),
         "recon_trans": loss_recon_trans.item(),
-        "recon_hist": loss_recon_hist.item(),
-        "contrast": loss_contrast.item(),
         "recon_token": loss_recon_token.item(),
         "contrast_local": loss_contrast_local.item(),
         "local_frac_masked": local_frac_masked,
     }
 
 
-def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5,
-          max_contrast_weight=1.0, temperature=0.07,
-          weight_reconstruction=True, freeze_hist=False, hist_lr_mult=1.0,
+def train(model, loader, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5, temperature=0.07,
+          weight_reconstruction=True,
           weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
           token_emb_all=None, cell_meta=None, max_local_contrast_weight=0.0,
           local_warmup_epochs=None, freeze_token=False, token_lr_mult=1.0,
-          patch_anchor_sim_threshold=None, local_anchor_sim_threshold=None):
+          local_anchor_sim_threshold=None):
     """
-    token_emb_all / cell_meta: token branch's cell-level analogue of
-      hist_emb_all/patch_meta (see `build_cell_meta`). None (default) trains as
+    token_emb_all / cell_meta: see `build_cell_meta`. None (default) trains as
       before, including for models with no token branch.
 
-    patch_anchor_sim_threshold / local_anchor_sim_threshold: forwarded to
-      `patch_level_infonce` -- cosine-similarity cutoff excluding
-      transcriptomically near-duplicate, non-matching patches/cells from hard
-      negatives (same false-negative protection as `neighbor_radius`, gated on
-      expression similarity instead of distance). Default None (off).
+    local_anchor_sim_threshold: forwarded to `patch_level_infonce` -- cosine-
+      similarity cutoff excluding transcriptomically near-duplicate, non-matching
+      cells from hard negatives (same false-negative protection as
+      `neighbor_radius`, gated on expression similarity instead of distance).
+      Default None (off).
 
-    max_local_contrast_weight / local_warmup_epochs: separate ramp schedule for
-      the cell<->token term vs. max_contrast_weight/warmup_epochs (patch-level).
-      local_warmup_epochs defaults to warmup_epochs if not given.
+    max_local_contrast_weight / local_warmup_epochs: ramp schedule for the
+      cell<->token contrastive term. local_warmup_epochs defaults to
+      warmup_epochs if not given.
 
-    freeze_token / token_lr_mult: token-branch analogues of freeze_hist/
-      hist_lr_mult (gentler LR on an already-pretrained branch).
+    freeze_token / token_lr_mult: gentler LR on an already-pretrained token
+      branch (pretrain_token_autoencoder + freeze_token_encoder beforehand).
 
-    freeze_hist: assumes `freeze_hist_encoder(model)` already ran -- frozen
-      params are excluded from the optimizer automatically via requires_grad.
-
-    hist_lr_mult: LR multiplier for hist_enc/hist_dec, only relevant when
-      freeze_hist=False. Keep <1.0 so contrastive/recon_hist losses reshape the
-      histology tower more gently than trans_enc (training from scratch) --
-      full `lr` risks undoing the Slide_ID-leakage fix Phase-1 pretraining
-      bought, since loss_contrast can exploit slide shortcuts once hist_enc is
-      allowed to move.
-
-    weight_decay: applied to every trainable param group -- trans_enc's
-      equivalent of what pretrain_hist_autoencoder already gives hist_enc/dec.
+    weight_decay: applied to every trainable param group.
 
     edge_dropout_p / gene_dropout_p: forwarded to `train_step` (denoising
       mechanism, see its docstring).
     """
     model.to(device)
-    hist_param_ids = {id(p) for p in list(model.hist_enc.parameters()) + list(model.hist_dec.parameters())}
     token_param_ids = set()
     if model.token_enc is not None:
         token_param_ids = {id(p) for p in list(model.token_enc.parameters()) + list(model.token_dec.parameters())}
-    special_param_ids = hist_param_ids | token_param_ids
-    hist_params = [p for p in model.parameters() if p.requires_grad and id(p) in hist_param_ids]
     token_params = [p for p in model.parameters() if p.requires_grad and id(p) in token_param_ids]
-    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in special_param_ids]
+    other_params = [p for p in model.parameters() if p.requires_grad and id(p) not in token_param_ids]
     param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
-    if hist_params:
-        param_groups.append({"params": hist_params, "lr": lr * hist_lr_mult, "weight_decay": weight_decay})
     if token_params:
         param_groups.append({"params": token_params, "lr": lr * token_lr_mult, "weight_decay": weight_decay})
     opt = torch.optim.Adam(param_groups)
-    hist_emb_all = hist_emb_all.to(device)
     patch_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
 
     use_tokens = model.token_enc is not None and token_emb_all is not None
@@ -1402,119 +1098,29 @@ def train(model, loader, hist_emb_all, patch_meta, n_epochs=30, lr=1e-3, warmup_
     # return value are unaffected.
     history = []
     for epoch in range(n_epochs):
-        cw = contrast_weight_schedule(epoch, warmup_epochs, max_contrast_weight)
         lcw = contrast_weight_schedule(epoch, local_warmup_epochs, max_local_contrast_weight) if use_tokens else 0.0
-        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_hist": 0.0, "contrast": 0.0,
+        epoch_stats = {"loss": 0.0, "recon_trans": 0.0,
                         "recon_token": 0.0, "contrast_local": 0.0, "local_frac_masked": 0.0}
         n_batches = 0
         for batch in loader:
-            stats = train_step(model, batch, hist_emb_all, patch_meta, opt, cw,
+            stats = train_step(model, batch, patch_meta, opt,
                                 temperature=temperature,
                                 weight_reconstruction=weight_reconstruction,
-                                freeze_hist=freeze_hist,
                                 edge_dropout_p=edge_dropout_p, gene_dropout_p=gene_dropout_p,
                                 device=device,
                                 token_emb_all=token_emb_all if use_tokens else None,
                                 cell_meta=cell_meta if use_tokens else None,
                                 local_contrast_weight=lcw, freeze_token=freeze_token,
-                                patch_anchor_sim_threshold=patch_anchor_sim_threshold,
                                 local_anchor_sim_threshold=local_anchor_sim_threshold)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
         epoch_stats = {k: v / n_batches for k, v in epoch_stats.items()}
-        print(f"epoch {epoch:03d} | contrast_w={cw:.2f}" + (f" | local_w={lcw:.2f}" if use_tokens else "") + " | " +
+        print(f"epoch {epoch:03d}" + (f" | local_w={lcw:.2f}" if use_tokens else "") + " | " +
               " | ".join(f"{k}={v:.4f}" for k, v in epoch_stats.items()))
-        history.append({"epoch": epoch, "contrast_w": cw, "local_w": lcw, **epoch_stats})
+        history.append({"epoch": epoch, "local_w": lcw, **epoch_stats})
 
     return history
-
-
-@torch.no_grad()
-def retrieval_accuracy(model, data, hist_emb_all, patch_meta, device="cuda",
-                        eval_num_neighbors=(10, 10), eval_batch_size=4096):
-    """
-    Full-graph patch-level retrieval eval. Reports strict top-1 accuracy plus a
-    neighborhood-tolerant top-1 (counts a hit if the predicted patch's centroid
-    lies within `patch_meta['neighbor_radius']` of the true one) -- two adjacent,
-    genuinely similar patches shouldn't be penalized like a distant confusion.
-
-    `trans_enc` runs via `encode_full_graph_batched`, not a single full-graph
-    call: with TransformerConv, materializing per-edge attention for every edge
-    at once can OOM even though mini-batch training fits fine.
-
-    Also reports median_rank/mrr -- top-1 over thousands of candidates is harsh
-    and can read as ~0 even when the true match is consistently near the top.
-
-    Returns patch-level embeddings for reuse downstream: z_trans_patch,
-    z_hist_patch, z_joint_patch (concat of the two), row-aligned to
-    `unique_patches`. These are PRE-projection encoder outputs, not
-    proj_trans/proj_hist's -- standard practice (SimCLR etc.) is that the
-    pre-projection representation transfers better to downstream probes.
-    """
-    model.eval()
-    z_cells_full = encode_full_graph_batched(
-        model.trans_enc, data, device,
-        num_neighbors=eval_num_neighbors, batch_size=eval_batch_size,
-    )
-
-    patch_row = data.patch_row.to(device)
-    num_patches = int(patch_row.max().item()) + 1
-    if model.pool_type == "attention":
-        z_patch_trans_full, _ = model.pool(z_cells_full, patch_row, num_patches)
-    else:
-        z_patch_trans_full = segment_mean_pool(z_cells_full, patch_row, num_patches)
-
-    unique_patches = torch.unique(patch_row)
-    hist_batch = hist_emb_all.to(device)[unique_patches]
-    z_patch_hist = model.hist_enc(hist_batch)
-    z_patch_trans = z_patch_trans_full[unique_patches]
-
-    p_trans = model.proj_trans(z_patch_trans)
-    p_hist = model.proj_hist(z_patch_hist)
-
-    sims = p_trans @ p_hist.T
-    pred = sims.argmax(dim=1)
-    true_col = torch.arange(len(unique_patches), device=device)  # one-to-one, in `unique_patches` order
-    top1_acc = (pred == true_col).float().mean().item()
-
-    n_candidates = len(unique_patches)
-    diag = sims.diagonal()
-    # Chunked to avoid materializing a second full n_candidates x n_candidates
-    # tensor (`sims` itself is already n_candidates^2 and, at full-cohort scale
-    # across all slides, that's the largest tensor this function can afford --
-    # a second one of the same size is what OOMs).
-    rank = torch.empty(n_candidates, device=device)
-    for start in range(0, n_candidates, eval_batch_size):
-        end = min(start + eval_batch_size, n_candidates)
-        rank[start:end] = (sims[start:end] >= diag[start:end].unsqueeze(1)).sum(dim=1).float()
-    mrr = (1.0 / rank).mean().item()
-    median_rank = rank.median().item()
-    chance_mrr = float(np.sum(1.0 / np.arange(1, n_candidates + 1)) / n_candidates)
-
-    neighbor_radius = patch_meta.get("neighbor_radius")
-    neighbor_acc = None
-    if neighbor_radius is not None:
-        centroids = patch_meta["centroid"][unique_patches].to(device)
-        slide_ids = patch_meta["slide_id"][unique_patches].to(device)
-        dist = (centroids[pred] - centroids).norm(dim=1)
-        same_slide = slide_ids[pred] == slide_ids  # raw coords aren't comparable across slides
-        neighbor_acc = ((dist < neighbor_radius) & same_slide).float().mean().item()
-
-    print(f"Top-1 patch retrieval accuracy: {top1_acc:.3f} (chance = {1/n_candidates:.5f})")
-    if neighbor_acc is not None:
-        print(f"Neighborhood-tolerant top-1 accuracy (radius={neighbor_radius}): {neighbor_acc:.3f}")
-    print(f"Median rank: {median_rank:.1f} / {n_candidates} | MRR: {mrr:.4f} (chance MRR = {chance_mrr:.5f})")
-
-    z_joint_patch = torch.cat([z_patch_trans, z_patch_hist], dim=1)
-
-    return {"top1": top1_acc, "neighbor_tolerant": neighbor_acc,
-            "median_rank": median_rank, "mrr": mrr, "chance_mrr": chance_mrr, "n_candidates": n_candidates,
-            "z_patch_trans_full": z_patch_trans_full.cpu().numpy(),
-            "z_trans_patch": z_patch_trans.cpu().numpy(),
-            "z_hist_patch": z_patch_hist.cpu().numpy(),
-            "z_joint_patch": z_joint_patch.cpu().numpy(),
-            "unique_patches": unique_patches.cpu().numpy()}
 
 
 @torch.no_grad()
@@ -1619,16 +1225,12 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
 
 def evaluate_latent_leakage(z, slide_id, cv=5, max_iter=5000):
     """
-    Slide_ID leakage diagnostic on an ALREADY-COMPUTED embedding `z` (n_patches x dim,
+    Slide_ID leakage diagnostic on an ALREADY-COMPUTED embedding `z` (n_cells x dim,
     numpy array or tensor): checks how well a plain logistic regression can recover
     Slide_ID from it via cross-validated accuracy (chance = 1/n_slides).
 
     Use this directly on whatever embedding you actually intend to use downstream --
-    trans-only, hist-only, or the joint concat -- not just hist_enc's output.
-    `evaluate_hist_leakage` is a thin wrapper around this (runs hist_enc first, kept
-    for the existing call sites); reach for this one directly when you already have
-    the embedding computed (e.g. from `retrieval_accuracy`'s `z_trans_patch` /
-    `z_hist_patch` / `z_joint_patch`).
+    e.g. `token_retrieval_accuracy`'s `z_trans_cell_full` / `z_token_cell_full`.
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import cross_val_score
@@ -1645,26 +1247,6 @@ def evaluate_latent_leakage(z, slide_id, cv=5, max_iter=5000):
         "leakage_chance": 1.0 / len(np.unique(y)),
     }
 
-
-def evaluate_hist_leakage(model, hist_emb_all, slide_id, device="cuda", cv=5, max_iter=5000):
-    """
-    Slide_ID leakage diagnostic: encodes every patch with `model.hist_enc` and
-    delegates to `evaluate_latent_leakage` for the actual cross-validated check.
-
-    Row-aligned directly against `hist_emb_all`/`slide_id` (the same tensors used
-    throughout training -- pass `patch_meta["slide_id"]`) rather than going
-    through any AnnData obs lookup or deduplication step. This deliberately
-    sidesteps the Patch_ID-collision bug found in the notebook's own
-    `patch_adata_global` construction: Patch_ID repeats across slides (only
-    11,974 unique values across 44,592 patches in this dataset), so
-    deduplicating on it alone silently drops ~73% of patches and mixes up which
-    slide's copy survives. Use this function for any leakage check going
-    forward instead of rebuilding that pipeline.
-    """
-    model.eval()
-    with torch.no_grad():
-        z = model.hist_enc(hist_emb_all.to(device)).cpu().numpy()
-    return evaluate_latent_leakage(z, slide_id, cv=cv, max_iter=max_iter)
 
 
 def evaluate_latent_spatial_autocorr(z, centroids, n_neighs=6):
@@ -1780,97 +1362,13 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
     }
 
 
-def pretrain_hist_once(model_kwargs, hist_emb_all, patch_meta, pretrain_kwargs, device="cuda"):
-    """
-    Runs `pretrain_hist_autoencoder` exactly ONCE on a throwaway model built from
-    `model_kwargs`, and returns just the resulting hist_enc/hist_dec state dicts
-    for reuse across many `run_experiment` calls via its `model_template_state`
-    argument.
-
-    Phase 1 doesn't depend on anything a Phase-3 sweep (contrast weight, freeze
-    strategy, patches_per_batch, ...) would vary, so pretraining it once and
-    reusing the result keeps every sweep run's comparison clean -- only Phase 3
-    differs between runs, not also a different random Phase-1 outcome -- and
-    avoids redundantly re-pretraining an identical histology encoder (up to 100
-    epochs over the full dataset) for every point in the sweep.
-    """
-    import copy
-    template_model = DualAutoencoder(**model_kwargs)
-    pretrain_hist_autoencoder(template_model, hist_emb_all, patch_meta, **pretrain_kwargs, device=device)
-    return {
-        "hist_enc": copy.deepcopy(template_model.hist_enc.state_dict()),
-        "hist_dec": copy.deepcopy(template_model.hist_dec.state_dict()),
-    }
-
-
-def pretrain_hist_replicated(model_kwargs, hist_emb_all, patch_meta, pretrain_kwargs,
-                              n_replicates=5, seeds=None, select_by="leakage", device="cuda"):
-    """
-    Runs `pretrain_hist_autoencoder` `n_replicates` times from different random
-    inits, returns the BEST replicate's hist_enc/hist_dec state dicts plus a
-    per-replicate log (seed, stopped epoch, val MSE, leakage) so run-to-run
-    variance is visible before trusting any single number.
-
-    Motivated by an observed case: two Phase-1 runs, identical setup, differing
-    only in random init, gave Slide_ID leakage of 0.336 vs 0.906.
-
-    select_by: 'leakage' (default) picks lowest Slide_ID leakage -- leakage and
-      reconstruction quality are different objectives and don't necessarily
-      track each other. 'val_loss' selects by reconstruction quality instead.
-
-    Returns best_template_state (hist_enc/hist_dec state dicts, for
-    run_experiment's model_template_state) and replicate_log (per-replicate
-    seed/stopped_epoch/best_val_mse/leakage_mean/leakage_chance).
-    """
-    import copy
-
-    if seeds is None:
-        seeds = list(range(n_replicates))
-
-    replicate_log = []
-    best_score = None
-    best_state = None
-
-    for seed in seeds:
-        set_seed(seed)
-        model = DualAutoencoder(**model_kwargs)
-        model.to(device)
-        pretrain_info = pretrain_hist_autoencoder(
-            model, hist_emb_all, patch_meta, **pretrain_kwargs, device=device,
-        )
-        leak = evaluate_hist_leakage(model, hist_emb_all, patch_meta["slide_id"], device=device)
-
-        entry = {
-            "seed": seed,
-            "stopped_epoch": pretrain_info["stopped_epoch"],
-            "best_val_mse": pretrain_info["best_val_mse"],
-            "leakage_mean": leak["leakage_mean"],
-            "leakage_chance": leak["leakage_chance"],
-        }
-        replicate_log.append(entry)
-        print(f"[replicate seed={seed}] stopped_epoch={entry['stopped_epoch']} "
-              f"val_mse={entry['best_val_mse']:.5f} leakage={entry['leakage_mean']:.4f} "
-              f"(chance={entry['leakage_chance']:.4f})")
-
-        score = entry["leakage_mean"] if select_by == "leakage" else entry["best_val_mse"]
-        if best_score is None or score < best_score:
-            best_score = score
-            best_state = {
-                "hist_enc": copy.deepcopy(model.hist_enc.state_dict()),
-                "hist_dec": copy.deepcopy(model.hist_dec.state_dict()),
-            }
-
-    print(f"Selected seed with best {select_by} = {best_score:.4f}")
-    return best_state, replicate_log
-
 
 def pretrain_token_once(model_kwargs, token_emb_all, cell_meta, pretrain_kwargs, device="cuda"):
     """
-    Token-branch analogue of `pretrain_hist_once`: runs `pretrain_token_autoencoder`
-    exactly ONCE on a throwaway model built from `model_kwargs` (which must include
-    `token_dim`), and returns just the resulting token_enc/token_dec state dicts
-    for reuse across many `run_token_experiment` calls via its
-    `model_template_state` argument -- same rationale as the hist version: Phase 1
+    Runs `pretrain_token_autoencoder` exactly ONCE on a throwaway model built
+    from `model_kwargs` (which must include `token_dim`), and returns just the
+    resulting token_enc/token_dec state dicts for reuse across many
+    `run_token_experiment` calls via its `model_template_state` argument: Phase 1
     doesn't depend on anything a Phase-3 sweep varies, so pretraining once and
     reusing the result keeps every sweep run's comparison clean (only Phase 3
     differs between runs, not also a different random Phase-1 outcome), and avoids
@@ -1885,109 +1383,17 @@ def pretrain_token_once(model_kwargs, token_emb_all, cell_meta, pretrain_kwargs,
     }
 
 
-def run_experiment(run_id, config, model_template_state, data, loader, hist_emb_all, patch_meta,
-                    n_slides, n_svg, hist_dim, log_path, checkpoint_dir=None, seed=0, device="cuda"):
-    """
-    Runs ONE Phase-3 (joint/contrastive) training run starting from a shared,
-    already phase-1-pretrained-and-frozen histology encoder
-    (`model_template_state`, from `pretrain_hist_once`), evaluates it, and
-    appends one row to a persistent CSV log at `log_path` (created on first
-    call) so config + metrics survive kernel restarts.
-
-    `config`: full parameter dict for this run, logged with a `cfg__` prefix so
-      the log is self-documenting.
-
-    `seed`: fixed (default 0) -- trans_enc/pooling/projection heads are freshly
-      initialized on every call; an uncontrolled random init would confound a
-      sweep the same way it did on the Phase-1 side before that was fixed. Keep
-      the same across a sweep; only change deliberately (e.g. replicate-checking
-      the winning config).
-
-    Metrics logged: top1_retrieval/neighbor_tolerant_retrieval (primary
-    cross-modal patch retrieval quality) and hist_leakage_mean/chance.
-
-    Returns (metrics_dict, trained_model) -- the model isn't discarded, so a
-    specific run's result can be inspected without reloading its checkpoint.
-    """
-    import copy, csv, time
-    from pathlib import Path
-
-    set_seed(seed)
-    model = DualAutoencoder(
-        n_svg=n_svg, hist_dim=hist_dim,
-        latent_dim=config["latent_dim"], proj_dim=config["proj_dim"],
-        n_slides=n_slides, pool_type=config["pool_type"], encoder_type=config["encoder"],
-        hist_condition_on_slide=config.get("hist_condition_on_slide", True),
-    )
-    model.hist_enc.load_state_dict(model_template_state["hist_enc"])
-    model.hist_dec.load_state_dict(model_template_state["hist_dec"])
-    model.to(device)
-
-    freeze_hist_encoder(model, freeze_decoder=config.get("freeze_decoder", True))
-
-    train(
-        model, loader, hist_emb_all, patch_meta,
-        n_epochs=config["n_epochs"], lr=config["lr"], warmup_epochs=config["warmup_epochs"],
-        max_contrast_weight=config["max_contrast_weight"], temperature=config["temperature"],
-        weight_reconstruction=config["weight_reconstruction_by_patch_freq"],
-        freeze_hist=True, device=device,
-    )
-
-    patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
-    eval_results = retrieval_accuracy(model, data, hist_emb_all, patch_meta_device, device=device)
-    leak = evaluate_hist_leakage(model, hist_emb_all, patch_meta["slide_id"], device=device)
-
-    metrics = {
-        "run_id": run_id,
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "top1_retrieval": eval_results["top1"],
-        "neighbor_tolerant_retrieval": eval_results["neighbor_tolerant"],
-        "hist_leakage_mean": leak["leakage_mean"],
-        "hist_leakage_chance": leak["leakage_chance"],
-    }
-    row = {**{f"cfg__{k}": v for k, v in config.items()}, **metrics}
-
-    # Reconcile against whatever's already on disk rather than blindly appending:
-    # CONFIG gains new keys over time, so a plain DictWriter.writerow() can append
-    # a row with a different field count than what's already there, corrupting the
-    # file (hit this: "Expected 32 fields... saw 33"). Union-column concat instead
-    # keeps the file consistent -- older rows get NaN in newer columns.
-    log_path = Path(log_path)
-    row_df = pd.DataFrame([row])
-    if log_path.exists():
-        existing = pd.read_csv(log_path)
-        combined = pd.concat([existing, row_df], ignore_index=True, sort=False)
-    else:
-        combined = row_df
-    combined.to_csv(log_path, index=False)
-
-    if checkpoint_dir is not None:
-        checkpoint_dir = Path(checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"model_state_dict": model.state_dict(), "config": config, "metrics": metrics},
-            checkpoint_dir / f"run_{run_id}.pt",
-        )
-
-    print(f"[run {run_id}] top1={metrics['top1_retrieval']:.4f} "
-          f"neighbor_tol={metrics['neighbor_tolerant_retrieval']:.4f} "
-          f"leakage={metrics['hist_leakage_mean']:.4f} (chance={metrics['hist_leakage_chance']:.4f})")
-
-    return metrics, model
-
-
-def run_token_experiment(run_id, config, model_template_state, data, loader, hist_emb_all, patch_meta,
-                          token_emb_all, cell_meta, n_slides, n_svg, hist_dim, token_dim,
+def run_token_experiment(run_id, config, model_template_state, data, loader, patch_meta,
+                          token_emb_all, cell_meta, n_slides, n_svg, token_dim,
                           cell_type_labels, log_path, checkpoint_dir=None, seed=0, device="cuda",
                           leakage_subsample=20_000):
     """
-    Token-branch analogue of `run_experiment`: runs ONE Phase-3 joint training run
-    for the cell-level (trans<->token) contrastive branch and logs the result.
+    Runs ONE Phase-3 joint training run for the cell-level (trans<->token)
+    contrastive branch and logs the result.
 
     Starts from a shared, already-pretrained token_enc/token_dec
     (`model_template_state`, from `pretrain_token_once` -- reused across sweep
-    points so Phase-1 variance never confounds the comparison) plus hist_enc/dec
-    at random init, immediately frozen (harmless while max_contrast_weight=0.0).
+    points so Phase-1 variance never confounds the comparison).
 
     `config`: full parameter dict for this run, logged with a `cfg__` prefix.
 
@@ -2014,32 +1420,29 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, his
 
     set_seed(seed)
     model = DualAutoencoder(
-        n_svg=n_svg, hist_dim=hist_dim, token_dim=token_dim,
+        n_svg=n_svg, token_dim=token_dim,
         latent_dim=config["latent_dim"], proj_dim=config["proj_dim"],
-        n_slides=n_slides, pool_type=config["pool_type"], encoder_type=config["encoder"],
-        hist_condition_on_slide=config.get("hist_condition_on_slide", True),
+        n_slides=n_slides, encoder_type=config["encoder"],
         token_condition_on_slide=config.get("token_condition_on_slide", True),
     )
     model.token_enc.load_state_dict(model_template_state["token_enc"])
     model.token_dec.load_state_dict(model_template_state["token_dec"])
     model.to(device)
 
-    freeze_hist_encoder(model, freeze_decoder=True)
     if config.get("freeze_token", False):
         freeze_token_encoder(model, freeze_decoder=True)
 
     history = train(
-        model, loader, hist_emb_all, patch_meta,
+        model, loader, patch_meta,
         n_epochs=config["n_epochs"], lr=config["lr"], warmup_epochs=config["warmup_epochs"],
-        max_contrast_weight=config.get("max_contrast_weight", 0.0), temperature=config["temperature"],
+        temperature=config["temperature"],
         weight_reconstruction=config["weight_reconstruction_by_patch_freq"],
-        freeze_hist=True, device=device,
+        device=device,
         token_emb_all=token_emb_all, cell_meta=cell_meta,
         max_local_contrast_weight=config["max_local_contrast_weight"],
         local_warmup_epochs=config.get("local_warmup_epochs"),
         freeze_token=config.get("freeze_token", False),
         token_lr_mult=config.get("token_lr_mult", 1.0),
-        patch_anchor_sim_threshold=config.get("patch_anchor_sim_threshold"),
         local_anchor_sim_threshold=config.get("local_anchor_sim_threshold"),
     )
 
@@ -2228,299 +1631,18 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     return result
 
 
-def run_leave_one_slide_out(held_out_slide, f_hist_adata, f_trans_adata, f_trans_coord,
-                             CONFIG, device, log_path=None, checkpoint_dir=None,
-                             seed=0, verbose=True, run_tag=""):
-    """
-    run_tag: appended to run_id/checkpoint filename ("loso_{slide}{run_tag}") so
-      comparison runs on the same held_out_slide don't overwrite each other.
-      Empty by default.
-
-    Trains the full pipeline on every slide EXCEPT held_out_slide, then
-    evaluates cross-modal retrieval on held_out_slide alone -- tissue never
-    seen at any training stage. This is the actual generalization test: every
-    prior evaluation ran retrieval_accuracy on data the model had trained on.
-
-    Reports retrieval_accuracy on both training slides (in-sample) and the
-    held-out slide -- the GAP between them is what tells you whether this
-    generalizes.
-
-    Deliberately NOT reported for the held-out slide:
-      - hist_leakage: no other slide within a single held-out slide to
-        classify against -- meaningless here, not just hard to compute.
-      - hist_dec/trans_dec reconstruction: both decoders condition on slide
-        identity via a one-hot sized for the TRAINING slides only -- the
-        held-out slide has no valid slot at all. retrieval_accuracy never
-        touches either decoder, so it's the right metric here.
-
-    seed: fixed (default 0) so an uncontrolled random init doesn't confound
-      fold-to-fold comparison.
-    """
-    import time
-    from pathlib import Path
-
-    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
-    if held_out_slide not in all_slides:
-        raise ValueError(f"held_out_slide {held_out_slide!r} not found among {all_slides}")
-    train_slides = [s for s in all_slides if s != held_out_slide]
-
-    if verbose:
-        print(f"[LOSO] held out: {held_out_slide} | train: {train_slides}")
-
-    hist_slide = f_hist_adata.obs["Slide_ID"].astype(str)
-    trans_slide = f_trans_adata.obs["Slide_ID"].astype(str)
-    coord_slide = f_trans_coord["Slide_ID"].astype(str)
-
-    f_hist_train = f_hist_adata[hist_slide != held_out_slide].copy()
-    f_trans_train = f_trans_adata[trans_slide != held_out_slide].copy()
-    f_coord_train = f_trans_coord[coord_slide != held_out_slide]
-
-    f_hist_held = f_hist_adata[hist_slide == held_out_slide].copy()
-    f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
-    f_coord_held = f_trans_coord[coord_slide == held_out_slide]
-
-    # gene selection computed ONCE from TRAIN-only data -- same rationale as svg_scaler/
-    # hist_scaler being fit-on-train-only: computing it fresh on the held-out slide alone
-    # would leak its own variability pattern into what "counts" as a selected gene.
-    gene_selection = CONFIG.get("gene_selection", "svg")
-    gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection)
-    if verbose:
-        print(f"  gene selection ({gene_selection}): {gene_mask.sum()} genes")
-
-    if verbose:
-        print("  building training-slide pipeline data...")
-    train_pipe = build_pipeline_data(f_hist_train, f_trans_train, f_coord_train, CONFIG,
-                                      svg_mask=gene_mask, verbose=verbose)
-
-    if verbose:
-        print("  building held-out-slide pipeline data (reusing training svg_mask/scalers)...")
-    held_pipe = build_pipeline_data(
-        f_hist_held, f_trans_held, f_coord_held, CONFIG,
-        svg_mask=train_pipe["svg_mask"], svg_scaler=train_pipe["svg_scaler"],
-        hist_scaler=train_pipe["hist_scaler"], verbose=verbose,
-    )
-
-    model_kwargs = dict(
-        n_svg=train_pipe["n_svg"], hist_dim=train_pipe["hist_dim"],
-        latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
-        n_slides=train_pipe["n_slides"], pool_type=CONFIG["pool_type"], encoder_type=CONFIG["encoder"],
-        hist_condition_on_slide=CONFIG.get("hist_condition_on_slide", True),
-    )
-    pretrain_kwargs = dict(
-        epochs=CONFIG["hist_pretrain_epochs"], lr=CONFIG["hist_pretrain_lr"],
-        weight_decay=CONFIG["hist_pretrain_weight_decay"],
-        val_frac=CONFIG["hist_pretrain_val_frac"], patience=CONFIG["hist_pretrain_patience"],
-    )
-
-    set_seed(seed)
-    model = DualAutoencoder(**model_kwargs)
-    pretrain_info = pretrain_hist_autoencoder(
-        model, train_pipe["hist_emb_t"], train_pipe["patch_meta"],
-        device=device, verbose=verbose, **pretrain_kwargs,
-    )
-    freeze_hist = CONFIG.get("freeze_hist", True)
-    if freeze_hist:
-        freeze_hist_encoder(model, freeze_decoder=CONFIG.get("freeze_decoder", True))
-
-    train(
-        model, train_pipe["loader"], train_pipe["hist_emb_t"], train_pipe["patch_meta"],
-        n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
-        max_contrast_weight=CONFIG["max_contrast_weight"], temperature=CONFIG["temperature"],
-        weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
-        freeze_hist=freeze_hist, hist_lr_mult=CONFIG.get("hist_lr_mult", 1.0),
-        weight_decay=CONFIG.get("trans_weight_decay", 0.0),
-        edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0), gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
-        device=device,
-    )
-
-    train_patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
-                                for k, v in train_pipe["patch_meta"].items()}
-    if verbose:
-        print("  in-sample (training slides) retrieval:")
-    train_eval = retrieval_accuracy(model, train_pipe["data"], train_pipe["hist_emb_t"],
-                                     train_patch_meta_device, device=device)
-
-    held_patch_meta_device = {k: (v.to(device) if torch.is_tensor(v) else v)
-                               for k, v in held_pipe["patch_meta"].items()}
-    if verbose:
-        print(f"  held-out ({held_out_slide}) retrieval -- the actual generalization test:")
-    held_eval = retrieval_accuracy(model, held_pipe["data"], held_pipe["hist_emb_t"],
-                                    held_patch_meta_device, device=device)
-
-    # Slide_ID leakage on TRAINING slides only (meaningless for the held-out slide,
-    # see docstring). Checked on trans/hist/joint so a frozen-vs-unfrozen comparison
-    # shows which representation absorbs leakage. Safe to use numeric
-    # patch_meta["slide_id"] here since both it and z_*_patch come from the same
-    # build_pipeline_data call.
-    train_slide_id_np = train_pipe["patch_meta"]["slide_id"].cpu().numpy()[train_eval["unique_patches"]]
-    train_leak_trans = evaluate_latent_leakage(train_eval["z_trans_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
-    train_leak_hist = evaluate_latent_leakage(train_eval["z_hist_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
-    train_leak_joint = evaluate_latent_leakage(train_eval["z_joint_patch"], train_slide_id_np, cv=min(5, len(train_slides)))
-    if verbose:
-        print(f"  train-slide leakage -- trans: {train_leak_trans['leakage_mean']:.3f} | "
-              f"hist: {train_leak_hist['leakage_mean']:.3f} | joint: {train_leak_joint['leakage_mean']:.3f} "
-              f"(chance = {train_leak_hist['leakage_chance']:.3f})")
-
-    # Held-out-vs-train leakage: does the held-out slide's patches separate out as
-    # their own cluster, or blend in like another training slide? Needs string
-    # Slide_ID labels here, not numeric slide_id codes -- those are factorized
-    # separately per build_pipeline_data call, so code 0 differs between train_pipe
-    # and held_pipe.
-    train_slide_name = train_pipe["patch_meta_df"]["Slide_ID"].values[train_eval["unique_patches"]]
-    held_slide_name = held_pipe["patch_meta_df"]["Slide_ID"].values[held_eval["unique_patches"]]
-    combined_slide_name = np.concatenate([train_slide_name, held_slide_name])
-    combined_leak_trans = evaluate_latent_leakage(
-        np.concatenate([train_eval["z_trans_patch"], held_eval["z_trans_patch"]]), combined_slide_name)
-    combined_leak_hist = evaluate_latent_leakage(
-        np.concatenate([train_eval["z_hist_patch"], held_eval["z_hist_patch"]]), combined_slide_name)
-    combined_leak_joint = evaluate_latent_leakage(
-        np.concatenate([train_eval["z_joint_patch"], held_eval["z_joint_patch"]]), combined_slide_name)
-    if verbose:
-        print(f"  held-out-vs-train leakage (n_slides={len(all_slides)}) -- trans: {combined_leak_trans['leakage_mean']:.3f} | "
-              f"hist: {combined_leak_hist['leakage_mean']:.3f} | joint: {combined_leak_joint['leakage_mean']:.3f} "
-              f"(chance = {combined_leak_hist['leakage_chance']:.3f})")
-
-    # Unsupervised spatial-smoothness sanity check on the held-out slide's embeddings --
-    # doesn't need cross-modal matching or labels at all, just asks "does this look like
-    # tissue architecture or noise" (see evaluate_latent_spatial_autocorr docstring for
-    # the necessary-but-not-sufficient caveat).
-    held_centroids_np = held_pipe["patch_meta"]["centroid"].cpu().numpy()[held_eval["unique_patches"]]
-    moran_trans = evaluate_latent_spatial_autocorr(held_eval["z_trans_patch"], held_centroids_np)
-    moran_hist = evaluate_latent_spatial_autocorr(held_eval["z_hist_patch"], held_centroids_np)
-    moran_joint = evaluate_latent_spatial_autocorr(held_eval["z_joint_patch"], held_centroids_np)
-    if verbose:
-        print(f"  held-out spatial autocorr (mean |Moran's I|) -- trans: {moran_trans['moran_mean_I']:.4f} | "
-              f"hist: {moran_hist['moran_mean_I']:.4f} | joint: {moran_joint['moran_mean_I']:.4f}")
-
-    # Tumor-vs-normal signal -- the flip side of the leakage checks above: this dataset's
-    # 5 slides are 3 tumor (CRC_*) / 2 normal (Normal_*), 1 patient each, so tumor status
-    # is confounded 1:1 with Slide_ID. Some of the Slide_ID leakage measured above is
-    # plausibly this real, desired biological signal rather than a technical artifact --
-    # this checks that directly, on trans/hist/joint, both within the training pool
-    # (slide-disjoint) and as a genuine zero-shot check on the held-out slide.
-    disease_trans = evaluate_disease_signal(train_eval["z_trans_patch"], train_slide_name,
-                                             held_eval["z_trans_patch"], held_slide_name)
-    disease_hist = evaluate_disease_signal(train_eval["z_hist_patch"], train_slide_name,
-                                            held_eval["z_hist_patch"], held_slide_name)
-    disease_joint = evaluate_disease_signal(train_eval["z_joint_patch"], train_slide_name,
-                                             held_eval["z_joint_patch"], held_slide_name)
-    if verbose:
-        print(f"  train-slide-disjoint tumor/normal accuracy ({disease_trans['n_valid_folds']} valid folds) -- "
-              f"trans: {disease_trans['train_loso_acc']} | hist: {disease_hist['train_loso_acc']} | "
-              f"joint: {disease_joint['train_loso_acc']}")
-        print(f"  held-out ({held_out_slide}, true label={disease_trans['held_out_true_label']}) tumor/normal "
-              f"accuracy -- trans: {disease_trans['held_out_acc']} | hist: {disease_hist['held_out_acc']} | "
-              f"joint: {disease_joint['held_out_acc']}")
-
-    metrics = {
-        "run_id": f"loso_{held_out_slide}{run_tag}",
-        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "held_out_slide": held_out_slide,
-        "train_slides": ",".join(train_slides),
-        "train_top1_retrieval": train_eval["top1"],
-        "train_neighbor_tolerant_retrieval": train_eval["neighbor_tolerant"],
-        "train_median_rank": train_eval["median_rank"],
-        "train_mrr": train_eval["mrr"],
-        "train_chance_mrr": train_eval["chance_mrr"],
-        "held_out_top1_retrieval": held_eval["top1"],
-        "held_out_neighbor_tolerant_retrieval": held_eval["neighbor_tolerant"],
-        "held_out_median_rank": held_eval["median_rank"],
-        "held_out_mrr": held_eval["mrr"],
-        "held_out_chance_mrr": held_eval["chance_mrr"],
-        "hist_pretrain_best_val_mse": pretrain_info["best_val_mse"],
-        "hist_pretrain_stopped_epoch": pretrain_info["stopped_epoch"],
-        "train_trans_leakage_mean": train_leak_trans["leakage_mean"],
-        "train_hist_leakage_mean": train_leak_hist["leakage_mean"],
-        "train_joint_leakage_mean": train_leak_joint["leakage_mean"],
-        "train_leakage_chance": train_leak_hist["leakage_chance"],
-        "combined_trans_leakage_mean": combined_leak_trans["leakage_mean"],
-        "combined_hist_leakage_mean": combined_leak_hist["leakage_mean"],
-        "combined_joint_leakage_mean": combined_leak_joint["leakage_mean"],
-        "combined_leakage_chance": combined_leak_hist["leakage_chance"],
-        "held_out_moran_mean_I_trans": moran_trans["moran_mean_I"],
-        "held_out_moran_mean_I_hist": moran_hist["moran_mean_I"],
-        "held_out_moran_mean_I_joint": moran_joint["moran_mean_I"],
-        "train_loso_disease_acc_trans": disease_trans["train_loso_acc"],
-        "train_loso_disease_acc_hist": disease_hist["train_loso_acc"],
-        "train_loso_disease_acc_joint": disease_joint["train_loso_acc"],
-        "train_loso_disease_n_valid_folds": disease_trans["n_valid_folds"],
-        "held_out_disease_acc_trans": disease_trans["held_out_acc"],
-        "held_out_disease_acc_hist": disease_hist["held_out_acc"],
-        "held_out_disease_acc_joint": disease_joint["held_out_acc"],
-        "held_out_disease_true_label": disease_trans["held_out_true_label"],
-    }
-
-    if log_path is not None:
-        row = {**{f"cfg__{k}": v for k, v in CONFIG.items()}, **metrics}
-        row_df = pd.DataFrame([row])
-        log_path = Path(log_path)
-        if log_path.exists():
-            existing = pd.read_csv(log_path)
-            combined_log = pd.concat([existing, row_df], ignore_index=True, sort=False)
-        else:
-            combined_log = row_df
-        combined_log.to_csv(log_path, index=False)
-
-    if checkpoint_dir is not None:
-        checkpoint_dir = Path(checkpoint_dir)
-        checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {"model_state_dict": model.state_dict(), "config": CONFIG, "metrics": metrics},
-            checkpoint_dir / f"loso_{held_out_slide}{run_tag}.pt",
-        )
-        # Joint/trans-only/hist-only patch embeddings, saved alongside the checkpoint --
-        # these ARE the actual deliverable (a combined latent embedding to use downstream),
-        # not just an eval byproduct, so they're persisted rather than only returned in
-        # memory for the duration of the script.
-        np.savez(
-            checkpoint_dir / f"loso_{held_out_slide}{run_tag}_embeddings.npz",
-            train_z_trans=train_eval["z_trans_patch"], train_z_hist=train_eval["z_hist_patch"],
-            train_z_joint=train_eval["z_joint_patch"], train_patch_row=train_eval["unique_patches"],
-            train_slide_name=train_slide_name,
-            held_out_z_trans=held_eval["z_trans_patch"], held_out_z_hist=held_eval["z_hist_patch"],
-            held_out_z_joint=held_eval["z_joint_patch"], held_out_patch_row=held_eval["unique_patches"],
-        )
-
-    if verbose:
-        gap = metrics["train_top1_retrieval"] - metrics["held_out_top1_retrieval"]
-        print(f"[LOSO {held_out_slide}] train_top1={metrics['train_top1_retrieval']:.4f} "
-              f"held_out_top1={metrics['held_out_top1_retrieval']:.4f} (gap={gap:.4f})")
-
-    return metrics, model
-
-
-def run_5fold_loso(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
-                    log_path=None, checkpoint_dir=None, seed=0, verbose=True):
-    """
-    Runs run_leave_one_slide_out once per slide (full leave-one-slide-out CV).
-    Expensive: trains the entire Phase 1 + Phase 3 pipeline from scratch once
-    per slide (5x the cost of a single run_leave_one_slide_out call) -- run a
-    single held-out slide first via run_leave_one_slide_out directly and sanity
-    check it before committing to this.
-    """
-    all_slides = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique().tolist())
-    results = []
-    for held_out in all_slides:
-        metrics, _ = run_leave_one_slide_out(
-            held_out, f_hist_adata, f_trans_adata, f_trans_coord, CONFIG, device,
-            log_path=log_path, checkpoint_dir=checkpoint_dir, seed=seed, verbose=verbose,
-        )
-        results.append(metrics)
-    return pd.DataFrame(results)
-
-
 def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f_trans_coord,
                                    f_token_adata, CONFIG, device, log_path=None, checkpoint_dir=None,
                                    seed=0, verbose=True, run_tag="", leakage_subsample=20_000):
     """
-    Token-branch (cell<->token) analogue of `run_leave_one_slide_out`: does
-    cell-level cross-modal retrieval generalize to a slide never seen at any
-    training stage (Phase 1b token pretrain or Phase 3 joint)? Every other
-    cell-level retrieval number produced so far was measured in-sample.
+    Does cell-level cross-modal (trans<->token) retrieval generalize to a slide
+    never seen at any training stage (Phase 1b token pretrain or Phase 3
+    joint)? Every other cell-level retrieval number produced so far was
+    measured in-sample.
 
-    Mirrors train_autoenc_token.py's regime: hist_enc/hist_dec frozen at random
-    init (max_contrast_weight=0.0), token_enc/token_dec pretrained once on
-    training slides only, then Phase 3 trains the cell<->token contrastive term.
+    Mirrors train_autoenc_token.py's regime: token_enc/token_dec pretrained
+    once on training slides only, then Phase 3 trains the cell<->token
+    contrastive term.
 
     CONFIG["max_patches_per_slide"]: forwarded to the training pipeline's
       PatchGroupedLoader to cap a disproportionately large slide's per-epoch
@@ -2570,9 +1692,9 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     f_coord_held = f_trans_coord[coord_slide == held_out_slide]
     f_token_held = f_token_adata[token_slide == held_out_slide].copy()
 
-    # gene selection computed ONCE from TRAIN-only data -- same rationale as the
-    # patch-level function: computing it fresh on the held-out slide alone would leak
-    # its own variability pattern into what "counts" as a selected gene.
+    # gene selection computed ONCE from TRAIN-only data: computing it fresh on the
+    # held-out slide alone would leak its own variability pattern into what "counts"
+    # as a selected gene.
     gene_selection = CONFIG.get("gene_selection", "svg")
     gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection)
     if verbose:
@@ -2603,10 +1725,9 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     )
 
     model_kwargs = dict(
-        n_svg=train_pipe["n_svg"], hist_dim=train_pipe["hist_dim"], token_dim=train_pipe["token_dim"],
+        n_svg=train_pipe["n_svg"], token_dim=train_pipe["token_dim"],
         latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
-        n_slides=train_pipe["n_slides"], pool_type=CONFIG["pool_type"], encoder_type=CONFIG["encoder"],
-        hist_condition_on_slide=CONFIG.get("hist_condition_on_slide", True),
+        n_slides=train_pipe["n_slides"], encoder_type=CONFIG["encoder"],
         token_condition_on_slide=CONFIG.get("token_condition_on_slide", True),
     )
     pretrain_kwargs = dict(
@@ -2622,10 +1743,6 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         device=device, verbose=verbose, **pretrain_kwargs,
     )
 
-    # hist_enc/hist_dec always frozen at random init here -- harmless as long as
-    # max_contrast_weight=0.0 (see train_autoenc_token.py's CONFIG comment: patch-level
-    # alignment isn't being trained while this project's focus is the cell/token branch).
-    freeze_hist_encoder(model, freeze_decoder=True)
     freeze_token = CONFIG.get("freeze_token", False)
     if freeze_token:
         freeze_token_encoder(model, freeze_decoder=True)
@@ -2649,20 +1766,19 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     n_slides = train_pipe["n_slides"]
     assert train_pipe["patch_meta"]["slide_id"].max().item() < n_slides, (
         f"patch_meta['slide_id'] has a code >= n_slides ({n_slides}) -- "
-        f"hist_dec's F.one_hot(slide_code, num_classes=n_slides) would go out of bounds."
+        f"trans_dec's F.one_hot(slide_code, num_classes=n_slides) would go out of bounds."
     )
 
     history = train(
-        model, train_pipe["loader"], train_pipe["hist_emb_t"], train_pipe["patch_meta"],
+        model, train_pipe["loader"], train_pipe["patch_meta"],
         n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
-        max_contrast_weight=CONFIG.get("max_contrast_weight", 0.0), temperature=CONFIG["temperature"],
+        temperature=CONFIG["temperature"],
         weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
-        freeze_hist=True, device=device,
+        device=device,
         token_emb_all=train_pipe["token_emb_t"], cell_meta=train_pipe["cell_meta"],
         max_local_contrast_weight=CONFIG["max_local_contrast_weight"],
         local_warmup_epochs=CONFIG.get("local_warmup_epochs"),
         freeze_token=freeze_token, token_lr_mult=CONFIG.get("token_lr_mult", 1.0),
-        patch_anchor_sim_threshold=CONFIG.get("patch_anchor_sim_threshold"),
         local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
     )
 
@@ -2764,8 +1880,8 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
             checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}.pt",
         )
         # Full (uncapped) cell embeddings, saved alongside the checkpoint as the actual
-        # deliverable (same rationale as the patch-level function) -- can be large (a
-        # multi-hundred-MB .npz) when the training pool is 1M+ cells.
+        # deliverable -- can be large (a multi-hundred-MB .npz) when the training pool
+        # is 1M+ cells.
         np.savez(
             checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}_embeddings.npz",
             train_z_trans=train_eval["z_trans_cell_full"], train_z_token=train_eval["z_token_cell_full"],

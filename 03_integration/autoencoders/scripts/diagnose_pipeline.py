@@ -14,8 +14,8 @@ without waiting ~8h on the training job:
    cells within a patch relative to other patches on the SAME slide). This
    computes the actual per-slide share of every training epoch from real data.
 3. Baseline (pre-training) Slide_ID separability in the raw modalities, via the
-   same evaluate_latent_leakage() diagnostic run_sweep.py/run_loso.py already
-   use. train_autoenc_token.py's eval step doesn't currently call it at all, so
+   same evaluate_latent_leakage() diagnostic run_loso.py already uses.
+   train_autoenc_token.py's eval step doesn't currently call it at all, so
    there's no leakage number yet for the trained token model to compare
    against -- this gives a pre-training reference point in the meantime.
 
@@ -101,9 +101,9 @@ print()
 print("=" * 70)
 print("4. Baseline Slide_ID leakage in raw modalities (pre-training reference point)")
 print("=" * 70)
-print("train_autoenc_token.py's eval step never calls evaluate_latent_leakage/"
-      "evaluate_hist_leakage -- these numbers are the only leakage reference that "
-      "exists until that's added to the training script and re-run.")
+print("train_autoenc_token.py's eval step never calls evaluate_latent_leakage -- "
+      "these numbers are the only leakage reference that exists until that's "
+      "added to the training script and re-run.")
 
 dir_hist = basedir / "combined/01_preprocessing/unimodel/metadata"
 hist = sc.read_h5ad(dir_hist / "filtered_WSI_patch_embeddings.h5ad")
