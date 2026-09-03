@@ -113,10 +113,15 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
     if not svg_path.exists():
         raise FileNotFoundError(f"{svg_path} not found")
 
-    btf_candidates = sorted(dir_base_input.glob("*.btf"))
-    if len(btf_candidates) != 1:
-        raise RuntimeError(f"Expected exactly one .btf in {dir_base_input}, found {btf_candidates}")
-    f_wsi = btf_candidates[0]
+    # .btf (BigTIFF) for the original CRC_P*/Normal_P* samples, .tif/.tiff for newer
+    # ones (e.g. CRC_P3_SMAP/CRC_P4_SMAP ship "HE.tif" instead) -- both are read the
+    # same way via pyvips, so just widen the search rather than assuming one extension.
+    wsi_candidates = sorted(set(
+        p for pattern in ("*.btf", "*.tif", "*.tiff") for p in dir_base_input.glob(pattern)
+    ))
+    if len(wsi_candidates) != 1:
+        raise RuntimeError(f"Expected exactly one .btf/.tif/.tiff in {dir_base_input}, found {wsi_candidates}")
+    f_wsi = wsi_candidates[0]
     print("Using WSI:", f_wsi)
 
     # obsm['spatial'] already holds nuclei centroid pixel coords (set by get_svg.py
