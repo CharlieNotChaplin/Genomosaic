@@ -48,6 +48,7 @@ from anndata.utils import make_index_unique
 from scipy import sparse
 from scipy.spatial import cKDTree
 from sklearn.decomposition import TruncatedSVD
+from sklearn.metrics import f1_score
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 
@@ -643,14 +644,21 @@ def train_classifier(
     if model_type == "knn":
         model = KNeighborsClassifier(n_neighbors=n_neighbors, weights="distance")
         model.fit(X_scaled[train_idx], y_enc[train_idx])
+        val_pred = model.predict(X_scaled[val_idx])
         val_acc = model.score(X_scaled[val_idx], y_enc[val_idx])
-        print(f"  [{name}] trained on {len(train_idx)} patches (knn, k={n_neighbors}), val accuracy = {val_acc:.3f}")
+        # macro F1 alongside accuracy: the reference's classes are heavily imbalanced
+        # (e.g. Neoplasm vs. Vessel/Veins -- see main()'s printed class counts), so
+        # accuracy alone can look fine while a rare class's own recall doesn't.
+        val_f1 = f1_score(y_enc[val_idx], val_pred, average="macro", zero_division=0)
+        print(f"  [{name}] trained on {len(train_idx)} patches (knn, k={n_neighbors}), "
+              f"val accuracy = {val_acc:.3f}, val macro F1 = {val_f1:.3f}")
         return {
             "model_type": "knn",
             "model": model,
             "scaler": scaler,
             "label_encoder": label_encoder,
             "val_accuracy": val_acc,
+            "val_f1": val_f1,
         }
 
     class_counts = np.bincount(y_enc[train_idx], minlength=len(label_encoder.classes_))
@@ -683,7 +691,16 @@ def train_classifier(
             best_val_acc, best_state = val_acc, {k: v.clone() for k, v in model.state_dict().items()}
 
     model.load_state_dict(best_state)
-    print(f"  [{name}] trained on {len(train_idx)} patches, best val accuracy = {best_val_acc:.3f}")
+    model.eval()
+    with torch.no_grad():
+        best_val_pred = model(X_val).argmax(1).cpu().numpy()
+    # Computed once on the final best-checkpoint's predictions, not per-epoch (would
+    # add an sklearn call to every one of `epochs` iterations for no benefit -- model
+    # selection above already uses val_acc, unchanged). See the knn branch for why F1
+    # is reported alongside accuracy at all.
+    best_val_f1 = f1_score(y_val.cpu().numpy(), best_val_pred, average="macro", zero_division=0)
+    print(f"  [{name}] trained on {len(train_idx)} patches, best val accuracy = {best_val_acc:.3f}, "
+          f"val macro F1 = {best_val_f1:.3f}")
 
     return {
         "model_type": "mlp",
@@ -691,6 +708,7 @@ def train_classifier(
         "scaler": scaler,
         "label_encoder": label_encoder,
         "val_accuracy": best_val_acc,
+        "val_f1": float(best_val_f1),
     }
 
 
@@ -940,8 +958,11 @@ def main_grid(
     manual bin-summation needed (unlike the patch pipeline's
     aggregate_expression_by_patch).
 
-    Writes "{sample}_grid_predictions.h5ad" per target sample, mirroring
-    "{sample}_patch_predictions.h5ad" from main().
+    Writes "{sample}_grid_predictions.parquet" per target sample -- a lean table
+    (bin_id, array_row/array_col, spatial, Slide_ID, predictions/confidences),
+    not an AnnData with X: at grid resolution X would just be a redundant copy
+    of the gene-expression matrix already available elsewhere (see the
+    save-block comment below), and blew files up to multiple GB for nothing.
 
     targets: restrict to these samples instead of every `discover_target_samples()`
     result -- see main()'s targets docstring for why.
@@ -1028,22 +1049,29 @@ def main_grid(
             suppress_classes=tx_suppress, suppress_weight=neoplasm_prior_weight_on_normal or 0.0,
         )
 
-        out = ad.AnnData(
-            X=adata.X,
-            obs=adata.obs.assign(
-                Slide_ID=sample,
-                predicted_tissuetype_grid_image=img_labels,
-                predicted_confidence_grid_image=img_conf,
-                predicted_tissuetype_grid_transcriptomics=tx_labels,
-                predicted_confidence_grid_transcriptomics=tx_conf,
-            ),
+        # Lean table, not an AnnData carrying X: a grid target can be 500,000+ rows,
+        # and X here would just be a full copy of the gene-expression matrix already
+        # sitting on disk elsewhere (native square_008um, or reproducible via
+        # aggregate_expression_to_grid) -- an early version wrote that through and
+        # produced multi-GB files (CRC_P11mm: 7GB) for a few KB of actual new
+        # information. bin_id + array_row/array_col (the universal join key back onto
+        # the real expression source, valid whether it came from load_grid_bin_counts
+        # or the square_002um fallback) is everything downstream analysis needs.
+        out = adata.obs.assign(
+            Slide_ID=sample,
+            predicted_tissuetype_grid_image=img_labels,
+            predicted_confidence_grid_image=img_conf,
+            predicted_tissuetype_grid_transcriptomics=tx_labels,
+            predicted_confidence_grid_transcriptomics=tx_conf,
         )
-        out.obsm["spatial"] = adata.obsm["spatial"]
+        out.insert(0, "bin_id", adata.obs_names)
+        out["pxl_col"] = adata.obsm["spatial"][:, 0]
+        out["pxl_row"] = adata.obsm["spatial"][:, 1]
 
         out_dir = DATA_DIR / OUT_DIR_TEMPLATE.format(sample)
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"{sample}_grid_predictions.h5ad"
-        out.write_h5ad(out_path)
+        out_path = out_dir / f"{sample}_grid_predictions.parquet"
+        out.reset_index(drop=True).to_parquet(out_path, index=False)
         print(f"  Saved -> {out_path}")
         agree = (img_labels == tx_labels).mean()
         print(f"  image/transcriptomics agreement: {agree:.1%}")

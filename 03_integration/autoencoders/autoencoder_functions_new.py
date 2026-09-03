@@ -1714,14 +1714,19 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
     real biology, not a technical artifact to suppress.
 
     Two checks, both genuinely slide-disjoint (unlike a naive pooled cross_val_score):
-      - train_loso_acc: leave-one-TRAINING-slide-out (sklearn LeaveOneGroupOut) --
-        does the classifier separate tumor/normal on a training slide it wasn't fit
-        on? Degenerate folds (down to one class) are skipped; n_valid_folds reports
-        how many contributed.
+      - train_loso_acc/train_loso_f1: leave-one-TRAINING-slide-out (sklearn
+        LeaveOneGroupOut) -- does the classifier separate tumor/normal on a
+        training slide it wasn't fit on? Degenerate folds (down to one class)
+        are skipped; n_valid_folds reports how many contributed. f1 (macro) is
+        reported alongside accuracy because these folds are exactly as class-imbalanced
+        as the slide split itself -- e.g. 1 normal vs. 7 tumor training slides
+        once a normal slide is held out -- so accuracy alone can look fine
+        while the minority class's own performance doesn't.
       - held_out_acc: fits on all training-slide patches, predicts on the TRUE
         held-out slide (never seen). Its true label is constant, so this is "fraction
         classified as its own known label," not two-sided accuracy -- read alongside
-        train_loso_acc, not alone.
+        train_loso_acc, not alone. No held_out_f1: F1 needs both classes present in
+        y_true to mean anything, and a single held-out slide is only ever one class.
 
     class_weight: forwarded to LogisticRegression (e.g. "balanced" for training-pool
       class imbalance, e.g. only 1 normal slide left among 7 when a normal slide is
@@ -1733,6 +1738,7 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
     """
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import LeaveOneGroupOut
+    from sklearn.metrics import f1_score
 
     if torch.is_tensor(z_train):
         z_train = z_train.detach().cpu().numpy()
@@ -1743,7 +1749,10 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
     y_train = np.array([1 if str(s).startswith(tumor_prefix) else 0 for s in train_slide_name])
     y_held = np.array([1 if str(s).startswith(tumor_prefix) else 0 for s in held_slide_name])
 
-    fold_scores = []
+    # F1 alongside accuracy: train_loso's classes are as imbalanced as the slide split
+    # itself (e.g. 1 normal vs 7 tumor training slides once one normal slide is held
+    # out) -- accuracy alone can look fine while the minority class's own F1 doesn't.
+    fold_scores, fold_f1s = [], []
     if len(np.unique(groups)) >= 2:
         for tr_idx, te_idx in LeaveOneGroupOut().split(z_train, y_train, groups=groups):
             if len(np.unique(y_train[tr_idx])) < 2:
@@ -1751,7 +1760,10 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
             clf_fold = LogisticRegression(max_iter=max_iter, class_weight=class_weight)
             clf_fold.fit(z_train[tr_idx], y_train[tr_idx])
             fold_scores.append(clf_fold.score(z_train[te_idx], y_train[te_idx]))
+            fold_f1s.append(f1_score(y_train[te_idx], clf_fold.predict(z_train[te_idx]),
+                                      labels=[0, 1], average="macro", zero_division=0))
     train_loso_acc = float(np.mean(fold_scores)) if fold_scores else None
+    train_loso_f1 = float(np.mean(fold_f1s)) if fold_f1s else None
 
     held_out_acc = None
     if len(y_held) and len(np.unique(y_train)) >= 2:
@@ -1761,6 +1773,7 @@ def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
 
     return {
         "train_loso_acc": train_loso_acc,
+        "train_loso_f1": train_loso_f1,
         "n_valid_folds": len(fold_scores),
         "held_out_acc": held_out_acc,
         "held_out_true_label": int(y_held[0]) if len(y_held) else None,

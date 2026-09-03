@@ -17,8 +17,9 @@
 # at all -- main_grid falls back to aggregate_expression_to_grid, which loads the
 # full square_002um matrix first, an even bigger footprint than CRC_P11mm's). The
 # other 6 slides (CRC_P1, CRC_P5, CRC_P6_5mm, CRC_P11mm_2_cut, Normal_P3, Normal_P5)
-# already completed locally one-at-a-time; their *_grid_predictions.h5ad already
-# exist under data/{slide}/02_baselines/label_transfer/.
+# already completed locally one-at-a-time; their *_grid_predictions.parquet already
+# exist under data/{slide}/02_baselines/label_transfer/ (main_grid() writes a lean
+# parquet table, not an AnnData -- see its docstring).
 #
 # One task per slide (not one job looping over all 3) so a crash on one doesn't
 # lose the others' progress -- same reasoning that made the local runs go one
