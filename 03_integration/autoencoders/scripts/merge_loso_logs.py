@@ -13,7 +13,15 @@ import sys
 from pathlib import Path
 import pandas as pd
 
-basedir = Path("../../data")
+# Robust to invocation directory: walks up from this file's own location for
+# a `data/` sibling, rather than assuming a fixed relative depth from CWD
+# (broke when this file moved into scripts/, one level deeper than before).
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "data").is_dir():
+        basedir = _candidate / "data"
+        break
+else:
+    raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
 dir_output = basedir / "combined/03_integration/autoencoders/002um"
 
 out_path = dir_output / "loso_token_log_combined.csv"

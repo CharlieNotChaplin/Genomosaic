@@ -64,6 +64,16 @@ set_seed(42)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
 
+# Robust to invocation directory: walks up from this file's own location for
+# a `data/` sibling, rather than assuming a fixed relative depth from CWD
+# (broke when this file moved into scripts/, one level deeper than before).
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "data").is_dir():
+        basedir = _candidate / "data"
+        break
+else:
+    raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
+
 # ---- sweep grid -------------------------------------------------------------
 # Extend/trim freely -- every combination below is one sequential Phase-3 run
 # within this job, so keep len(combos) * REDUCED_EPOCHS within your --time
@@ -79,8 +89,8 @@ GRID = {
 REDUCED_EPOCHS = 30  # vs. 100 for the full run -- see module docstring
 
 BIN_SIZE = "002um"
-LOG_PATH = Path("../../data/combined/03_integration/autoencoders/002um/token_sweep_log.csv")
-CHECKPOINT_DIR = Path("../../data/combined/03_integration/autoencoders/002um/token_sweep_checkpoints")
+LOG_PATH = basedir / "combined/03_integration/autoencoders/002um/token_sweep_log.csv"
+CHECKPOINT_DIR = basedir / "combined/03_integration/autoencoders/002um/token_sweep_checkpoints"
 
 # ---- base config: everything NOT being swept, held at
 # train_autoenc_token.py's currently-validated values -------------------------
@@ -94,7 +104,6 @@ BASE_CONFIG = dict(
 )
 
 # ---- load data (identical to train_autoenc_token.py's data-prep block) -----
-basedir = Path("../../data")
 dir_histology = basedir / "combined/01_preprocessing/unimodel/metadata"
 dir_transcriptomics = basedir / "combined/01_preprocessing/cell_seg_stardist" / BIN_SIZE / "custom_binning"
 

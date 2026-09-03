@@ -42,7 +42,15 @@ from functions.dual_autoencoder import build_pairing, extract_cell_xy
 HELD_OUT_SLIDE = "CRC_P1"
 RUN_TAG = ""   # must match whatever run_loso.py used (see loso_token_log.csv's run_id)
 
-basedir = Path("../../data")
+# Robust to invocation directory: walks up from this file's own location for
+# a `data/` sibling, rather than assuming a fixed relative depth from CWD
+# (broke when this file moved into scripts/, one level deeper than before).
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "data").is_dir():
+        basedir = _candidate / "data"
+        break
+else:
+    raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
 dir_histology = basedir / "combined/01_preprocessing/unimodel/metadata"
 dir_transcriptomics = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning"
 checkpoint_dir = basedir / "combined/03_integration/autoencoders/002um/loso_token_checkpoints"

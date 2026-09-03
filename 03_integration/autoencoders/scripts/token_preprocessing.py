@@ -43,6 +43,15 @@ TOKEN_SIZE_PX = 14.0
 TOKENS_PER_SIDE = 16
 
 
+def _find_data_dir():
+    """Walks up from this file's own location for a `data/` sibling, robust to
+    invocation directory -- rather than assuming a fixed relative depth from CWD."""
+    for candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+        if (candidate / "data").is_dir():
+            return candidate / "data"
+    raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
+
+
 def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_tokens=1):
     """Bounding-box prefilter: which (col, row) token grid cells could possibly
     overlap a region with these pixel bounds, given the patch's token-grid
@@ -260,7 +269,7 @@ def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad
     return footprint, halo, matched
 
 
-def run(slide, basedir=Path("../../data"), halo_px=15.0, out_name="cell_token_embeddings.h5ad",
+def run(slide, basedir=_find_data_dir(), halo_px=15.0, out_name="cell_token_embeddings.h5ad",
         token_filename="WSI_patch_token_embeddings_filtered.h5ad", correct_positional_bias=True):
     trans_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/count_area_filtered_adata.h5ad"
     nuclei_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/nuclei_geometry.parquet"
@@ -326,7 +335,7 @@ if __name__ == "__main__":
                               "in more neighboring-cell signal (median nearest-cell spacing ~27px, "
                               "so halo rings now commonly extend into neighboring cells' territory "
                               "-- an accepted tradeoff, not an oversight)")
-    parser.add_argument("--basedir", type=Path, default=Path("../../data"))
+    parser.add_argument("--basedir", type=Path, default=_find_data_dir())
     parser.add_argument("--no-bias-correction", action="store_true",
                          help="skip the per-(row,col) positional-bias correction (on by default) -- "
                               "e.g. to reproduce the older, uncorrected cell_token_embeddings.h5ad "

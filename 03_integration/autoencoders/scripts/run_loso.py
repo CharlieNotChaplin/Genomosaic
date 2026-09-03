@@ -128,7 +128,15 @@ def run_it(held_out_slide="CRC_P1"):
     EXCLUDE_SLIDES = []
 
     # ---- output dirs ----------------------------------------------------------
-    basedir = Path("../../data")
+    # Robust to invocation directory: walks up from this file's own location for
+    # a `data/` sibling, rather than assuming a fixed relative depth from CWD
+    # (broke when this file moved into scripts/, one level deeper than before).
+    for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+        if (_candidate / "data").is_dir():
+            basedir = _candidate / "data"
+            break
+    else:
+        raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
     dir_histology = basedir / "combined/01_preprocessing/unimodel/metadata"
     dir_transcriptomics = basedir / "combined/01_preprocessing" / CONFIG["dir_cellseg"] / CONFIG["bin_size"] / "custom_binning"
     dir_output = basedir / "combined" / "03_integration/autoencoders" / CONFIG["bin_size"]

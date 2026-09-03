@@ -50,7 +50,15 @@ LEAKAGE_SUBSAMPLE = 20000  # cap rows fed to LogisticRegression -- this is a fas
                             # check, not the final reported metric, so keep it quick
 
 _t0 = _time.time()
-basedir = Path("../../data")
+# Robust to invocation directory: walks up from this file's own location for
+# a `data/` sibling, rather than assuming a fixed relative depth from CWD
+# (broke when this file moved into scripts/, one level deeper than before).
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "data").is_dir():
+        basedir = _candidate / "data"
+        break
+else:
+    raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
 
 print("=" * 70)
 print("1. GPU/CUDA check")
