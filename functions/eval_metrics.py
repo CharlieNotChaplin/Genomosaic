@@ -1,8 +1,8 @@
 """
 Shared downstream evaluation metrics -- generic over both the label-transfer
 outputs (functions/label_transfer.py) and the autoencoder embeddings
-(03_integration/autoencoders/autoencoder_functions_new.py), so both consume
-one implementation instead of duplicating sklearn-wrapper boilerplate.
+(functions/dual_autoencoder.py), so both consume one implementation instead
+of duplicating sklearn-wrapper boilerplate.
 
 Covers:
   - cluster_quality_metrics: Silhouette / Calinski-Harabasz / Davies-Bouldin --
@@ -26,10 +26,10 @@ nothing in this project currently reconstructs pixel-level images -- add it
 only once there's a concrete image-vs-image comparison to run it on.
 
 "Cluster retrieval" isn't reimplemented here either -- it already exists as
-the cluster_top1 metric in retrieval_accuracy/token_retrieval_accuracy
-(autoencoder_functions_new.py): a hit if the cross-modal nearest neighbor
-shares the query's independent cluster label. This module's
-cluster_quality_metrics answers a different question (is the clustering
+the cluster_top1 metric in token_retrieval_accuracy (functions/dual_autoencoder.py):
+a hit if the cross-modal nearest neighbor shares the query's independent
+cluster label. This module's cluster_quality_metrics answers a different
+question (is the clustering
 itself well-separated), not that one.
 """
 

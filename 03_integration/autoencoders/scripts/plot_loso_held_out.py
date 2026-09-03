@@ -17,6 +17,8 @@ run_leave_one_slide_out_token's actual filtering (e.g. a fixed bug re-run with a
 different keep_mask) and the npz should be regenerated instead of trusted here.
 """
 
+import sys
+
 import anndata as ad
 import geopandas as gpd
 import numpy as np
@@ -26,7 +28,16 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from sklearn.cluster import KMeans
 
-from autoencoder_functions_new import build_pairing, extract_cell_xy
+# Finds the ancestor directory that actually contains `functions/` -- the repo
+# root when run from a checkout (this file sits three levels under it), or this
+# script's own directory when run from a flat cluster deployment that copied
+# the `functions/` package alongside it.
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "functions").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from functions.dual_autoencoder import build_pairing, extract_cell_xy
 
 HELD_OUT_SLIDE = "CRC_P1"
 RUN_TAG = ""   # must match whatever run_loso.py used (see loso_token_log.csv's run_id)

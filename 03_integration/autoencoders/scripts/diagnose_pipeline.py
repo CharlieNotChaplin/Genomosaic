@@ -23,6 +23,7 @@ Nothing here touches a GPU or trains anything. Run directly (login node, or a
 plain CPU allocation):
     python -u diagnose_pipeline.py
 """
+import sys
 import time as _time
 from pathlib import Path
 
@@ -33,7 +34,16 @@ import scanpy as sc
 import scipy.sparse as sp
 import torch
 
-from autoencoder_functions_new import evaluate_latent_leakage
+# Finds the ancestor directory that actually contains `functions/` -- the repo
+# root when run from a checkout (this file sits two levels under it), or this
+# script's own directory when run from a flat cluster deployment that copied
+# the `functions/` package alongside it.
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "functions").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from functions.dual_autoencoder import evaluate_latent_leakage
 
 PATCHES_PER_BATCH = 64  # must match CONFIG["patches_per_batch"] in train_autoenc_token.py
 LEAKAGE_SUBSAMPLE = 20000  # cap rows fed to LogisticRegression -- this is a fast sanity

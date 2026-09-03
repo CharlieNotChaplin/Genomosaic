@@ -22,9 +22,11 @@
 # oversample_slides (~24000 draws/epoch for each normal slide, roughly matching the
 # tumor side's total) -- see PatchGroupedLoader.oversample_target's docstring.
 #
-# Requires run_loso.py/autoencoder_functions_new.py/this file in the SAME flat
-# directory (no scripts/ subdir) so `from autoencoder_functions_new import *`
-# resolves; run `sbatch` from that directory too.
+# Requires run_loso.py + this file in the SAME flat directory (no scripts/
+# subdir), PLUS a `functions/` subdirectory copied alongside them (dual_
+# autoencoder.py now lives there, not next to run_loso.py -- run_loso.py's own
+# sys.path bootstrap finds `functions/` as a sibling of wherever it's run from).
+# Run `sbatch` from that same flat directory too.
 SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P3_SMAP CRC_P4_SMAP CRC_P5 CRC_P6_5mm Normal_P3 Normal_P5)
 HELD_OUT_SLIDE="${SLIDES[$SLURM_ARRAY_TASK_ID]}"
 

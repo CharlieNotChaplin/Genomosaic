@@ -19,6 +19,7 @@ weight=1.0, local_warmup_epochs=10, local_anchor_sim_threshold=None -- the
 
 # ---- imports ----------------------------------------------------------
 import argparse
+import sys
 
 import anndata as ad
 import geopandas as gpd
@@ -30,7 +31,16 @@ import torch
 from pathlib import Path
 from plyer import notification
 
-from autoencoder_functions_new import *
+# Finds the ancestor directory that actually contains `functions/` -- the repo
+# root when run from a checkout (this file sits two levels under it), or this
+# script's own directory when run from a flat cluster deployment that copied
+# the `functions/` package alongside it (see submit_run_loso_array.sbatch).
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "functions").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
+from functions.dual_autoencoder import *
 
 
 def run_it(held_out_slide="CRC_P1"):
