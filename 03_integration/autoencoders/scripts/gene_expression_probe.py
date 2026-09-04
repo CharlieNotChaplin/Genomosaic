@@ -2,6 +2,15 @@
 Proof of concept: does the histology token embedding (z_token) actually predict
 real gene expression on a slide the model never saw?
 
+Fits two probes per fold, not just one: Ridge (linear) and a small MLP
+(nonlinear). Ridge is the conservative default for "does this representation
+carry information" questions -- limited capacity means it can't overfit its way
+to a good-looking score, but that same limited capacity means a genuinely
+nonlinear z_token->expression relationship would show up as a false negative
+(low score) for Ridge alone. The MLP checks that: if it scores meaningfully
+higher than Ridge, the earlier weak Ridge numbers were a linear-probe ceiling,
+not evidence that z_token lacks the signal.
+
 Context: run_loso.py's cell<->token contrastive alignment only optimizes z_token
 and z_trans to be *relatively* closer for true pairs than for mismatched ones --
 it never forces them to be literally interchangeable inputs into the same decoder
@@ -37,6 +46,7 @@ token feature vector, no slide_code) -- just a direct trans<->token id join,
 independent of build_pairing/build_pipeline_data's heavier hist-matching path.
 """
 
+import copy
 import sys
 from pathlib import Path
 
@@ -46,6 +56,8 @@ import pandas as pd
 import scanpy as sc
 import scipy.sparse as sp
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from scipy.stats import pearsonr
 from sklearn.linear_model import Ridge
 from sklearn.metrics import r2_score
@@ -115,6 +127,88 @@ per_slide_data = {s: load_token_features(s) for s in slides_with_tokens}
 for s, (tf, xs) in per_slide_data.items():
     print(f"  {s}: {tf.shape[0]} matched cells")
 
+
+class ProbeMLP(nn.Module):
+    """Single hidden layer -- enough to test "is the z_token->expression map
+    nonlinear", not meant to be a tuned/production model."""
+    def __init__(self, in_dim, out_dim, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, out_dim))
+
+    def forward(self, x):
+        return self.net(x)
+
+
+def fit_mlp_probe(z_train, y_train, device, val_frac=0.1, max_epochs=100, patience=8,
+                   lr=1e-3, batch_size=4096, seed=0):
+    """Early-stopped on a held-back slice of the TRAINING cells only (never the fold's
+    held-out slide) -- same val_frac/patience early-stopping idea as
+    pretrain_token_autoencoder in functions/dual_autoencoder.py, applied here instead
+    of a fixed epoch count so this doesn't just memorize training noise."""
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(z_train.shape[0])
+    n_val = int(len(idx) * val_frac)
+    val_idx, fit_idx = idx[:n_val], idx[n_val:]
+
+    z_fit = torch.from_numpy(z_train[fit_idx]).to(device)
+    y_fit = torch.from_numpy(y_train[fit_idx]).to(device)
+    z_val = torch.from_numpy(z_train[val_idx]).to(device)
+    y_val = torch.from_numpy(y_train[val_idx]).to(device)
+
+    model = ProbeMLP(z_train.shape[1], y_train.shape[1]).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-5)
+
+    best_val, best_state, epochs_no_improve = float("inf"), None, 0
+    n_fit = z_fit.shape[0]
+    for _epoch in range(max_epochs):
+        model.train()
+        perm = torch.randperm(n_fit, device=device)
+        for start in range(0, n_fit, batch_size):
+            batch_idx = perm[start:start + batch_size]
+            opt.zero_grad()
+            loss = F.mse_loss(model(z_fit[batch_idx]), y_fit[batch_idx])
+            loss.backward()
+            opt.step()
+
+        model.eval()
+        with torch.no_grad():
+            val_loss = F.mse_loss(model(z_val), y_val).item()
+        if val_loss < best_val - 1e-5:
+            best_val, best_state, epochs_no_improve = val_loss, copy.deepcopy(model.state_dict()), 0
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= patience:
+                break
+
+    model.load_state_dict(best_state)
+    model.eval()
+    return model
+
+
+def score_predictions(y_true, y_pred):
+    """Per-gene R^2 (via sklearn, not hand-rolled ss_res/ss_tot) and Pearson r, plus
+    the summary stats actually worth reading. Per-gene R^2 is NOT averaged as a
+    headline number: any gene with genuinely low (not necessarily zero) variance in
+    the held-out slide makes ss_res/ss_tot blow up to an enormous negative value for
+    a merely-modest absolute miss -- confirmed on a smoke test where mean_r2 came out
+    to -1.5 MILLION while median_r2 was a sane 0.014. median_r2 (robust to outlier
+    genes) and Pearson r's mean/median (naturally bounded to [-1, 1], unaffected by a
+    target's absolute variance) are the numbers to actually read; mean_r2 is kept only
+    for completeness."""
+    r2_per_gene = r2_score(y_true, y_pred, multioutput="raw_values")
+    pearson_per_gene = np.array([
+        pearsonr(y_true[:, g], y_pred[:, g])[0] if np.ptp(y_pred[:, g]) > 0 else np.nan
+        for g in range(y_true.shape[1])
+    ])
+    return {
+        "mean_r2": np.nanmean(r2_per_gene),
+        "median_r2": np.nanmedian(r2_per_gene),
+        "frac_genes_r2_pos": float(np.mean(r2_per_gene > 0)),
+        "mean_pearson_r": np.nanmean(pearson_per_gene),
+        "median_pearson_r": np.nanmedian(pearson_per_gene),
+    }
+
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 rows = []
 for held_out_slide in EVAL_SLIDES:
@@ -158,48 +252,39 @@ for held_out_slide in EVAL_SLIDES:
         z_train = model.token_enc(torch.from_numpy(train_token_std).to(device)).cpu().numpy()
         z_held = model.token_enc(torch.from_numpy(held_token_std).to(device)).cpu().numpy()
 
-    probe = Ridge(alpha=RIDGE_ALPHA)
-    probe.fit(z_train, train_expr_std)
-    pred = probe.predict(z_held)
-
-    # Per-gene R^2 is NOT averaged as a headline number below: any gene with genuinely
-    # low (not necessarily zero) variance in the held-out slide makes ss_res/ss_tot blow
-    # up to an enormous negative value for a merely-modest absolute miss -- confirmed on
-    # a smoke test where mean_r2 came out to -1.5 MILLION while median_r2 was a sane
-    # 0.014. sklearn's r2_score only special-cases an EXACTLY zero denominator, so this
-    # isn't avoidable by swapping formulas -- it's inherent to averaging R^2 across many
-    # genes of differing scale. median_r2 (robust to outlier genes) and Pearson r's mean/
-    # median (naturally bounded to [-1, 1], unaffected by a target's absolute variance)
-    # are the numbers to actually read; mean_r2 is kept in the CSV only for completeness.
-    r2_per_gene = r2_score(held_expr_std, pred, multioutput="raw_values")
-    pearson_per_gene = np.array([
-        pearsonr(held_expr_std[:, g], pred[:, g])[0] if np.ptp(pred[:, g]) > 0 else np.nan
-        for g in range(held_expr_std.shape[1])
-    ])
-
-    rows.append({
-        "held_out_slide": held_out_slide,
-        "train_slides_used": ",".join(train_slides),
-        "n_train_cells": z_train.shape[0],
-        "n_held_cells": z_held.shape[0],
+    print(f"  n_train={z_train.shape[0]} n_held={z_held.shape[0]}")
+    common = {
+        "held_out_slide": held_out_slide, "train_slides_used": ",".join(train_slides),
+        "n_train_cells": z_train.shape[0], "n_held_cells": z_held.shape[0],
         "n_genes": held_expr_std.shape[1],
-        "mean_r2": np.nanmean(r2_per_gene),
-        "median_r2": np.nanmedian(r2_per_gene),
-        "frac_genes_r2_pos": float(np.mean(r2_per_gene > 0)),
-        "mean_pearson_r": np.nanmean(pearson_per_gene),
-        "median_pearson_r": np.nanmedian(pearson_per_gene),
-    })
-    print(f"  n_train={z_train.shape[0]} n_held={z_held.shape[0]} | "
-          f"median R^2={rows[-1]['median_r2']:.4f} ({rows[-1]['frac_genes_r2_pos']:.0%} of genes R^2>0) | "
-          f"median Pearson r={rows[-1]['median_pearson_r']:.4f} (mean {rows[-1]['mean_pearson_r']:.4f}) "
-          f"[mean R^2={rows[-1]['mean_r2']:.1f}, not meaningful -- see script docstring/comment above]")
+    }
 
-summary = pd.DataFrame(rows).set_index("held_out_slide")
+    ridge = Ridge(alpha=RIDGE_ALPHA)
+    ridge.fit(z_train, train_expr_std)
+    ridge_pred = ridge.predict(z_held)
+    ridge_scores = score_predictions(held_expr_std, ridge_pred)
+    rows.append({**common, "probe": "ridge", **ridge_scores})
+    print(f"  [ridge] median R^2={ridge_scores['median_r2']:.4f} "
+          f"({ridge_scores['frac_genes_r2_pos']:.0%} of genes R^2>0) | "
+          f"median Pearson r={ridge_scores['median_pearson_r']:.4f} (mean {ridge_scores['mean_pearson_r']:.4f})")
+
+    mlp = fit_mlp_probe(z_train, train_expr_std, device)
+    with torch.no_grad():
+        mlp_pred = mlp(torch.from_numpy(z_held).to(device)).cpu().numpy()
+    mlp_scores = score_predictions(held_expr_std, mlp_pred)
+    rows.append({**common, "probe": "mlp", **mlp_scores})
+    print(f"  [mlp]   median R^2={mlp_scores['median_r2']:.4f} "
+          f"({mlp_scores['frac_genes_r2_pos']:.0%} of genes R^2>0) | "
+          f"median Pearson r={mlp_scores['median_pearson_r']:.4f} (mean {mlp_scores['mean_pearson_r']:.4f})")
+
+summary = pd.DataFrame(rows).set_index(["held_out_slide", "probe"])
 out_path = dir_output / "gene_expression_probe_log.csv"
 summary.to_csv(out_path)
-print(f"\n=== Summary (also written to {out_path}) ===")
+print(f"\n=== Summary (also written to {out_path}; mean_r2 not meaningful, see score_predictions docstring) ===")
 print(summary.drop(columns=["train_slides_used"]))
 if len(summary):
-    print(f"\nAcross {len(summary)} folds: median R^2={summary['median_r2'].median():.4f}, "
-          f"median Pearson r={summary['median_pearson_r'].median():.4f} "
-          f"(mean Pearson r={summary['mean_pearson_r'].mean():.4f})")
+    for probe_name in summary.index.get_level_values("probe").unique():
+        sub = summary.xs(probe_name, level="probe")
+        print(f"\n[{probe_name}] across {len(sub)} folds: median R^2={sub['median_r2'].median():.4f}, "
+              f"median Pearson r={sub['median_pearson_r'].median():.4f} "
+              f"(mean Pearson r={sub['mean_pearson_r'].mean():.4f})")
