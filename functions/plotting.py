@@ -1,12 +1,62 @@
 import random
 from pathlib import Path
 
+import matplotlib.font_manager as fm
 import matplotlib.pyplot as plt
 import numpy as np
 import anndata as ad
 from matplotlib.collections import PatchCollection
+from matplotlib.colors import LinearSegmentedColormap
 from matplotlib.offsetbox import AnnotationBbox, OffsetImage
 from matplotlib.patches import Rectangle
+
+# Linux Libertine as the default plot font, project-wide. Not actually
+# system-wide on Fedora: the texlive-libertine package installs the .otf
+# files under TeX Live's own font tree, which fontconfig doesn't scan and
+# matplotlib's font manager therefore never sees on its own -- register them
+# directly instead of requiring a system font install (which wouldn't help
+# on other machines, e.g. the cluster, anyway). Falls back to matplotlib's
+# default font with a one-time warning if the files aren't found -- other
+# environments running this module don't have the same TeX Live layout.
+_LIBERTINE_DIRS = [
+    Path("/usr/share/texlive/texmf-dist/fonts/opentype/public/libertine"),
+    Path("/usr/share/fonts/opentype/linux-libertine"),
+    Path("/usr/share/fonts/truetype/linux-libertine"),
+    Path.home() / ".local/share/fonts",
+]
+_LIBERTINE_FILES = ["LinLibertine_R.otf", "LinLibertine_RB.otf", "LinLibertine_RI.otf", "LinLibertine_RBI.otf"]
+
+_libertine_found = False
+for _dir in _LIBERTINE_DIRS:
+    _paths = [_dir / f for f in _LIBERTINE_FILES if (_dir / f).exists()]
+    if _paths:
+        for _p in _paths:
+            fm.fontManager.addfont(str(_p))
+        _libertine_found = True
+        break
+
+if _libertine_found:
+    plt.rcParams["font.family"] = "Linux Libertine O"
+else:
+    print("functions.plotting: Linux Libertine .otf files not found, falling back to matplotlib's default font")
+
+# Project color convention (04_eval/colors.txt): a 5-step blue sequential ramp
+# (darkest first) plus 9 categorical accents, blue always the first choice for
+# whatever's plotted first/primary. RWTH_CATEGORICAL is the ramp's darkest step
+# followed by the accents, for functions that need a flat list of N distinct colors.
+RWTH_BLUE_RAMP = ["#00549F", "#407FB7", "#8EBAE5", "#C7DDF2", "#E8F1FA"]
+RWTH_ACCENT_COLORS = ["#006165", "#0098A1", "#57AB27", "#BDCD00", "#F6A800", "#CC071E", "#A11035", "#612158", "#7A6FAC"]
+RWTH_CATEGORICAL = [RWTH_BLUE_RAMP[0]] + RWTH_ACCENT_COLORS
+
+
+def rwth_blue_cmap():
+    """Sequential colormap (light -> dark) for continuous data, built from RWTH_BLUE_RAMP."""
+    return LinearSegmentedColormap.from_list("rwth_blue", list(reversed(RWTH_BLUE_RAMP)))
+
+
+def rwth_blue_yellow_cmap():
+    """Sequential colormap (dark blue -> yellow/orange) for continuous data."""
+    return LinearSegmentedColormap.from_list("rwth_blue_yellow", [RWTH_BLUE_RAMP[0], RWTH_ACCENT_COLORS[4]])
 
 
 def plot_spatial_labels(
@@ -266,8 +316,8 @@ def plot_distribution_grid(
     -------
     (fig, axes)
     """
-    BASE_COLOR = "#3470a3"       # muted blue -- below cutoff (or all bars, if no cutoff)
-    HIGHLIGHT_COLOR = "#e8871e"  # warm amber -- above cutoff (retained)
+    BASE_COLOR = RWTH_BLUE_RAMP[0]     # RWTH blue -- below cutoff (or all bars, if no cutoff)
+    HIGHLIGHT_COLOR = RWTH_ACCENT_COLORS[4]  # orange -- above cutoff (retained)
 
     slides = list(values_by_slide.keys())
     n = len(slides)
@@ -355,9 +405,8 @@ def plot_filter_funnel(counts_df, colors: list | None = None, ax=None, title: st
         nuclei failing both) will not sum to 100% and should be split into
         exclusive categories first.
     colors : list[str], optional
-        One color per column, in column order. Defaults to a 5-step blue
-        sequential palette (darkest first), truncated/cycled to the number
-        of columns.
+        One color per column, in column order. Defaults to RWTH_BLUE_RAMP
+        (darkest first), truncated/cycled to the number of columns.
     ax : matplotlib.axes.Axes, optional
         Axis to draw on. A new figure/axis is created if not given.
     title : str, optional
@@ -367,9 +416,8 @@ def plot_filter_funnel(counts_df, colors: list | None = None, ax=None, title: st
     -------
     ax
     """
-    default_palette = ["#00549F", "#407FB7", "#8EBAE5", "#C7DDF2", "#E8F1FA"]
     if colors is None:
-        colors = [default_palette[i % len(default_palette)] for i in range(counts_df.shape[1])]
+        colors = [RWTH_BLUE_RAMP[i % len(RWTH_BLUE_RAMP)] for i in range(counts_df.shape[1])]
 
     pct_df = counts_df.div(counts_df.sum(axis=1), axis=0) * 100
     slides = pct_df.index.astype(str)
@@ -425,8 +473,8 @@ def plot_raincloud_grid(
     title : str, optional
         Figure title.
     colors : dict[str, str], optional
-        {stage_label: color}. Defaults to a small fixed palette assigned
-        in stage-label order of first appearance.
+        {stage_label: color}. Defaults to RWTH_CATEGORICAL (blue first),
+        assigned in stage-label order of first appearance.
     figsize : tuple, optional
         Defaults to a height scaled by the number of rows.
     jitter_n : int
@@ -456,8 +504,7 @@ def plot_raincloud_grid(
 
     stage_labels = list(dict.fromkeys(stage for _, stage, _ in rows))
     if colors is None:
-        default_colors = ["#B0413E", "#00549F", "#8EBAE5", "#E8871E"]
-        colors = {s: default_colors[i % len(default_colors)] for i, s in enumerate(stage_labels)}
+        colors = {s: RWTH_CATEGORICAL[i % len(RWTH_CATEGORICAL)] for i, s in enumerate(stage_labels)}
 
     n_rows = len(rows)
     if figsize is None:
