@@ -435,6 +435,99 @@ def aggregate_tokens_to_grid(
     return out
 
 
+def aggregate_tokens_to_grid_footprint_halo(
+    sample: str, bin_coords: np.ndarray, inner_radius_px: float, halo_width_px: float,
+    data_dir: Path = DATA_DIR, batch_size: int = 20_000,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Footprint+halo analogue of aggregate_tokens_to_grid, mirroring
+    03_integration/autoencoders/scripts/token_preprocessing.py's per-cell
+    footprint (nucleus polygon) / halo (dilated ring around it) split -- but a
+    bin has no polygon, just a center point and a fixed physical size, so
+    footprint/halo become two concentric radii around that center instead of
+    two shapely geometries.
+
+    footprint: mean raw ViT token embedding within inner_radius_px of a bin's
+      center (this bin's own tissue -- the role a nucleus polygon plays for a
+      cell).
+    halo: mean embedding of tokens in the ring [inner_radius_px,
+      inner_radius_px + halo_width_px) around the center (immediate
+      surrounding context -- the role the dilated ring plays for a cell).
+    matched: True iff any token fell within the OUTER radius at all (mirrors
+      compute_cell_token_features's semantics: False means "no token data
+      anywhere nearby", not "none in the inner circle specifically").
+
+    Fallbacks mirror aggregate_tokens_to_grid's own (nearest-single-token,
+    folded into the same averaging code by substituting a 1-element neighbor
+    list before the batch read), applied per radius:
+      - inner circle empty, ring non-empty -> footprint falls back to the
+        single nearest token (guaranteed to already be a member of the
+        non-empty outer list, since the globally nearest token can be no
+        farther than any point already found within the outer radius).
+      - ring empty (outer == inner), inner non-empty -> halo falls back to
+        the footprint value itself, the same neutral fallback
+        compute_cell_token_features uses when its halo ring has zero
+        overlap -- not a second nearest-token lookup.
+      - both empty -> footprint and halo both fall back to the single
+        nearest token (matched=False).
+
+    Builds ONE cKDTree over the whole slide's tokens (same as
+    aggregate_tokens_to_grid) and queries it at both radii per batch, still
+    reading each batch's needed token rows off disk in one indexed call.
+    """
+    path = data_dir / TOKEN_METADATA_TEMPLATE.format(sample)
+    bin_coords = np.asarray(bin_coords)[:, :2]
+    outer_radius_px = inner_radius_px + halo_width_px
+
+    with h5py.File(path, "r") as f:
+        tok_x = f["obs/Token_X"][:].astype(np.float64)
+        tok_y = f["obs/Token_Y"][:].astype(np.float64)
+        n_dims = f["X"].shape[1]
+        tree = cKDTree(np.stack([tok_x, tok_y], axis=1))
+        del tok_x, tok_y
+
+        n = len(bin_coords)
+        footprint = np.zeros((n, n_dims), dtype=np.float32)
+        halo = np.zeros((n, n_dims), dtype=np.float32)
+        matched = np.zeros(n, dtype=bool)
+
+        for start in range(0, n, batch_size):
+            batch = bin_coords[start : start + batch_size]
+            inner_lists = tree.query_ball_point(batch, r=inner_radius_px)
+            outer_lists = tree.query_ball_point(batch, r=outer_radius_px)
+            batch_matched = [len(nb) > 0 for nb in outer_lists]
+
+            empty_outer = [i for i, nb in enumerate(outer_lists) if len(nb) == 0]
+            if empty_outer:
+                _, nearest = tree.query(batch[empty_outer])
+                for j, i in enumerate(empty_outer):
+                    outer_lists[i] = [int(nearest[j])]
+                    inner_lists[i] = [int(nearest[j])]
+
+            empty_inner = [i for i, nb in enumerate(inner_lists) if len(nb) == 0 and len(outer_lists[i]) > 0]
+            if empty_inner:
+                _, nearest = tree.query(batch[empty_inner])
+                for j, i in enumerate(empty_inner):
+                    inner_lists[i] = [int(nearest[j])]
+
+            # h5py fancy indexing needs sorted unique indices -- read this
+            # batch's needed rows in one indexed call, small enough to hold
+            # in memory, then average per-bin from that slice.
+            all_idx = np.unique(np.concatenate([np.asarray(nb, dtype=np.int64) for nb in outer_lists]))
+            sub_emb = f["X"][all_idx].astype(np.float32)
+            row_of = {idx: pos for pos, idx in enumerate(all_idx)}
+
+            for i, (inner, outer) in enumerate(zip(inner_lists, outer_lists)):
+                gi = start + i
+                matched[gi] = batch_matched[i]
+                footprint[gi] = sub_emb[[row_of[idx] for idx in inner]].mean(axis=0)
+                ring = [idx for idx in outer if idx not in set(inner)]
+                halo[gi] = sub_emb[[row_of[idx] for idx in ring]].mean(axis=0) if ring else footprint[gi]
+            del sub_emb
+
+    return footprint, halo, matched
+
+
 def aggregate_expression_by_patch(bin_adata: ad.AnnData, bin_to_patch: pd.Series) -> ad.AnnData:
     """Sum raw counts of all bins assigned to the same patch -> patches x genes."""
     bin_to_patch = bin_to_patch[bin_to_patch.index.isin(bin_adata.obs_names)]
@@ -922,7 +1015,7 @@ def main(
     print("\nDone.")
 
 
-def _microns_per_pixel(sample: str, data_dir: Path = DATA_DIR) -> float:
+def microns_per_pixel(sample: str, data_dir: Path = DATA_DIR) -> float:
     path = data_dir / GRID_SPATIAL_DIR_TEMPLATE.format(sample) / "spatial" / "scalefactors_json.json"
     if not path.exists():
         # No native square_008um output -- microns_per_pixel is a property of the
@@ -999,7 +1092,7 @@ def main_grid(
     print(f"  {labeled.sum()}/{ref_adata.n_obs} grid cells have ground truth. Classes:\n"
           f"  {y_ref.value_counts().to_dict()}")
 
-    radius_px = grid_um / _microns_per_pixel(REFERENCE_SAMPLE) * radius_factor
+    radius_px = grid_um / microns_per_pixel(REFERENCE_SAMPLE) * radius_factor
     print(f"\nAggregating reference raw-token image features (radius={radius_px:.1f}px)...")
     X_ref_img = aggregate_tokens_to_grid(
         REFERENCE_SAMPLE, ref_adata.obsm["spatial"][labeled], radius_px, batch_size=token_batch_size,
@@ -1034,7 +1127,7 @@ def main_grid(
         if apply_neoplasm_prior:
             print(f"  disease_status=Normal: suppressing Neoplasm (weight={neoplasm_prior_weight_on_normal})")
 
-        radius_px = grid_um / _microns_per_pixel(sample) * radius_factor
+        radius_px = grid_um / microns_per_pixel(sample) * radius_factor
         img_input = aggregate_tokens_to_grid(sample, adata.obsm["spatial"], radius_px, batch_size=token_batch_size)
         img_suppress = classes_containing(img_fit, "Neoplasm") if apply_neoplasm_prior else None
         img_labels, img_conf = predict_classifier(

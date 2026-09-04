@@ -21,5 +21,5 @@ export OPENBLAS_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
-python get_svg.py --sample "$1"
+python get_svg.py --sample "$1" --unit "${2:-cell}"
 
