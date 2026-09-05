@@ -19,6 +19,10 @@
 # Run BinPreprocessing.ipynb's merge cells (14-17) by hand afterwards, once
 # every sample has both steps done -- merging needs every sample present at
 # once, so it isn't part of this per-sample script.
+#
+# N_JOBS overrides get_svg.py's --n-jobs (default 20 there) for one submission,
+# without editing this file -- e.g. for CRC_P11mm's outsized bin count:
+#   sbatch --export=ALL,N_JOBS=5 run_bin_pipeline.sbatch CRC_P11mm
 SLIDES=(CRC_P1 CRC_P2 CRC_P5 CRC_P6_5mm CRC_P11mm CRC_P11mm_2_cut CRC_P3_SMAP CRC_P4_SMAP Normal_P3 Normal_P5)
 SAMPLE="${1:-${SLIDES[$SLURM_ARRAY_TASK_ID]}}"
 
@@ -38,5 +42,5 @@ mkdir -p logs
 echo "=== $SAMPLE: bin preprocessing (load/QC/cluster/patch-assign) ==="
 python -u bin_preprocessing.py --sample "$SAMPLE"
 
-echo "=== $SAMPLE: get_svg.py --unit bin ==="
-python -u get_svg.py --sample "$SAMPLE" --unit bin
+echo "=== $SAMPLE: get_svg.py --unit bin (n-jobs=${N_JOBS:-20}) ==="
+python -u get_svg.py --sample "$SAMPLE" --unit bin --n-jobs "${N_JOBS:-20}"
