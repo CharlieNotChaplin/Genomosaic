@@ -116,7 +116,9 @@ gc.collect()
 ###################### Clustering ##############################
 ###############################################################
 
-sc.pp.normalize_total(count_area_filtered_adata, inplace=True)
+# fixed target_sum (not the per-sample median) so every sample lands on the same scale
+# before log1p -- see functions/label_transfer.py's own normalize_total(target_sum=1e4)
+sc.pp.normalize_total(count_area_filtered_adata, target_sum=1e4, inplace=True)
 sc.pp.log1p(count_area_filtered_adata)
 sc.pp.highly_variable_genes(count_area_filtered_adata, flavor="seurat", n_top_genes=2000)
 sc.pp.pca(count_area_filtered_adata)
