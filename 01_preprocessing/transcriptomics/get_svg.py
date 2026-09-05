@@ -33,6 +33,11 @@ parser.add_argument("--sample", required=True, help="Sample name")
 parser.add_argument("--unit", choices=["cell", "bin"], default="cell",
                      help="cell (StarDist nucleus, default -- unchanged behavior) or "
                           "bin (native/aggregated 8um grid bins, see BinPreprocessing.ipynb)")
+parser.add_argument("--n-jobs", type=int, default=20,
+                     help="parallel workers for spatial_autocorr's permutation test (default 20). "
+                          "Lower this for a sample whose worker gets SIGKILL'd/OOM-killed at the "
+                          "default -- e.g. CRC_P11mm's ~1.5M bins is far larger than any other "
+                          "sample and needs fewer, larger-memory-per-worker jobs.")
 args = parser.parse_args()
 
 
@@ -122,11 +127,11 @@ else:
 
 # based on neighborhood graph: get spatial autocorr
 print("Building spatial autocorr...")
-sq.gr.spatial_autocorr(count_area_filtered_adata, 
-                       mode="moran", 
+sq.gr.spatial_autocorr(count_area_filtered_adata,
+                       mode="moran",
                        genes=count_area_filtered_adata.var_names,
                        n_perms=1000,
-                       n_jobs=20,) # adapt to computing capabilities of machine
+                       n_jobs=args.n_jobs,) # adapt to computing capabilities of machine / sample size
 
 
 # store moran I result into var, aligned by gene name

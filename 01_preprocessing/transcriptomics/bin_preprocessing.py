@@ -1,14 +1,22 @@
 """
 Throwaway script version of BinPreprocessing.ipynb's per-sample steps (load ->
-QC -> clustering -> patch-assignment), so the bin pipeline can be driven
+patch-assignment -> QC -> clustering), so the bin pipeline can be driven
 per-sample from run_bin_pipeline.sbatch instead of running the notebook by
 hand for every sample. The notebook stays the source of truth for anything
 interactive (UMI-cutoff diagnostic plots, ad-hoc inspection) -- this script
 just applies umi_cutoff directly, no plotting.
 
+Patch assignment runs before QC/clustering (not after): a bin with no
+histology counterpart -- e.g. tissue Visium detected on-slide but never
+scanned into this sample's WSI, such as a slide holding several tissue pieces
+where only one was imaged (CRC_P11mm_2_cut) -- would otherwise get clustered
+together with completely unrelated tissue, skewing this sample's own Leiden
+clusters. Dropping those bins first means QC/clustering only ever sees the
+imaged region.
+
 Does NOT merge across samples (needs every sample's output to exist first) --
-run BinPreprocessing.ipynb's merge cells (14-17) by hand once this script
-(and get_svg.py --unit bin) have both been run for every sample.
+run BinPreprocessing.ipynb's merge cells by hand once this script (and
+get_svg.py --unit bin) have both been run for every sample.
 
 Usage:
     python bin_preprocessing.py --sample CRC_P1
@@ -23,7 +31,7 @@ import scanpy as sc
 
 sys.path.insert(0, str(Path("../..").resolve()))
 from functions.label_transfer import load_grid_bin_counts, aggregate_expression_to_grid, assign_bins_to_patches
-from functions.merge import read_h5ad_with_null_uns_healing, sanitize_uns
+from functions.merge import sanitize_uns
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--sample", required=True, help="Sample name, e.g. CRC_P1")
@@ -67,6 +75,31 @@ adata.var_names_make_unique()
 print(f"{sample}: {adata.n_obs} bins, {adata.n_vars} genes")
 
 ###############################################################
+###################### Patch assignment #########################
+###############################################################
+
+dir_histology = basedir / sample / "01_preprocessing/unimodel/metadata"
+patch_file = dir_histology / "filtered_WSI_patch_embeddings.h5ad"
+if not patch_file.exists():
+    print(f"{sample}: no filtered_WSI_patch_embeddings.h5ad yet -- skipping patch assignment (all bins kept).")
+else:
+    adata_patches = sc.read_h5ad(patch_file)
+    tissue_positions = pd.DataFrame(
+        {"pxl_col_in_fullres": adata.obsm["spatial"][:, 0],
+         "pxl_row_in_fullres": adata.obsm["spatial"][:, 1]},
+        index=adata.obs_names,
+    )
+    patch_ids = assign_bins_to_patches(tissue_positions, adata_patches.obs)
+    adata.obs["Patch_ID"] = patch_ids.reindex(adata.obs_names)
+
+    n_missing = adata.obs["Patch_ID"].isna().sum()
+    print(f"{sample}: {n_missing}/{adata.n_obs} bins got no Patch_ID (outside any extracted patch) -- dropping them")
+    # A bin with no Patch_ID can never be paired for the histology-transcriptomics
+    # objective this bin-level output exists for -- drop it here, before QC/clustering,
+    # so it can't dilute either.
+    adata = adata[adata.obs["Patch_ID"].notna()].copy()
+
+###############################################################
 ###################### QC (UMI count only) #####################
 ###############################################################
 
@@ -94,35 +127,10 @@ sc.pp.neighbors(count_area_filtered_adata)
 sc.tl.leiden(count_area_filtered_adata, resolution=0.2, key_added="clusters",
              flavor="igraph", n_iterations=2, directed=False)
 
+stray_nones = sanitize_uns(count_area_filtered_adata)
+if stray_nones:
+    print(f"{sample}: sanitized stray null uns entries before saving: {stray_nones}")
 count_area_filtered_adata.write(dir_custom_binning / "count_area_filtered_adata.h5ad")
 print(f"{sample}: wrote {dir_custom_binning / 'count_area_filtered_adata.h5ad'}")
-
-###############################################################
-###################### Patch assignment #########################
-###############################################################
-
-dir_histology = basedir / sample / "01_preprocessing/unimodel/metadata"
-patch_file = dir_histology / "filtered_WSI_patch_embeddings.h5ad"
-if not patch_file.exists():
-    print(f"{sample}: no filtered_WSI_patch_embeddings.h5ad yet -- skipping patch assignment.")
-else:
-    adata_patches = sc.read_h5ad(patch_file)
-    bin_adata = read_h5ad_with_null_uns_healing(dir_custom_binning / "count_area_filtered_adata.h5ad")
-
-    tissue_positions = pd.DataFrame(
-        {"pxl_col_in_fullres": bin_adata.obsm["spatial"][:, 0],
-         "pxl_row_in_fullres": bin_adata.obsm["spatial"][:, 1]},
-        index=bin_adata.obs_names,
-    )
-    patch_ids = assign_bins_to_patches(tissue_positions, adata_patches.obs)
-    bin_adata.obs["Patch_ID"] = patch_ids.reindex(bin_adata.obs_names)
-
-    n_missing = bin_adata.obs["Patch_ID"].isna().sum()
-    print(f"{sample}: {n_missing}/{bin_adata.n_obs} bins got no Patch_ID (outside any extracted patch)")
-
-    stray_nones = sanitize_uns(bin_adata)
-    if stray_nones:
-        print(f"{sample}: sanitized stray null uns entries before saving: {stray_nones}")
-    bin_adata.write(dir_custom_binning / "count_area_filtered_adata.h5ad")
 
 print(f"{sample}: bin preprocessing done.")
