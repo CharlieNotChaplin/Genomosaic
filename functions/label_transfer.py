@@ -64,6 +64,11 @@ EXCLUDE_DIRS = {"new", "CRC_P_Mixed", "combined", REFERENCE_SAMPLE}
 SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_002um"
 GRID_SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_008um"
 TOKEN_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/WSI_patch_token_embeddings_filtered.h5ad"
+# Matches 03_integration/autoencoders/scripts/token_preprocessing.py's own TOKEN_SIZE_PX --
+# both read the same file above, where obs/Token_X, obs/Token_Y are each raw ViT token's
+# top-left pixel corner (not its center), so a token's own box is
+# [Token_X, Token_X+TOKEN_SIZE_PX) x [Token_Y, Token_Y+TOKEN_SIZE_PX).
+TOKEN_SIZE_PX = 14.0
 PATCH_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/filtered_WSI_patch_embeddings.h5ad"
 
 # Defaults for main()'s keyword parameters below -- used by plain
@@ -435,49 +440,91 @@ def aggregate_tokens_to_grid(
     return out
 
 
+def _rect_overlap_area(cx1, cy1, cx2, cy2, bx1, by1, bx2, by2):
+    """Exact overlap area between one axis-aligned box ([cx1,cx2) x [cy1,cy2))
+    and an array of axis-aligned boxes ([bx1,bx2) x [by1,by2)). 0 where they
+    don't overlap -- no shapely needed, both shapes here are rectangles."""
+    ox = np.clip(np.minimum(cx2, bx2) - np.maximum(cx1, bx1), 0, None)
+    oy = np.clip(np.minimum(cy2, by2) - np.maximum(cy1, by1), 0, None)
+    return ox * oy
+
+
 def aggregate_tokens_to_grid_footprint_halo(
-    sample: str, bin_coords: np.ndarray, inner_radius_px: float, halo_width_px: float,
+    sample: str, bin_coords: np.ndarray, half_side_px: float, halo_width_px: float,
     data_dir: Path = DATA_DIR, batch_size: int = 20_000,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Footprint+halo analogue of aggregate_tokens_to_grid, mirroring
-    03_integration/autoencoders/scripts/token_preprocessing.py's per-cell
-    footprint (nucleus polygon) / halo (dilated ring around it) split -- but a
-    bin has no polygon, just a center point and a fixed physical size, so
-    footprint/halo become two concentric radii around that center instead of
-    two shapely geometries.
+    03_integration/autoencoders/scripts/token_preprocessing.py's per-cell exact
+    area-weighted overlap (compute_cell_token_features) rather than the
+    coarser circular-radius approximation aggregate_tokens_to_grid itself
+    uses. A bin's footprint IS a known axis-aligned square (2*half_side_px per
+    side, centered on bin_coords), and each raw ViT token is itself a known
+    axis-aligned TOKEN_SIZE_PX square -- so, unlike a nucleus's irregular
+    polygon, both shapes here are rectangles and their exact overlap area is
+    closed-form (see _rect_overlap_area), no shapely needed.
 
-    footprint: mean raw ViT token embedding within inner_radius_px of a bin's
-      center (this bin's own tissue -- the role a nucleus polygon plays for a
+    footprint: weighted mean token embedding, weights = exact overlap area
+      between each candidate token's box and the bin's own half_side_px
+      square (this bin's own tissue -- the role a nucleus polygon plays for a
       cell).
-    halo: mean embedding of tokens in the ring [inner_radius_px,
-      inner_radius_px + halo_width_px) around the center (immediate
-      surrounding context -- the role the dilated ring plays for a cell).
-    matched: True iff any token fell within the OUTER radius at all (mirrors
-      compute_cell_token_features's semantics: False means "no token data
-      anywhere nearby", not "none in the inner circle specifically").
+    halo: weighted mean embedding of the same candidates, using overlap area
+      against the [half_side_px, half_side_px + halo_width_px) square ring
+      instead -- computed as outer-box overlap minus inner-box overlap
+      (exact, since the inner square is a subset of the outer one), rather
+      than constructing the ring shape itself.
+    matched: True iff any token's box overlaps the OUTER square at all
+      (mirrors compute_cell_token_features's semantics: False means "no
+      token data anywhere nearby", not "none in the footprint specifically").
 
-    Fallbacks mirror aggregate_tokens_to_grid's own (nearest-single-token,
-    folded into the same averaging code by substituting a 1-element neighbor
-    list before the batch read), applied per radius:
-      - inner circle empty, ring non-empty -> footprint falls back to the
-        single nearest token (guaranteed to already be a member of the
-        non-empty outer list, since the globally nearest token can be no
-        farther than any point already found within the outer radius).
-      - ring empty (outer == inner), inner non-empty -> halo falls back to
-        the footprint value itself, the same neutral fallback
-        compute_cell_token_features uses when its halo ring has zero
-        overlap -- not a second nearest-token lookup.
-      - both empty -> footprint and halo both fall back to the single
-        nearest token (matched=False).
+    Fallbacks mirror compute_cell_token_features's own (nearest single token
+    by center-to-center distance):
+      - footprint weights all zero, ring non-empty -> footprint falls back to
+        the nearest-by-distance candidate already fetched for this bin
+        (guaranteed present, since a non-empty ring means some candidate
+        overlaps the outer square).
+      - ring weights all zero (outer == inner overlap), footprint non-zero ->
+        halo falls back to the footprint value itself, the same neutral
+        fallback compute_cell_token_features uses when its halo ring has
+        zero overlap.
+      - no candidate overlaps the outer square at all -> both footprint and
+        halo fall back to the single globally-nearest token (matched=False),
+        found via an unrestricted tree query since the nearest token isn't
+        guaranteed to be among this bin's (padded, but still finite) window.
 
     Builds ONE cKDTree over the whole slide's tokens (same as
-    aggregate_tokens_to_grid) and queries it at both radii per batch, still
-    reading each batch's needed token rows off disk in one indexed call.
+    aggregate_tokens_to_grid). Candidates are narrowed per batch via a
+    Chebyshev (p=inf) query -- an axis-aligned square window, matching this
+    function's own rectangular geometry exactly, unlike a circular ball --
+    padded by TOKEN_SIZE_PX beyond the outer square's own half-width so no
+    token whose box could overlap it is ever missed (Token_X/Token_Y is a
+    token's corner, not its center, hence the padding). Exact overlap area is
+    then computed only for that small candidate set; any tokens the padding
+    pulled in beyond the true outer square simply get zero weight.
+
+    The whole batch is processed as one flat (bin, candidate) pair array,
+    weighted via a sparse (bins x unique_candidate_tokens) matrix multiplied
+    against the batch's token embeddings -- mirrors aggregate_expression_by_
+    patch's own sparse-indicator @ X pattern below. This avoids a Python loop
+    per bin (too slow at hundreds of thousands of bins) while also avoiding a
+    dense (n_bins, max_candidates, token_dim) tensor, which would be many GB
+    at a token_dim of 1536.
+
+    bin_coords is processed in row-major spatial order internally (then
+    un-sorted back before returning, so output order still matches the input)
+    -- bins are NOT already spatially contiguous by the time this is called
+    (merge/QC/Leiden reordering upstream), so a batch of "the next batch_size
+    rows" can otherwise scatter across the whole slide with almost no window
+    overlap between bins. Sorting first means each batch's bins are actually
+    near each other, so their candidate windows overlap heavily and dedup
+    (see all_idx below) shrinks the per-batch token read/matmul by 3-4x.
     """
     path = data_dir / TOKEN_METADATA_TEMPLATE.format(sample)
     bin_coords = np.asarray(bin_coords)[:, :2]
-    outer_radius_px = inner_radius_px + halo_width_px
+    order = np.lexsort((bin_coords[:, 0], bin_coords[:, 1]))
+    bin_coords = bin_coords[order]
+    outer_half_px = half_side_px + halo_width_px
+    candidate_half_px = outer_half_px + TOKEN_SIZE_PX
 
     with h5py.File(path, "r") as f:
         tok_x = f["obs/Token_X"][:].astype(np.float64)
@@ -493,39 +540,85 @@ def aggregate_tokens_to_grid_footprint_halo(
 
         for start in range(0, n, batch_size):
             batch = bin_coords[start : start + batch_size]
-            inner_lists = tree.query_ball_point(batch, r=inner_radius_px)
-            outer_lists = tree.query_ball_point(batch, r=outer_radius_px)
-            batch_matched = [len(nb) > 0 for nb in outer_lists]
+            b = len(batch)
+            # Chebyshev ball (p=inf) = axis-aligned square window.
+            candidate_lists = tree.query_ball_point(batch, r=candidate_half_px, p=np.inf)
 
-            empty_outer = [i for i, nb in enumerate(outer_lists) if len(nb) == 0]
-            if empty_outer:
-                _, nearest = tree.query(batch[empty_outer])
-                for j, i in enumerate(empty_outer):
-                    outer_lists[i] = [int(nearest[j])]
-                    inner_lists[i] = [int(nearest[j])]
+            lengths = np.fromiter((len(c) for c in candidate_lists), dtype=np.int64, count=b)
+            bin_idx = np.repeat(np.arange(b), lengths)
+            tok_idx = np.fromiter(
+                (idx for c in candidate_lists for idx in c), dtype=np.int64, count=int(lengths.sum())
+            )
 
-            empty_inner = [i for i, nb in enumerate(inner_lists) if len(nb) == 0 and len(outer_lists[i]) > 0]
-            if empty_inner:
-                _, nearest = tree.query(batch[empty_inner])
-                for j, i in enumerate(empty_inner):
-                    inner_lists[i] = [int(nearest[j])]
+            footprint_b = np.zeros((b, n_dims), dtype=np.float32)
+            halo_b = np.zeros((b, n_dims), dtype=np.float32)
+            matched_b = np.zeros(b, dtype=bool)
 
-            # h5py fancy indexing needs sorted unique indices -- read this
-            # batch's needed rows in one indexed call, small enough to hold
-            # in memory, then average per-bin from that slice.
-            all_idx = np.unique(np.concatenate([np.asarray(nb, dtype=np.int64) for nb in outer_lists]))
-            sub_emb = f["X"][all_idx].astype(np.float32)
-            row_of = {idx: pos for pos, idx in enumerate(all_idx)}
+            if tok_idx.size:
+                tok_xy = tree.data[tok_idx]
+                cx, cy = batch[bin_idx, 0], batch[bin_idx, 1]
 
-            for i, (inner, outer) in enumerate(zip(inner_lists, outer_lists)):
-                gi = start + i
-                matched[gi] = batch_matched[i]
-                footprint[gi] = sub_emb[[row_of[idx] for idx in inner]].mean(axis=0)
-                ring = [idx for idx in outer if idx not in set(inner)]
-                halo[gi] = sub_emb[[row_of[idx] for idx in ring]].mean(axis=0) if ring else footprint[gi]
-            del sub_emb
+                outer_w = _rect_overlap_area(
+                    cx - outer_half_px, cy - outer_half_px, cx + outer_half_px, cy + outer_half_px,
+                    tok_xy[:, 0], tok_xy[:, 1], tok_xy[:, 0] + TOKEN_SIZE_PX, tok_xy[:, 1] + TOKEN_SIZE_PX,
+                )
+                inner_w = _rect_overlap_area(
+                    cx - half_side_px, cy - half_side_px, cx + half_side_px, cy + half_side_px,
+                    tok_xy[:, 0], tok_xy[:, 1], tok_xy[:, 0] + TOKEN_SIZE_PX, tok_xy[:, 1] + TOKEN_SIZE_PX,
+                )
+                ring_w = outer_w - inner_w
 
-    return footprint, halo, matched
+                outer_sum = np.bincount(bin_idx, weights=outer_w, minlength=b)
+                inner_sum = np.bincount(bin_idx, weights=inner_w, minlength=b)
+                ring_sum = outer_sum - inner_sum
+                matched_b = outer_sum > 0
+
+                all_idx, col_pos = np.unique(tok_idx, return_inverse=True)
+                sub_emb = f["X"][all_idx].astype(np.float32)
+
+                w_inner = sparse.coo_matrix((inner_w, (bin_idx, col_pos)), shape=(b, len(all_idx))).tocsr()
+                w_ring = sparse.coo_matrix((ring_w, (bin_idx, col_pos)), shape=(b, len(all_idx))).tocsr()
+                footprint_raw = np.asarray(w_inner @ sub_emb)
+                halo_raw = np.asarray(w_ring @ sub_emb)
+
+                safe_inner = np.where(inner_sum > 0, inner_sum, 1.0)[:, None]
+                safe_ring = np.where(ring_sum > 0, ring_sum, 1.0)[:, None]
+                footprint_b = (footprint_raw / safe_inner).astype(np.float32)
+                halo_b = np.where(ring_sum[:, None] > 0, halo_raw / safe_ring, footprint_b).astype(np.float32)
+
+                # Fallback: matched but footprint empty (no candidate overlaps
+                # the bin's own inner square) -> nearest-by-center-distance
+                # candidate, already guaranteed present since matched_b=True.
+                need_fallback = matched_b & (inner_sum == 0)
+                if need_fallback.any():
+                    tok_cx = tok_xy[:, 0] + TOKEN_SIZE_PX / 2
+                    tok_cy = tok_xy[:, 1] + TOKEN_SIZE_PX / 2
+                    dist2 = (tok_cx - cx) ** 2 + (tok_cy - cy) ** 2
+                    for i in np.nonzero(need_fallback)[0]:
+                        nearest_local = np.argmin(np.where(bin_idx == i, dist2, np.inf))
+                        footprint_b[i] = sub_emb[col_pos[nearest_local]]
+                        if ring_sum[i] == 0:
+                            halo_b[i] = footprint_b[i]
+
+            # Fallback: no candidate overlaps the outer square at all -> single
+            # globally-nearest token (unrestricted query, since the nearest
+            # token isn't guaranteed to be inside this batch's candidate window).
+            not_matched = np.nonzero(~matched_b)[0]
+            if not_matched.size:
+                _, nearest_global = tree.query(batch[not_matched])
+                nearest_global = np.atleast_1d(nearest_global)
+                uniq_g, pos_g = np.unique(nearest_global, return_inverse=True)
+                vals = f["X"][uniq_g].astype(np.float32)[pos_g]
+                footprint_b[not_matched] = vals
+                halo_b[not_matched] = vals
+
+            footprint[start : start + b] = footprint_b
+            halo[start : start + b] = halo_b
+            matched[start : start + b] = matched_b
+
+    # Undo the row-major sort so output order matches the original bin_coords.
+    unorder = np.argsort(order)
+    return footprint[unorder], halo[unorder], matched[unorder]
 
 
 def aggregate_expression_by_patch(bin_adata: ad.AnnData, bin_to_patch: pd.Series) -> ad.AnnData:
