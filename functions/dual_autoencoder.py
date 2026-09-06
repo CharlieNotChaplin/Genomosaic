@@ -251,10 +251,33 @@ def get_gene_mask(trans_adata, gene_selection="svg"):
         raise ValueError(f"Unsupported gene_selection: {gene_selection!r}. Choose from 'svg', 'hvg', 'intersection'.")
 
 
-def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delaunay=False, percentile=95.0):
-    """Uses squidpy so that neighbors are only ever formed within a sample."""
-    
-    if delaunay:
+def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delaunay=False, percentile=95.0, grid=False):
+    """Uses squidpy so that neighbors are only ever formed within a sample.
+
+    grid: True for bin units (a regular 8um lattice) -- uses squidpy's dedicated
+      grid builder (same one get_svg.py's --unit bin path uses for its own Moran's I
+      graph) instead of a generic Euclidean KNN/Delaunay search, since it reasons
+      about the lattice directly rather than approximating it. n_neighs=8 (not the
+      default 6, tuned for hexagonal Visium spots) gives the full Moore/queen
+      neighborhood (4 orthogonal + 4 diagonal) for a square lattice -- there's a
+      clean distance gap before the 9th-nearest point, so 8 is unambiguous. Takes
+      priority over delaunay (mutually exclusive: a unit is either irregular
+      nuclei or a regular bin grid, never both).
+    delaunay: True for cell/nuclei units -- matches get_svg.py's own cell-path
+      choice (coord_type="generic", delaunay=True) for the same irregularly-
+      spaced points, rather than an arbitrary fixed-k cutoff. Long boundary edges
+      are pruned beyond the `percentile`-th distance, same as get_svg.py relies on
+      implicitly via squidpy's default pruning.
+    """
+    if grid:
+        # Grid graph within each library slide (regular lattice, e.g. 8um bins)
+        sq.gr.spatial_neighbors_grid(
+            trans_adata,
+            spatial_key="spatial",
+            library_key=library_key,
+            n_neighs=n_neighs,
+        )
+    elif delaunay:
         # Delaunay triangulation within each library slide
         sq.gr.spatial_neighbors_delaunay(
             trans_adata,
@@ -1539,7 +1562,9 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
         print(f"  SVG mask: {svg_mask.sum()} genes")
 
     conn = build_spatial_graph(f_trans_adata, library_key="Slide_ID",
-                                n_neighs=CONFIG["n_neighs"], delaunay=False)
+                                n_neighs=CONFIG["n_neighs"],
+                                delaunay=CONFIG.get("spatial_graph_delaunay", True),
+                                grid=CONFIG.get("spatial_graph_grid", False))
 
     keep_mask, patch_row_trans, hist_emb = build_pairing(f_trans_adata, f_hist_adata)
 

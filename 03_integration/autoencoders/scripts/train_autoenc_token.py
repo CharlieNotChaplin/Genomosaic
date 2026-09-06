@@ -51,6 +51,7 @@ CONFIG = dict(
     bin_size="002um",
     dir_cellseg="cell_seg_stardist",  # in case of multiple cell segmentation methods
     loss_fct="ntxent",                # optional: ntxent, cosine
+    token_filename="cell_token_embeddings.h5ad",  # "bin_token_embeddings.h5ad" for bins
 
     # model
     latent_dim=64,                      # latent dim for encoders
@@ -58,7 +59,12 @@ CONFIG = dict(
     encoder="transconv",                # sage or transconv for transcriptomics encoding
 
     # graph / batching
-    n_neighs=6,                         # how many neighbors in knn spatial graph of cells
+    # n_neighs: 6 for the (unused-by-default) KNN fallback; 8 for spatial_graph_grid=True
+    # (bins -- full Moore/queen neighborhood of a square lattice, see build_spatial_graph).
+    # Irrelevant when spatial_graph_delaunay=True (nuclei default), which uses percentile instead.
+    n_neighs=6,
+    spatial_graph_delaunay=True,  # nuclei/cells: matches get_svg.py's own cell-path choice
+    spatial_graph_grid=False,     # bins: set True (with n_neighs=8) for a regular 8um lattice
     num_neighbors=(10, 10),
     patches_per_batch=64,
     max_cells_per_patch=64,
@@ -140,18 +146,24 @@ print("Writing outputs to:", dir_output)
 # ---- load transcriptomics + patch histology (histology only for cell<->patch pairing) ----
 f_hist_adata = sc.read_h5ad(dir_histology / "filtered_WSI_patch_embeddings.h5ad")
 f_trans_adata = ad.read_h5ad(dir_transcriptomics / "count_area_filtered_adata.h5ad")
-f_trans_coord = gpd.read_parquet(dir_transcriptomics / "nuclei_geometry.parquet")
+# Bins have no geometry side-car (obsm['spatial'] is already populated directly at
+# load time) -- extract_cell_xy already prioritizes obsm['spatial'] over f_trans_coord,
+# so None here is a safe, fully-supported fallback, not a degraded path.
+_geom_path = dir_transcriptomics / "nuclei_geometry.parquet"
+f_trans_coord = gpd.read_parquet(_geom_path) if _geom_path.exists() else None
 
 if CONFIG["sample"] == "combined":
     pass
 elif isinstance(CONFIG["sample"], str):
     f_hist_adata = f_hist_adata[f_hist_adata.obs["Slide_ID"] == CONFIG["sample"]]
     f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"] == CONFIG["sample"]]
-    f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"] == CONFIG["sample"]]
+    if f_trans_coord is not None:
+        f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"] == CONFIG["sample"]]
 elif isinstance(CONFIG["sample"], (list, tuple)):
     f_hist_adata = f_hist_adata[f_hist_adata.obs["Slide_ID"].isin(CONFIG["sample"])]
     f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].isin(CONFIG["sample"])]
-    f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(CONFIG["sample"])]
+    if f_trans_coord is not None:
+        f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(CONFIG["sample"])]
 print("Training on slides:", sorted(f_trans_adata.obs["Slide_ID"].unique().tolist()))
 
 trans_global_id = f_trans_adata.obs["Slide_ID"].astype(str) + "_" + f_trans_adata.obs["id"].astype(str)
@@ -165,14 +177,15 @@ if not hist_global_id.is_unique:
 f_hist_adata.obs = f_hist_adata.obs.set_index(hist_global_id)
 
 # ---- load token data --------------------------------------------------
-# Loads each in-scope slide's cell_token_embeddings.h5ad (from token_preprocessing.py),
-# concatenates them, and -- if some in-scope slides don't have token data yet --
-# restricts training to the slides that do (rather than silently zero-filling,
-# which would let the model learn "zero vector = slide X" as a shortcut).
+# Loads each in-scope slide's token embeddings (CONFIG["token_filename"] -- cell or
+# bin, from token_preprocessing.py / bin_token_preprocessing.py), concatenates them,
+# and -- if some in-scope slides don't have token data yet -- restricts training to
+# the slides that do (rather than silently zero-filling, which would let the model
+# learn "zero vector = slide X" as a shortcut).
 slides_needed = sorted(f_trans_adata.obs["Slide_ID"].astype(str).unique())
 token_adatas, slides_with_tokens = [], []
 for s in slides_needed:
-    p = basedir / s / "01_preprocessing/unimodel/metadata/cell_token_embeddings.h5ad"
+    p = basedir / s / "01_preprocessing/unimodel/metadata" / CONFIG["token_filename"]
     if p.exists():
         token_adatas.append(sc.read_h5ad(p))
         slides_with_tokens.append(s)
@@ -184,7 +197,8 @@ if missing:
     print(f"Restricting to slides with token data: {slides_with_tokens} (dropping {missing})")
     f_hist_adata = f_hist_adata[f_hist_adata.obs["Slide_ID"].isin(slides_with_tokens)].copy()
     f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].astype(str).isin(slides_with_tokens)].copy()
-    f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
+    if f_trans_coord is not None:
+        f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
 if not token_adatas:
     raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py first")
 
@@ -203,7 +217,9 @@ svg_mask = get_svg_union_mask(f_trans_adata)
 print(f"{svg_mask.sum()} SVGs selected (union)")
 
 print("2. building spatial graph")
-conn = build_spatial_graph(f_trans_adata, library_key="Slide_ID", n_neighs=CONFIG["n_neighs"], delaunay=False)
+conn = build_spatial_graph(f_trans_adata, library_key="Slide_ID", n_neighs=CONFIG["n_neighs"],
+                            delaunay=CONFIG.get("spatial_graph_delaunay", True),
+                            grid=CONFIG.get("spatial_graph_grid", False))
 
 print("3. pairing")
 keep_mask, patch_row_trans, hist_emb = build_pairing(f_trans_adata, f_hist_adata)
