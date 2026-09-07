@@ -193,10 +193,8 @@ cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=100)
 
 print("6. pyg")
 data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
-patch_to_nodes = build_patch_to_nodes(data.patch_row)
-loader = PatchGroupedLoader(
-    data, patch_to_nodes, patch_meta["slide_id"],
-    num_neighbors=(10, 10), patches_per_batch=64, max_cells_per_patch=64,
+loader = SlideStratifiedLoader(
+    data, data.slide_code, num_neighbors=(10, 10), cells_per_batch=1024,
 )
 
 hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)

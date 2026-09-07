@@ -74,8 +74,15 @@ def run_it(held_out_slide="CRC_P1"):
         spatial_graph_delaunay=True,  # nuclei/cells: matches get_svg.py's own cell-path choice
         spatial_graph_grid=False,     # bins: set True (with n_neighs=8) for a regular 8um lattice
         num_neighbors=(10, 10),
-        patches_per_batch=64,
-        max_cells_per_patch=64,
+        # Seed cells drawn uniformly at random per slide (SlideStratifiedLoader),
+        # not grouped by shared histology-patch membership -- the patch-level
+        # pooled contrastive loss that grouping existed for is gone; reconstruction
+        # weighting and the cell<->token contrastive term are already per-cell,
+        # needing only a per-cell patch-weight lookup. ~1024 was old batches'
+        # typical realized size (64 patches x a few cells/patch each, rarely
+        # hitting the old 64-cell-per-patch cap) -- a starting point, re-tune
+        # against actual throughput/GPU memory now that it's a direct cap.
+        cells_per_batch=1024,
 
         # loss
         temperature=0.07,
@@ -104,23 +111,29 @@ def run_it(held_out_slide="CRC_P1"):
         max_local_contrast_weight=1.0,   # winner of run_token_sweep.py's 18-config sweep
         local_warmup_epochs=10,
 
-        # Caps CRC_P11mm's per-epoch batch share: PatchGroupedLoader allocates batches
-        # proportional to each slide's own patch count, and CRC_P11mm's 29,959 (vs.
-        # 8,063-10,983 elsewhere) dominated every epoch. 11000 sits just above the next
-        # largest slide -- a no-op for everyone except CRC_P11mm. None = uncapped.
+        # Caps CRC_P11mm's per-epoch batch share: SlideStratifiedLoader allocates
+        # batches proportional to each slide's own (capped) cell count, and
+        # CRC_P11mm was the outsized slide under the old patch-count accounting
+        # (29,959 patches vs. 8,063-10,983 elsewhere). This value was carried over
+        # unchanged from the patch-count cap and now caps CELL count instead --
+        # cell:patch ratios were never uniform across slides, so re-check this
+        # against actual per-slide cell counts (printed at pipeline build time)
+        # before trusting it's still "just above the next-largest slide" the way
+        # the old value was. None = uncapped.
         # (Tried fully EXCLUDING CRC_P11mm instead: reduced leakage and ~doubled in-sample
         # fit, but held-out generalization stayed flat and the train/held-out gap widened
         # -- an overfitting signature, not a fix. Capping is the better tradeoff.)
-        max_patches_per_slide=11000,
+        max_cells_per_slide=11000,
 
         # Boosts the 2 normal slides' per-epoch exposure: evaluate_disease_signal showed
         # the model doesn't reliably generalize "normal tissue" to a second unseen normal
         # patient (Normal_P5 stayed near chance even after rebalancing the diagnostic
-        # classifier, unlike Normal_P3). Each normal slide is a typical size on its own
-        # (~8,000 patches) but only 2 exist vs. 8 tumor slides, so combined exposure is
-        # ~16,400 vs. ~96,000. 24000/slide (~3x) roughly balances the two classes per
-        # epoch -- a starting point, not tuned. Resampling real cells with replacement
-        # (see PatchGroupedLoader.oversample_target), not synthetic augmentation.
+        # classifier, unlike Normal_P3). Values carried over unchanged from the old
+        # patch-count targets and now set CELL-count targets instead -- same caveat as
+        # max_cells_per_slide above, re-tune against actual per-slide cell counts rather
+        # than assuming this is still "~3x" a normal slide's natural size. Resampling
+        # real cells with replacement (see SlideStratifiedLoader.oversample_target), not
+        # synthetic augmentation.
         oversample_slides={"Normal_P3": 24000, "Normal_P5": 24000},
     )
 
@@ -230,8 +243,8 @@ def run_it(held_out_slide="CRC_P1"):
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
         _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
-    if CONFIG.get("max_patches_per_slide") is not None:
-        _tag_parts.append(f"cap{CONFIG['max_patches_per_slide']}")
+    if CONFIG.get("max_cells_per_slide") is not None:
+        _tag_parts.append(f"cap{CONFIG['max_cells_per_slide']}")
     if CONFIG.get("oversample_slides"):
         _tag_parts.append("oversample_normal")
     RUN_TAG = ("_" + "_".join(_tag_parts)) if _tag_parts else ""

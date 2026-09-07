@@ -309,9 +309,11 @@ def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delauna
 def build_pairing(trans_adata, hist_adata, trans_patch_col="Patch_ID", hist_patch_col="Patch_ID",
                    slide_col="Slide_ID"):
     """
-    Matches each nucleus to the histology patch it falls in -- shared batching
-    infrastructure (PatchGroupedLoader groups cells by patch regardless of
-    whether a patch-level embedding is trained on), not itself patch-branch-only.
+    Matches each nucleus to the histology patch it falls in -- still needed even
+    with per-cell random batching (SlideStratifiedLoader), since patch_row_trans
+    is what `compute_patch_metadata` uses to build the per-cell reconstruction-
+    loss density weight (patch_meta["weight"], looked up via data.patch_row in
+    train_step), not itself patch-branch-only.
 
     Returns:
       keep_mask: (n_trans,) bool array, nuclei with a matching histology patch
@@ -539,83 +541,85 @@ def build_pyg_data(X_svg, conn, patch_row_trans, slide_codes):
     return data
  
  
-def build_patch_to_nodes(patch_row_tensor):
-    """dict: global patch_row id -> LongTensor of node indices belonging to that patch."""
-    patch_row_np = patch_row_tensor.numpy()
-    order = np.argsort(patch_row_np, kind="stable")
-    sorted_patches = patch_row_np[order]
-    unique_patches, start_idx = np.unique(sorted_patches, return_index=True)
-    groups = np.split(order, start_idx[1:])
-    return {int(p): torch.tensor(g, dtype=torch.long) for p, g in zip(unique_patches, groups)}
- 
- 
-class PatchGroupedLoader:
+class SlideStratifiedLoader:
     """
-    Groups cells by patch so each mini-batch contains complete (or capped) patches,
-    instead of the arbitrary partial patches a plain node-level NeighborLoader would
-    produce -- needed for patch-level pooling/contrastive alignment to be meaningful.
+    Slide-stratified random mini-batch loader: seed cells are drawn uniformly at
+    random per slide (batches are never mixed across slides -- see
+    `patch_level_infonce`'s `slide_ids` masking for why that matters), then
+    expanded via `NeighborLoader`'s standard k-hop neighbor sampling for message
+    passing.
 
-    Batches are SLIDE-STRATIFIED (never mixed): otherwise the patch-level contrastive
-    loss can shortcut via slide/scan identity instead of genuine morphology-
-    transcriptomics correspondence. See `patch_level_infonce`'s `slide_ids` masking
-    for a second, independent safeguard.
+    Supersedes the earlier `PatchGroupedLoader`, which grouped seed cells by
+    shared histology-patch membership so a (since-removed) patch-level pooled
+    contrastive loss saw complete patches per batch. That constraint no longer
+    applies: the token/cell contrastive term (`patch_level_infonce` called on
+    `p_trans_local`/`p_token` in `train_step`) and the cell reconstruction loss
+    are already both genuinely per-cell, needing only a per-cell patch-weight
+    LOOKUP (via `data.patch_row`, see `train_step`) rather than patch-complete
+    batches. Plain per-slide random seed sampling is simpler, and gives more
+    spatially diverse (less clustered, so less frequently excluded by
+    `neighbor_radius` masking) in-batch negatives for the contrastive term
+    besides.
 
-    Reuses NeighborLoader's subgraph sampling via `collate_fn`, driving the seed-node
-    groups ourselves. Relies on `collate_fn(index)` being directly callable with an
-    arbitrary index tensor (standard in recent PyG); if that breaks, fall back to a
-    fresh `NeighborLoader(data, input_nodes=seed_nodes, batch_size=len(seed_nodes))`
-    per group.
+    Reuses NeighborLoader's subgraph sampling via `collate_fn`, driving the
+    seed-node groups ourselves. Relies on `collate_fn(index)` being directly
+    callable with an arbitrary index tensor (standard in recent PyG); if that
+    breaks, fall back to a fresh
+    `NeighborLoader(data, input_nodes=seed_nodes, batch_size=len(seed_nodes))`
+    per batch.
     """
 
-    def __init__(self, data, patch_to_nodes, patch_slide_id, num_neighbors=(10, 10),
-                 patches_per_batch=16, max_cells_per_patch=64, shuffle=True,
-                 max_patches_per_slide=None, oversample_target=None):
+    def __init__(self, data, slide_codes, num_neighbors=(10, 10), cells_per_batch=512,
+                 shuffle=True, max_cells_per_slide=None, oversample_target=None):
         """
-        max_patches_per_slide: caps how many of a slide's OWN patches feed into batches
-          per epoch (None = no cap). __len__/__iter__ give each slide a batch count
-          proportional to its own patch count, so an outsized slide (e.g. CRC_P11mm at
-          29,959 vs. 8,063-10,983 elsewhere) would dominate every epoch's gradient
-          updates; capping truncates its (reshuffled) list before chunking, so a
-          different random subset is used each epoch and the full pool still gets
-          exposure over time, just not all at once.
+        slide_codes: LongTensor, one entry per node in `data`, aligned with
+          `data.x` (i.e. `data.slide_code`) -- used to group node indices by
+          slide up front.
 
-        oversample_target: dict[int, int], slide code -> minimum patch draws per epoch
-          (WITH replacement) -- the mirror-image problem to max_patches_per_slide: too
-          FEW slides of a class rather than one slide too big (e.g. 2 normal vs. 8
-          tumor slides here, each individually a normal size). A slide below its target
-          gets padded via random.choices from its own real patches (not synthetic data;
-          still passes through this loader's per-batch subsampling and the model's
-          dropout, so repeats aren't identical training examples). Applied after
-          max_patches_per_slide. None (default) leaves a slide at its natural count.
+        max_cells_per_slide / oversample_target: direct cell-count analogues of
+        `PatchGroupedLoader`'s same-named patch-count parameters. max_cells_per_slide
+        caps how many of a slide's own cells feed into batches per epoch (None =
+        no cap); __len__/__iter__ give each slide a batch count proportional to
+        its own (capped) cell count, so an outsized slide doesn't dominate every
+        epoch's gradient updates -- capping truncates its (reshuffled) pool before
+        chunking, so a different random subset is used each epoch and the full
+        pool still gets exposure over time, just not all at once.
+
+        oversample_target: dict[int, int], slide code -> minimum cell draws per
+          epoch (WITH replacement) -- the mirror-image problem to
+          max_cells_per_slide: too FEW slides of a class rather than one slide
+          too big. A slide below its target gets padded via `np.random.choice`
+          from its own real cells (not synthetic data). Applied after
+          max_cells_per_slide. None (default) leaves a slide at its natural count.
+
+        Both caps carry over the same rationale as before, but now operate on
+        cell counts directly instead of patch counts as a proxy -- re-derive the
+        numeric targets against actual per-slide cell counts rather than
+        assuming the old patch-based values transfer unchanged.
         """
-        self.patch_to_nodes = patch_to_nodes
-        self.patches_per_batch = patches_per_batch
-        self.max_cells_per_patch = max_cells_per_patch
+        self.cells_per_batch = cells_per_batch
         self.shuffle = shuffle
-        self.max_patches_per_slide = max_patches_per_slide
+        self.max_cells_per_slide = max_cells_per_slide
         self.oversample_target = oversample_target or {}
 
-        # group patches by slide up front; `patch_slide_id` is indexed the same way
-        # as `patch_meta["slide_id"]` (one entry per patch_row id)
-        self.patches_by_slide = {}
-        for p in patch_to_nodes.keys():
-            sid = int(patch_slide_id[p])
-            self.patches_by_slide.setdefault(sid, []).append(p)
+        slide_codes_np = slide_codes.numpy() if torch.is_tensor(slide_codes) else np.asarray(slide_codes)
+        self.nodes_by_slide = {
+            int(sid): np.where(slide_codes_np == sid)[0] for sid in np.unique(slide_codes_np)
+        }
 
-        # --- FIX: Pass torch.arange(data.num_nodes) so all node indices are valid ---
         self._sampler_loader = NeighborLoader(
-            data, 
+            data,
             num_neighbors=list(num_neighbors),
-            input_nodes=torch.arange(data.num_nodes), 
+            input_nodes=torch.arange(data.num_nodes),
             batch_size=1,
         )
 
     def __len__(self):
         total = 0
-        for sid, plist in self.patches_by_slide.items():
-            n = len(plist) if self.max_patches_per_slide is None else min(len(plist), self.max_patches_per_slide)
+        for sid, nodes in self.nodes_by_slide.items():
+            n = len(nodes) if self.max_cells_per_slide is None else min(len(nodes), self.max_cells_per_slide)
             n = max(n, self.oversample_target.get(sid, 0))
-            total += (n + self.patches_per_batch - 1) // self.patches_per_batch
+            total += (n + self.cells_per_batch - 1) // self.cells_per_batch
         return total
 
     def __iter__(self):
@@ -623,40 +627,32 @@ class PatchGroupedLoader:
         # then shuffle the batch ORDER so training still sees slides interleaved
         # across steps -- only within-batch mixing is what causes the shortcut.
         all_batches = []
-        for sid, plist in self.patches_by_slide.items():
-            plist = plist.copy()
+        for sid, nodes in self.nodes_by_slide.items():
+            nodes = nodes.copy()
             if self.shuffle:
-                random.shuffle(plist)
-            if self.max_patches_per_slide is not None:
-                plist = plist[:self.max_patches_per_slide]
+                np.random.shuffle(nodes)
+            if self.max_cells_per_slide is not None:
+                nodes = nodes[:self.max_cells_per_slide]
             target = self.oversample_target.get(sid)
-            if target is not None and len(plist) < target:
-                # pad up to target by resampling this slide's own patches WITH
-                # replacement -- plist is already shuffled, so every real patch is
+            if target is not None and len(nodes) < target:
+                # pad up to target by resampling this slide's own cells WITH
+                # replacement -- nodes is already shuffled, so every real cell is
                 # used at least once before any repeats occur
-                plist = plist + random.choices(plist, k=target - len(plist))
+                pad = np.random.choice(nodes, size=target - len(nodes), replace=True)
+                nodes = np.concatenate([nodes, pad])
                 if self.shuffle:
-                    random.shuffle(plist)
-            for start in range(0, len(plist), self.patches_per_batch):
-                all_batches.append(plist[start:start + self.patches_per_batch])
+                    np.random.shuffle(nodes)
+            for start in range(0, len(nodes), self.cells_per_batch):
+                all_batches.append(nodes[start:start + self.cells_per_batch])
 
         if self.shuffle:
             random.shuffle(all_batches)
 
-        for batch_patch_ids in all_batches:
-            seed_chunks, local_patch_index = [], []
-            for local_idx, p in enumerate(batch_patch_ids):
-                nodes = self.patch_to_nodes[p]
-                if len(nodes) > self.max_cells_per_patch:
-                    perm = torch.randperm(len(nodes))[:self.max_cells_per_patch]
-                    nodes = nodes[perm]
-                seed_chunks.append(nodes)
-                local_patch_index.append(torch.full((len(nodes),), local_idx, dtype=torch.long))
-            seed_nodes = torch.cat(seed_chunks)
+        for seed_nodes_np in all_batches:
+            seed_nodes = torch.from_numpy(seed_nodes_np).long()
             batch = self._sampler_loader.collate_fn(seed_nodes)
             # NeighborLoader guarantees seed nodes are the first len(seed_nodes) rows.
-            batch.local_patch_index = torch.cat(local_patch_index)
-            batch.batch_patch_ids = torch.tensor(batch_patch_ids, dtype=torch.long)
+            batch.n_seed = len(seed_nodes)
             yield batch
  
  
@@ -673,7 +669,7 @@ def encode_full_graph_batched(encoder, data, device, num_neighbors=(10, 10), bat
     even when mini-batch training (which only ever sees small sampled subgraphs)
     fits comfortably.
 
-    This reuses the same sampling machinery as `PatchGroupedLoader`/training
+    This reuses the same sampling machinery as `SlideStratifiedLoader`/training
     (`NeighborLoader`, `num_neighbors`), just iterating over every node as a seed
     in chunks of `batch_size`, so each forward pass only ever touches one small
     sampled subgraph at a time. Results are written back into a full-size output
@@ -748,8 +744,8 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
     device = logits.device
 
     # Hard-exclude cross-slide pairs from the negative set entirely (independent of
-    # neighbor_radius below). With slide-stratified batches (see PatchGroupedLoader)
-    # this is normally a no-op, since every patch in a batch already shares a slide --
+    # neighbor_radius below). With slide-stratified batches (see SlideStratifiedLoader)
+    # this is normally a no-op, since every batch already shares a slide --
     # it's kept as a defensive backstop so the loss can never exploit slide identity
     # as a shortcut even if batch composition changes elsewhere.
     if slide_ids is not None:
@@ -971,9 +967,10 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
     """
     patch_meta is still needed here even though the patch-level (histology)
     branch is gone: `weight_reconstruction`'s per-patch inverse-frequency
-    weighting of the CELL reconstruction loss, and the batch's own patch-grouped
-    structure (PatchGroupedLoader), are shared batching infrastructure, not
-    part of that removed branch.
+    weighting of the CELL reconstruction loss looks up each seed cell's patch
+    via `batch.patch_row` (a per-cell attribute, sliced by NeighborLoader same
+    as `batch.slide_code`) -- no patch-complete batching (SlideStratifiedLoader)
+    is required for this, just the lookup.
 
     token_emb_all / cell_meta: token_emb_all and cell_meta["xy"]/["slide_id"]
     must be row-aligned with data.x -- seed cells are looked up via
@@ -1004,7 +1001,7 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
 
     x = batch.x.to(device)
     edge_index = batch.edge_index.to(device)
-    n_seed = batch.local_patch_index.shape[0]
+    n_seed = batch.n_seed
 
     x_in = F.dropout(x, p=gene_dropout_p, training=True) if gene_dropout_p > 0 else x
     edge_index_in = dropout_edge(edge_index, p=edge_dropout_p, training=True)[0] if edge_dropout_p > 0 else edge_index
@@ -1019,10 +1016,8 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
     recon_per_cell = F.mse_loss(x_recon, x[:n_seed], reduction="none").mean(dim=1)
 
     if weight_reconstruction:
-        batch_patch_ids = batch.batch_patch_ids.to(device)
-        local_patch_index = batch.local_patch_index.to(device)
-        per_patch_weight = patch_meta["weight"][batch_patch_ids]
-        cell_weight = per_patch_weight[local_patch_index]
+        cell_patch_row = batch.patch_row[:n_seed].to(device)
+        cell_weight = patch_meta["weight"][cell_patch_row]
         loss_recon_trans = (recon_per_cell * cell_weight).sum() / cell_weight.sum().clamp(min=1e-8)
     else:
         loss_recon_trans = recon_per_cell.mean()
@@ -1530,7 +1525,7 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, pat
 def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
                          svg_mask=None, svg_scaler=None, hist_scaler=None, verbose=True,
                          f_token_adata=None, token_scaler=None, local_neighbor_radius=None,
-                         max_patches_per_slide=None, oversample_slides=None):
+                         max_cells_per_slide=None, oversample_slides=None):
     """
     Runs the SVG-mask -> spatial-graph -> pairing -> standardize -> patch-metadata
     -> PyG-data-and-loader pipeline, factored out so it can run on an arbitrary
@@ -1631,12 +1626,10 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
         cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=local_neighbor_radius)
 
     data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
-    patch_to_nodes = build_patch_to_nodes(data.patch_row)
-    loader = PatchGroupedLoader(
-        data, patch_to_nodes, patch_meta["slide_id"],
-        num_neighbors=CONFIG["num_neighbors"], patches_per_batch=CONFIG["patches_per_batch"],
-        max_cells_per_patch=CONFIG["max_cells_per_patch"], max_patches_per_slide=max_patches_per_slide,
-        oversample_target=oversample_target,
+    loader = SlideStratifiedLoader(
+        data, data.slide_code,
+        num_neighbors=CONFIG["num_neighbors"], cells_per_batch=CONFIG["cells_per_batch"],
+        max_cells_per_slide=max_cells_per_slide, oversample_target=oversample_target,
     )
     hist_emb_t = torch.tensor(hist_emb, dtype=torch.float32)
 
@@ -1669,8 +1662,8 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     once on training slides only, then Phase 3 trains the cell<->token
     contrastive term.
 
-    CONFIG["max_patches_per_slide"]: forwarded to the training pipeline's
-      PatchGroupedLoader to cap a disproportionately large slide's per-epoch
+    CONFIG["max_cells_per_slide"]: forwarded to the training pipeline's
+      SlideStratifiedLoader to cap a disproportionately large slide's per-epoch
       batch share. (Tried fully excluding such a slide instead: reduced leakage
       and roughly doubled in-sample fit, but held-out generalization stayed
       flat and the gap widened -- overfitting, not a fix. Capping keeps its
@@ -1727,15 +1720,15 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
 
     if verbose:
         print("  building training-slide pipeline data (hist + token)...")
-    # max_patches_per_slide/oversample_slides only matter for the TRAINING pipeline's
-    # loader (they reshape per-epoch batch share -- see PatchGroupedLoader's
+    # max_cells_per_slide/oversample_slides only matter for the TRAINING pipeline's
+    # loader (they reshape per-epoch batch share -- see SlideStratifiedLoader's
     # docstring); the held-out pipe's own loader (built below) is never iterated over
     # during training or eval, only its "data" is used, so both are no-ops left at
     # CONFIG's default (None) for that call.
     train_pipe = build_pipeline_data(
         f_hist_train, f_trans_train, f_coord_train, CONFIG, svg_mask=gene_mask,
         f_token_adata=f_token_train, local_neighbor_radius=CONFIG.get("local_neighbor_radius"),
-        max_patches_per_slide=CONFIG.get("max_patches_per_slide"),
+        max_cells_per_slide=CONFIG.get("max_cells_per_slide"),
         oversample_slides=CONFIG.get("oversample_slides"), verbose=verbose,
     )
 

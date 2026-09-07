@@ -66,8 +66,11 @@ CONFIG = dict(
     spatial_graph_delaunay=True,  # nuclei/cells: matches get_svg.py's own cell-path choice
     spatial_graph_grid=False,     # bins: set True (with n_neighs=8) for a regular 8um lattice
     num_neighbors=(10, 10),
-    patches_per_batch=64,
-    max_cells_per_patch=64,
+    # Seed cells drawn uniformly at random per slide (SlideStratifiedLoader), not
+    # grouped by shared histology-patch membership -- see run_loso.py's CONFIG
+    # comment for why. ~1024 approximates the old loader's typical realized batch
+    # size; re-tune against actual throughput/GPU memory now that it's a direct cap.
+    cells_per_batch=1024,
 
     # loss
     temperature=0.07,
@@ -211,7 +214,7 @@ f_token_adata = f_token_adata[f_token_adata.obs["matched"].astype(bool)].copy()
 print(f"Loaded token data: {f_token_adata.n_obs} cells across {len(slides_with_tokens)} slide(s)")
 
 # ---- preprocessing: SVG mask, spatial graph, pairing, standardize, --------
-# ---- patch/cell metadata, PyG data + patch-grouped loader ------------------
+# ---- patch/cell metadata, PyG data + slide-stratified random loader --------
 print("1. SVG mask")
 svg_mask = get_svg_union_mask(f_trans_adata)
 print(f"{svg_mask.sum()} SVGs selected (union)")
@@ -268,12 +271,9 @@ cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=CONFIG["local_
 
 print("6. pyg")
 data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
-patch_to_nodes = build_patch_to_nodes(data.patch_row)
-loader = PatchGroupedLoader(
-    data, patch_to_nodes, patch_meta["slide_id"],
-    num_neighbors=CONFIG["num_neighbors"],
-    patches_per_batch=CONFIG["patches_per_batch"],
-    max_cells_per_patch=CONFIG["max_cells_per_patch"],
+loader = SlideStratifiedLoader(
+    data, data.slide_code,
+    num_neighbors=CONFIG["num_neighbors"], cells_per_batch=CONFIG["cells_per_batch"],
 )
 
 token_emb_t = torch.tensor(token_emb, dtype=torch.float32)

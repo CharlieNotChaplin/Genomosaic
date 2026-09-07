@@ -7,9 +7,9 @@ without waiting ~8h on the training job:
    cpu" despite the sbatch script requesting --gres=gpu:1 -- if that's still
    true, wall-clock time is CPU-bound and may drop substantially once fixed.
 2. Does CRC_P11mm's larger tissue area (~11x11mm vs ~6.5x6.5mm for the other
-   6 samples) give it disproportionate weight during training? PatchGroupedLoader
-   builds one batch group per slide and does ceil(n_patches_in_slide /
-   patches_per_batch) batches for it; nothing in train()/train_step() reweights
+   6 samples) give it disproportionate weight during training? SlideStratifiedLoader
+   builds one batch group per slide and does ceil(n_cells_in_slide /
+   cells_per_batch) batches for it; nothing in train()/train_step() reweights
    across slides afterward (weight_reconstruction_by_patch_freq only rebalances
    cells within a patch relative to other patches on the SAME slide). This
    computes the actual per-slide share of every training epoch from real data.
@@ -45,7 +45,7 @@ for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().pa
 
 from functions.dual_autoencoder import evaluate_latent_leakage
 
-PATCHES_PER_BATCH = 64  # must match CONFIG["patches_per_batch"] in train_autoenc_token.py
+CELLS_PER_BATCH = 1024  # must match CONFIG["cells_per_batch"] in train_autoenc_token.py
 LEAKAGE_SUBSAMPLE = 20000  # cap rows fed to LogisticRegression -- this is a fast sanity
                             # check, not the final reported metric, so keep it quick
 
@@ -85,7 +85,7 @@ obs = trans.obs[["Slide_ID", "Patch_ID"]]
 cell_counts = obs["Slide_ID"].value_counts()
 patch_counts = obs.groupby("Slide_ID")["Patch_ID"].nunique()
 na_rate = obs.groupby("Slide_ID")["Patch_ID"].apply(lambda s: s.isna().mean())
-batches_per_epoch = np.ceil(patch_counts / PATCHES_PER_BATCH)
+batches_per_epoch = np.ceil(cell_counts / CELLS_PER_BATCH)
 
 summary = pd.DataFrame({
     "n_cells": cell_counts,
@@ -99,7 +99,7 @@ summary = pd.DataFrame({
 print(summary.to_string(float_format=lambda x: f"{x:.3f}"))
 print(f"\nTotal batches/epoch across all slides: {int(batches_per_epoch.sum())}")
 print("batch_share = each slide's fraction of total gradient updates per epoch under "
-      "PatchGroupedLoader. With no cross-slide reweighting anywhere in train()/train_step(), "
+      "SlideStratifiedLoader. With no cross-slide reweighting anywhere in train()/train_step(), "
       "this IS the slide's influence on training -- directly comparable across slides.")
 
 print()
