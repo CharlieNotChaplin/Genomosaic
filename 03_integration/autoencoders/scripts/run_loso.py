@@ -112,29 +112,36 @@ def run_it(held_out_slide="CRC_P1"):
         local_warmup_epochs=10,
 
         # Caps CRC_P11mm's per-epoch batch share: SlideStratifiedLoader allocates
-        # batches proportional to each slide's own (capped) cell count, and
-        # CRC_P11mm was the outsized slide under the old patch-count accounting
-        # (29,959 patches vs. 8,063-10,983 elsewhere). This value was carried over
-        # unchanged from the patch-count cap and now caps CELL count instead --
-        # cell:patch ratios were never uniform across slides, so re-check this
-        # against actual per-slide cell counts (printed at pipeline build time)
-        # before trusting it's still "just above the next-largest slide" the way
-        # the old value was. None = uncapped.
+        # batches proportional to each slide's own (capped) cell count. Recalibrated
+        # (2026-09) against real per-slide cell counts from count_area_filtered_adata.h5ad
+        # -- cell:patch ratios turned out NOT uniform across slides, so the old
+        # patch-count cap (11000) badly undershot at cell granularity (every slide has
+        # 5-70x more cells than that, so it was throttling everyone, not just CRC_P11mm).
+        # Real counts (9-slide array, CRC_P6_5mm excluded as usual): CRC_P11mm=785828
+        # (outlier), next-largest CRC_P3_SMAP=295977, then CRC_P2=224825 down to
+        # Normal_P3=57187. 300000 sits just above CRC_P3_SMAP -- a no-op for every slide
+        # except CRC_P11mm, same rationale as the original patch-count value.
         # (Tried fully EXCLUDING CRC_P11mm instead: reduced leakage and ~doubled in-sample
         # fit, but held-out generalization stayed flat and the train/held-out gap widened
         # -- an overfitting signature, not a fix. Capping is the better tradeoff.)
-        max_cells_per_slide=11000,
+        max_cells_per_slide=300000,
 
         # Boosts the 2 normal slides' per-epoch exposure: evaluate_disease_signal showed
         # the model doesn't reliably generalize "normal tissue" to a second unseen normal
         # patient (Normal_P5 stayed near chance even after rebalancing the diagnostic
-        # classifier, unlike Normal_P3). Values carried over unchanged from the old
-        # patch-count targets and now set CELL-count targets instead -- same caveat as
-        # max_cells_per_slide above, re-tune against actual per-slide cell counts rather
-        # than assuming this is still "~3x" a normal slide's natural size. Resampling
-        # real cells with replacement (see SlideStratifiedLoader.oversample_target), not
-        # synthetic augmentation.
-        oversample_slides={"Normal_P3": 24000, "Normal_P5": 24000},
+        # classifier, unlike Normal_P3). Recalibrated (2026-09) by applying the ORIGINAL
+        # design's own multiplier (~3x a normal slide's natural size) to each slide's real
+        # cell count, rather than reusing the old flat 24000/slide (a patch-count value
+        # that happened to look uniform only because both normal slides had similar patch
+        # counts -- at cell level they don't: Normal_P3=57187 cells, Normal_P5=127584,
+        # a 2.2x difference). A flat target would have under-boosted Normal_P5 and
+        # over-boosted Normal_P3 relative to their real sizes; scaling each by the same
+        # ~3x keeps both slides' relative representation intact while still moving the
+        # aggregate tumor:normal per-epoch ratio from ~10:1 (natural) to ~2.4:1 (after
+        # capping CRC_P11mm to max_cells_per_slide above), similar magnitude of rebalancing
+        # to the original design's own ~2:1 target. Resampling real cells with replacement
+        # (see SlideStratifiedLoader.oversample_target), not synthetic augmentation.
+        oversample_slides={"Normal_P3": 172000, "Normal_P5": 383000},
     )
 
     # ---- WHICH SLIDE TO HOLD OUT ------------------------------------------------
