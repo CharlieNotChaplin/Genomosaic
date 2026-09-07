@@ -44,7 +44,7 @@ Thumbs.db
 
 # Data and results
 **/data/
-**/zz_unused_data/
+**/zz_latex/
 **/Data/
 **/UNI_Results/ 
 **/weights/
