@@ -225,12 +225,20 @@ for held_out_slide in EVAL_SLIDES:
     # n_slides isn't saved in cfg directly (computed internally during the original
     # run) -- recovered from trans_dec's first layer instead: MLPDecoder concatenates
     # a slide one-hot onto z before its first Linear, so in_dim = latent_dim + n_slides.
+    # NOTE: this recovery assumes trans_condition_on_slide=True (in_dim = latent_dim +
+    # n_slides) -- every checkpoint that exists as of this parameter's introduction was
+    # trained with it on, so cfg.get(..., True) below is safe for those. A future
+    # checkpoint trained with trans_condition_on_slide=False would make this line wrong
+    # (in_dim = latent_dim alone, so the subtraction gives n_slides=0) -- fix this
+    # recovery to branch on cfg.get("trans_condition_on_slide", True) if/when that
+    # ablation is actually run and reloaded here.
     n_slides = ckpt["model_state_dict"]["trans_dec.net.0.weight"].shape[1] - cfg["latent_dim"]
     model = DualAutoencoder(
         n_svg=int(svg_mask.sum()), latent_dim=cfg["latent_dim"], proj_dim=cfg["proj_dim"],
         n_slides=n_slides, encoder_type=cfg["encoder"],
         token_dim=per_slide_data[held_out_slide][0].shape[1],
         token_condition_on_slide=cfg.get("token_condition_on_slide", True),
+        trans_condition_on_slide=cfg.get("trans_condition_on_slide", True),
     )
     model.load_state_dict(ckpt["model_state_dict"])
     model.to(device).eval()

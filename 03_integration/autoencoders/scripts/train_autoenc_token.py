@@ -284,6 +284,7 @@ model = DualAutoencoder(
     latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
     n_slides=n_slides,
     encoder_type=CONFIG["encoder"],
+    trans_condition_on_slide=CONFIG.get("trans_condition_on_slide", True),
     token_dim=token_emb.shape[1],
 )
 model.to(device)

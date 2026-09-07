@@ -150,7 +150,7 @@ class DualAutoencoder(nn.Module):
     def __init__(self, n_svg, latent_dim=64, proj_dim=32, n_slides=5,
                  encoder_type="sage", transconv_heads=4,
                  token_dim=None, token_hidden=(512, 128),
-                 token_condition_on_slide=True):
+                 token_condition_on_slide=True, trans_condition_on_slide=True):
         """
         token_dim: dimensionality of the per-cell local histology token feature
             (footprint+halo ViT token embedding, see `token_preprocessing.py`).
@@ -163,6 +163,13 @@ class DualAutoencoder(nn.Module):
             Token embeddings are per-CELL, not per-patch -- no pooling/broadcast,
             since footprint/halo aggregation already makes the correspondence
             close to one-to-one (median nucleus ~21px vs. 14px tokens).
+
+        trans_condition_on_slide: whether `trans_dec` receives a one-hot slide
+            code alongside z_trans (see `MLPDecoder`'s own docstring for the
+            rationale). True (this class's prior, hardcoded behavior) is still
+            the default -- pass False to ablate it, e.g. to test whether the
+            latent absorbs slide-identifying technical variance without this
+            escape hatch.
         """
         super().__init__()
         if encoder_type == "sage":
@@ -171,7 +178,8 @@ class DualAutoencoder(nn.Module):
             self.trans_enc = SVGGraphEncoder_TransConv(n_svg, 256, latent_dim, n_slides, heads=transconv_heads)
         else:
             raise ValueError(f"Unsupported ecnoder_type: '{encoder_type}'. Choose from 'sage', 'transconv'.")
-        self.trans_dec = MLPDecoder(latent_dim, [256, 512], n_svg, n_slides)
+        self.trans_dec = MLPDecoder(latent_dim, [256, 512], n_svg, n_slides,
+                                     condition_on_slide=trans_condition_on_slide)
 
         self.token_dim = token_dim
         if token_dim is not None:
@@ -1442,6 +1450,7 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, pat
         latent_dim=config["latent_dim"], proj_dim=config["proj_dim"],
         n_slides=n_slides, encoder_type=config["encoder"],
         token_condition_on_slide=config.get("token_condition_on_slide", True),
+        trans_condition_on_slide=config.get("trans_condition_on_slide", True),
     )
     model.token_enc.load_state_dict(model_template_state["token_enc"])
     model.token_dec.load_state_dict(model_template_state["token_dec"])
@@ -1747,6 +1756,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         latent_dim=CONFIG["latent_dim"], proj_dim=CONFIG["proj_dim"],
         n_slides=train_pipe["n_slides"], encoder_type=CONFIG["encoder"],
         token_condition_on_slide=CONFIG.get("token_condition_on_slide", True),
+        trans_condition_on_slide=CONFIG.get("trans_condition_on_slide", True),
     )
     pretrain_kwargs = dict(
         epochs=CONFIG["token_pretrain_epochs"], lr=CONFIG["token_pretrain_lr"],
