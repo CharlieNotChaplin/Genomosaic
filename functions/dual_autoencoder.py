@@ -812,45 +812,6 @@ def contrast_weight_schedule(epoch, warmup_epochs=5, max_weight=1.0):
     return max_weight * min(1.0, epoch / warmup_epochs)
 
 
-def vicreg_regularizer(z, var_target=1.0, eps=1e-4):
-    """
-    VICReg-style variance + covariance regularization (Bardes, Ponce & LeCun,
-    2021) on a batch of latent vectors `z` (shape (B, D)). Penalizes collapse:
-      - variance term: pushes per-dimension std up toward `var_target` via
-        relu(target - std), stopping one dimension (or a correlated cluster)
-        from soaking up most of the variance.
-      - covariance term: pushes off-diagonal covariances toward zero, so
-        dimensions can't be redundant proxies for the same direction.
-
-    Unlike decoder conditioning (slide_code/tile_code), which only removes the
-    *requirement* to encode a nuisance direction without penalizing it (why
-    tile-conditioning alone changed nothing), this is an active penalty on z --
-    doesn't need to know what the nuisance variable is, unlike a GRL
-    classifier/regressor (unstable in this codebase historically).
-
-    Requires B > 1 (returns 0 for B=1, where std/covariance are undefined).
-
-    var_target: the paper's default (1.0) assumes roughly unit-scale
-    representations; check `z.std(dim=0)` early in a run if the loss saturates
-    at ~0 immediately (target too low) or stays large throughout (fighting the
-    other losses too hard -- lower vicreg_weight or var_target instead).
-    """
-    B, D = z.shape
-    if B < 2:
-        return z.new_tensor(0.0)
-
-    std = torch.sqrt(z.var(dim=0, unbiased=True) + eps)
-    loss_var = F.relu(var_target - std).mean()
-
-    z_centered = z - z.mean(dim=0, keepdim=True)
-    cov = (z_centered.T @ z_centered) / (B - 1)
-    off_diag = cov - torch.diag(torch.diagonal(cov))
-    loss_cov = off_diag.pow(2).sum() / D
-
-    return loss_var + loss_cov
-
-
-
 def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batch_size=1024,
                                 lr=1e-3, weight_decay=1e-5, val_frac=0.1, patience=15,
                                 device="cuda", verbose=True, seed=0):
