@@ -1667,18 +1667,27 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
 
     hist_slide = f_hist_adata.obs["Slide_ID"].astype(str)
     trans_slide = f_trans_adata.obs["Slide_ID"].astype(str)
-    coord_slide = f_trans_coord["Slide_ID"].astype(str)
     token_slide = f_token_adata.obs["Slide_ID"].astype(str)
 
     f_hist_train = f_hist_adata[hist_slide != held_out_slide].copy()
     f_trans_train = f_trans_adata[trans_slide != held_out_slide].copy()
-    f_coord_train = f_trans_coord[coord_slide != held_out_slide]
     f_token_train = f_token_adata[token_slide != held_out_slide].copy()
 
     f_hist_held = f_hist_adata[hist_slide == held_out_slide].copy()
     f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
-    f_coord_held = f_trans_coord[coord_slide == held_out_slide]
     f_token_held = f_token_adata[token_slide == held_out_slide].copy()
+
+    # f_trans_coord is None for bins (no nuclei_geometry.parquet side-car -- bins
+    # carry obsm['spatial'] directly, see extract_cell_xy's own None-safe priority
+    # order), same None convention run_loso.py's own EXCLUDE_SLIDES/token-restriction
+    # filtering already guards for -- this split needs the identical guard.
+    if f_trans_coord is not None:
+        coord_slide = f_trans_coord["Slide_ID"].astype(str)
+        f_coord_train = f_trans_coord[coord_slide != held_out_slide]
+        f_coord_held = f_trans_coord[coord_slide == held_out_slide]
+    else:
+        f_coord_train = None
+        f_coord_held = None
 
     # gene selection computed ONCE from TRAIN-only data: computing it fresh on the
     # held-out slide alone would leak its own variability pattern into what "counts"

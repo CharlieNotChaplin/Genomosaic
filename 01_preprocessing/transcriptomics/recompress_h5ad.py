@@ -28,13 +28,32 @@ import anndata as ad
 
 parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 parser.add_argument("paths", nargs="*", help="h5ad file(s) to recompress in place")
-parser.add_argument("--glob", action="append", default=[], help="glob pattern(s) to expand into paths, repeatable")
+parser.add_argument("--glob", action="append", default=[],
+                     help="glob pattern(s) to expand into paths, repeatable. Resolved against the "
+                          "current directory first; if that finds nothing and the pattern starts "
+                          "with 'data/', also tried against the repo root (found by walking up from "
+                          "this script), so 'data/...' patterns work regardless of your cwd.")
 parser.add_argument("--dry-run", action="store_true", help="just print what would be done, don't write anything")
 args = parser.parse_args()
 
+
+def _resolve_glob(pattern):
+    matches = sorted(globmod.glob(pattern))
+    if matches or not pattern.startswith("data/"):
+        return matches
+    # Fallback: try relative to the repo root (parent of the first ancestor
+    # directory containing a 'data/' folder), same upward-search convention
+    # every other script in this project uses -- avoids the pattern only
+    # working when run from one specific cwd.
+    for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+        if (_candidate / "data").is_dir():
+            return sorted(globmod.glob(str(_candidate / pattern)))
+    return []
+
+
 paths = [Path(p) for p in args.paths]
 for pattern in args.glob:
-    paths.extend(Path(p) for p in sorted(globmod.glob(pattern)))
+    paths.extend(Path(p) for p in _resolve_glob(pattern))
 paths = sorted(set(paths))
 
 if not paths:
