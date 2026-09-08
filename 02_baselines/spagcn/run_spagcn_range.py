@@ -1,0 +1,134 @@
+"""
+Sequential batch runner: for each --sample, in order,
+  1. build the adjacency matrix + prepped centroids once (build_adj_and_centroids)
+  2. find l once (spatial-only, independent of n_clusters)
+  3. for n_clusters in [--n-clusters-min, --n-clusters-max]: find its resolution,
+     train, and write one compact {sample}_cluster_{n}.parquet (id, sample,
+     n_clusters, pred, refined_pred) to --outputs-dir
+  4. delete every intermediate/heavy file created for that sample (adj.npy,
+     nuclei_centroids_svg.h5ad, l.txt, res_cluster_*.txt, results_cluster_*.h5ad,
+     plots) -- only the parquet/csv files in --outputs-dir survive
+  5. only then move to the next sample
+
+Samples are processed strictly one at a time within this single process --
+a sample's cleanup always finishes before the next sample's adjacency build
+starts (this is the whole point of one sequential script rather than
+run_all_samples.sh's parallel per-sample sbatch jobs). Reuses
+build_adj_and_centroids/find_l/find_res/run_train from run_spagcn_svg.py rather
+than duplicating that logic, so it also inherits the NaN-adjacency-matrix fix
+and the scipy `.A` compat shim defined there.
+
+Since this is one continuous process/job, its --mem/--time on the cluster must
+cover the LARGEST sample in --samples, not the average -- see
+run_all_samples.sh's per-sample nuclei-count table for sizing guidance, and
+don't mix a huge sample into the same invocation as several small ones if that
+means requesting memory the small ones will sit around not using.
+
+Usage:
+    python run_spagcn_range.py --samples CRC_P1 CRC_P6_5mm \\
+        --n-clusters-min 7 --n-clusters-max 10
+"""
+import argparse
+from pathlib import Path
+
+import run_spagcn_svg as core
+
+
+def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
+    basedir = Path("../../data")
+    dir_sample = basedir / sample
+    dir_base_input = dir_sample / "input"
+    dir_base_output = dir_sample / f"output/binned_outputs/square_{args.bin_size}"
+    dir_custom_binning = dir_sample / "01_preprocessing" / args.cellseg_dir / args.bin_size / "custom_binning"
+    dir_spagcn_data = dir_sample / "02_baselines/spagcn/data"
+    dir_spagcn_results = dir_sample / "02_baselines/spagcn/results"
+    suffix = "_svggenes" if args.svg_genes_only else ""
+
+    print(f"\n{'=' * 70}\nSample: {sample}\n{'=' * 70}", flush=True)
+
+    # Always rebuild fresh: this script deletes adj.npy/nuclei_centroids_svg.h5ad
+    # at the end of every sample regardless, so there is never a legitimate cache
+    # to reuse between invocations -- only stale/pre-patch leftovers from outside
+    # this script, which we don't want silently reused.
+    core.build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
+                                  dir_spagcn_data, dir_spagcn_results, sample,
+                                  args.beta, args.alpha, force_recompute=True)
+
+    adata, adj = core.load_prepped_adata_and_adj(dir_spagcn_data)
+    l = core.find_l(dir_spagcn_data, adj, args.p, args.l_start, args.l_end, args.l_tol, args.l_max_run)
+
+    outputs_dir.mkdir(parents=True, exist_ok=True)
+    written = []
+    for n_clusters in range(n_clusters_min, n_clusters_max + 1):
+        print(f"\n--- {sample}: n_clusters={n_clusters} ---", flush=True)
+        core.find_res(dir_spagcn_data, adata, adj, l, n_clusters, args.seed)
+        core.run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, args.seed, args.svg_genes_only)
+
+        result_h5ad = dir_spagcn_results / f"results_cluster_{n_clusters}{suffix}.h5ad"
+        result_adata = core.sc.read_h5ad(result_h5ad)
+
+        out_df = result_adata.obs[["pred", "refined_pred"]].copy()
+        out_df.insert(0, "id", out_df.index)
+        out_df.insert(1, "sample", sample)
+        out_df.insert(2, "n_clusters", n_clusters)
+        out_df.reset_index(drop=True, inplace=True)
+
+        out_path = outputs_dir / f"{sample}_cluster_{n_clusters}{suffix}.{args.format}"
+        if args.format == "csv":
+            out_df.to_csv(out_path, index=False)
+        else:
+            out_df.to_parquet(out_path, index=False)
+        print(f"Wrote {out_path} ({len(out_df)} rows)", flush=True)
+        written.append(out_path)
+
+        # Per-n_clusters intermediates -- safe to delete now, the next n_clusters
+        # iteration only needs adata/adj/l (already in memory), not these files.
+        (dir_spagcn_data / f"res_cluster_{n_clusters}.txt").unlink(missing_ok=True)
+        result_h5ad.unlink(missing_ok=True)
+        (dir_spagcn_results / f"pred_cluster_{n_clusters}{suffix}.png").unlink(missing_ok=True)
+        (dir_spagcn_results / f"refined_pred_cluster_{n_clusters}{suffix}.png").unlink(missing_ok=True)
+
+    # Shared prep files -- only removable now that every n_clusters is done.
+    del adata, adj
+    (dir_spagcn_data / "nuclei_centroids_svg.h5ad").unlink(missing_ok=True)
+    (dir_spagcn_data / "adj.npy").unlink(missing_ok=True)
+    (dir_spagcn_data / "l.txt").unlink(missing_ok=True)
+    print(f"Cleaned up intermediate files for {sample}. Kept: {[str(p) for p in written]}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--samples", nargs="+", required=True,
+                         help="Sample names, processed strictly in this order -- "
+                              "one sample's cleanup always finishes before the next starts")
+    parser.add_argument("--n-clusters-min", type=int, required=True)
+    parser.add_argument("--n-clusters-max", type=int, required=True)
+    parser.add_argument("--outputs-dir", default="outputs",
+                         help="Where the per-(sample, n_clusters) result files land (default: ./outputs)")
+    parser.add_argument("--format", choices=["parquet", "csv"], default="parquet",
+                         help="parquet is smaller/faster and already used elsewhere in this repo "
+                              "(tissue_positions.parquet, nuclei_geometry.parquet); csv if you need plain text")
+    parser.add_argument("--bin-size", default="002um")
+    parser.add_argument("--cellseg-dir", default="cell_seg_stardist")
+    parser.add_argument("--svg-genes-only", action="store_true",
+                         help="Restrict training to var['spatially_variable'] genes (does not affect adj/l/res search)")
+    parser.add_argument("--beta", type=int, default=49)
+    parser.add_argument("--alpha", type=float, default=1.0)
+    parser.add_argument("--p", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=100)
+    parser.add_argument("--l-start", type=float, default=0.01, help="spg.search_l lower bound")
+    parser.add_argument("--l-end", type=float, default=1000, help="spg.search_l upper bound")
+    parser.add_argument("--l-tol", type=float, default=0.01, help="spg.search_l tolerance on p")
+    parser.add_argument("--l-max-run", type=int, default=100, help="spg.search_l bisection step cap")
+    args = parser.parse_args()
+
+    if args.n_clusters_min > args.n_clusters_max:
+        raise ValueError("--n-clusters-min must be <= --n-clusters-max")
+
+    outputs_dir = Path(args.outputs_dir)
+    for sample in args.samples:
+        process_sample(sample, args.n_clusters_min, args.n_clusters_max, outputs_dir, args)
+
+
+if __name__ == "__main__":
+    main()

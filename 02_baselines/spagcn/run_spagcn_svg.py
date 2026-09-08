@@ -220,7 +220,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
     print(f"Wrote {nuclei_centroids_path} and {adj_path}")
 
 
-def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_max_run):
+def load_prepped_adata_and_adj(dir_spagcn_data):
     adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
     adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
     adata.var_names_make_unique()
@@ -228,7 +228,10 @@ def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_ma
     spg.prefilter_specialgenes(adata)
     sc.pp.normalize_per_cell(adata)
     sc.pp.log1p(adata)
+    return adata, adj
 
+
+def find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run):
     # Diagnose the search range ourselves before calling spg.search_l: SpaGCN's own
     # diagnostic prints ("l not found, try smaller/bigger ...") go to a block-buffered
     # stdout and can be lost if the process later dies, leaving only the confusing
@@ -259,7 +262,10 @@ def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_ma
     with open(dir_spagcn_data / "l.txt", "w") as f:
         f.write(str(l))
     print("l =", l, flush=True)
+    return l
 
+
+def find_res(dir_spagcn_data, adata, adj, l, n_clusters, seed):
     print(f"Searching for resolution giving {n_clusters} clusters...", flush=True)
     res = spg.search_res(
         adata, adj, l, n_clusters, start=0.7, step=0.1, tol=5e-3, lr=0.05,
@@ -268,6 +274,13 @@ def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_ma
     with open(dir_spagcn_data / f"res_cluster_{n_clusters}.txt", "w") as f:
         f.write(str(res))
     print("l =", l, " res =", res)
+    return res
+
+
+def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_max_run):
+    adata, adj = load_prepped_adata_and_adj(dir_spagcn_data)
+    l = find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run)
+    find_res(dir_spagcn_data, adata, adj, l, n_clusters, seed)
 
 
 def run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, seed, svg_genes_only):
