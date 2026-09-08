@@ -1001,7 +1001,9 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
     # whenever the model has a token branch and token data was supplied.
     if model.token_enc is not None and token_emb_all is not None:
         seed_global_ids = batch.n_id[:n_seed].to(device)
-        token_x = token_emb_all[seed_global_ids]
+        # token_emb_all stays on CPU (see train()'s comment) -- index with the
+        # still-CPU id tensor and move only this batch's slice to device.
+        token_x = token_emb_all[batch.n_id[:n_seed]].to(device)
         cell_slide_ids = cell_meta["slide_id"][seed_global_ids]
 
         z_token_cells = model.token_enc(token_x)
@@ -1078,7 +1080,12 @@ def train(model, loader, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5, temp
 
     use_tokens = model.token_enc is not None and token_emb_all is not None
     if use_tokens:
-        token_emb_all = token_emb_all.to(device)
+        # token_emb_all deliberately kept on CPU -- moving the whole training-pool
+        # token matrix to GPU upfront fits at cell scale but OOMs at bin scale (up
+        # to ~4.79M rows, a single allocation exceeding a 40GB GPU's entire capacity,
+        # confirmed directly from a bin-level LOSO run's CUDA OOM traceback).
+        # train_step indexes each batch's slice directly, same per-batch pattern
+        # already used in pretrain_token_autoencoder.
         cell_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in cell_meta.items()}
     local_warmup_epochs = local_warmup_epochs if local_warmup_epochs is not None else warmup_epochs
 
@@ -1147,14 +1154,22 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
         model.trans_enc, data, device,
         num_neighbors=eval_num_neighbors, batch_size=eval_batch_size,
     )
-    token_emb_all = token_emb_all.to(device)
     slide_id_all = cell_meta["slide_id"].to(device)
     xy_all = cell_meta["xy"].to(device)
     neighbor_radius = cell_meta.get("neighbor_radius")
     if cell_type_labels is not None:
         cell_type_labels = torch.as_tensor(cell_type_labels, device=device)
 
-    z_token_full = model.token_enc(token_emb_all)
+    # token_emb_all stays on CPU and is encoded in chunks -- same rationale as
+    # train()/train_step: a wholesale .to(device) on the full training-pool matrix
+    # OOMs at bin scale. z_token_full itself (latent-dim wide, not token-dim wide)
+    # is small enough to keep resident on device for the rest of this function.
+    # (this whole function is already @torch.no_grad()-decorated)
+    z_token_chunks = []
+    for start in range(0, token_emb_all.shape[0], eval_batch_size):
+        chunk = token_emb_all[start:start + eval_batch_size].to(device)
+        z_token_chunks.append(model.token_enc(chunk))
+    z_token_full = torch.cat(z_token_chunks, dim=0)
 
     rng = np.random.default_rng(seed)
     results_per_slide = {}
