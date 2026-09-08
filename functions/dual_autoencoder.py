@@ -840,7 +840,12 @@ def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batc
     )
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, mode="min", factor=0.5, patience=5)
 
-    token_emb_all = token_emb_all.to(device)
+    # token_emb_all stays on CPU -- moving the WHOLE training-pool matrix to GPU
+    # upfront fit at cell scale (~2.1M rows) but OOMs at bin scale (up to ~4.79M
+    # rows -- a single allocation exceeding a 40GB GPU's entire capacity, confirmed
+    # directly from a bin-level LOSO run's CUDA OOM traceback). Only each batch is
+    # moved to GPU below, inside the loop, matching how the main Phase-3 loop
+    # (SlideStratifiedLoader) already handles data too large to keep resident on GPU.
     slide_id = cell_meta["slide_id"].to(device)
     N = token_emb_all.shape[0]
 
@@ -860,7 +865,7 @@ def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batc
         tot_recon, nb = 0.0, 0
         for start in range(0, len(train_perm), batch_size):
             idx = train_perm[start:start + batch_size]
-            x = token_emb_all[idx]
+            x = token_emb_all[idx].to(device)
             sid = slide_id[idx]
             z = model.token_enc(x)
             recon = model.token_dec(z, slide_code=sid)
@@ -875,7 +880,7 @@ def pretrain_token_autoencoder(model, token_emb_all, cell_meta, epochs=100, batc
         model.token_enc.eval()
         model.token_dec.eval()
         with torch.no_grad():
-            x = token_emb_all[val_idx]
+            x = token_emb_all[val_idx].to(device)
             sid = slide_id[val_idx]
             z = model.token_enc(x)
             recon = model.token_dec(z, slide_code=sid)
