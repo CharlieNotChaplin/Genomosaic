@@ -91,7 +91,45 @@ import warnings
 warnings.filterwarnings("ignore")
 
 
-def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
+def load_sample_adata(dir_custom_binning, dir_combined_adata, sample):
+    """
+    Load the per-nucleus adata for `sample`: from its own
+    count_area_filtered_adata.h5ad if that still exists, otherwise filtered out
+    of the combined multi-sample file (obs['Slide_ID'] == sample). The
+    per-sample files this pipeline originally read from have since been
+    deleted for every sample -- verified (2026-09-08) that the combined file's
+    per-slide obsm['spatial'] coordinates are still in that slide's own native
+    full-res WSI pixel space (CRC_P1's x/y range matches the old per-sample
+    file to within a few px, the small difference being extra nuclei present
+    in the combined file's less-filtered version) -- so no rescaling is needed
+    either way, just picking the right rows out.
+    """
+    per_sample_path = dir_custom_binning / "count_area_filtered_adata.h5ad"
+    if per_sample_path.exists():
+        adata = sc.read_h5ad(per_sample_path)
+        source = per_sample_path
+    else:
+        if not dir_combined_adata.exists():
+            raise FileNotFoundError(f"Neither {per_sample_path} nor {dir_combined_adata} exist")
+        print(f"{per_sample_path} not found, loading {sample} out of {dir_combined_adata} instead", flush=True)
+        combined = sc.read_h5ad(dir_combined_adata, backed="r")
+        if "Slide_ID" not in combined.obs:
+            raise ValueError(f"{dir_combined_adata} has no obs['Slide_ID'] to select {sample!r} by")
+        mask = (combined.obs["Slide_ID"] == sample).values
+        if mask.sum() == 0:
+            raise ValueError(f"No rows with Slide_ID == {sample!r} in {dir_combined_adata}")
+        adata = combined[mask].to_memory()
+        source = dir_combined_adata
+
+    if "spatially_variable" not in adata.var or "spatial" not in adata.obsm:
+        raise ValueError(
+            f"{source} has no var['spatially_variable']/obsm['spatial'] for sample {sample!r} -- "
+            f"run get_svg.py --sample {sample} first"
+        )
+    return adata
+
+
+def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
                              dir_spagcn_data, dir_spagcn_results, sample, beta, alpha,
                              force_recompute=False):
     nuclei_centroids_path = dir_spagcn_data / "nuclei_centroids_svg.h5ad"
@@ -106,13 +144,6 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
         nuclei_centroids_path.unlink()
         adj_path.unlink()
 
-    # get_svg.py annotates and writes back to the same count_area_filtered_adata.h5ad
-    # it reads (var['spatially_variable'], var['moranI'], obsm['spatial']) -- there is
-    # no separate "*_svg.h5ad" file on disk for any processed sample.
-    svg_path = dir_custom_binning / "count_area_filtered_adata.h5ad"
-    if not svg_path.exists():
-        raise FileNotFoundError(f"{svg_path} not found")
-
     # .btf (BigTIFF) for the original CRC_P*/Normal_P* samples, .tif/.tiff for newer
     # ones (e.g. CRC_P3_SMAP/CRC_P4_SMAP ship "HE.tif" instead) -- both are read the
     # same way via pyvips, so just widen the search rather than assuming one extension.
@@ -126,12 +157,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
 
     # obsm['spatial'] already holds nuclei centroid pixel coords (set by get_svg.py
     # from nuclei_geometry.parquet), so we don't need geopandas here.
-    adata = sc.read_h5ad(svg_path)
-    if "spatially_variable" not in adata.var or "spatial" not in adata.obsm:
-        raise ValueError(
-            f"{svg_path} has no var['spatially_variable']/obsm['spatial'] -- "
-            f"run get_svg.py --sample {sample} first"
-        )
+    adata = load_sample_adata(dir_custom_binning, dir_combined_adata, sample)
     adata.var_names_make_unique()
     if adata.obs["id"].is_unique:
         adata.obs = adata.obs.set_index("id")
@@ -372,11 +398,13 @@ def main():
     dir_base_input = dir_sample / "input"
     dir_base_output = dir_sample / f"output/binned_outputs/square_{args.bin_size}"
     dir_custom_binning = dir_sample / "01_preprocessing" / args.cellseg_dir / args.bin_size / "custom_binning"
+    dir_combined_adata = (basedir / "combined" / "01_preprocessing" / args.cellseg_dir / args.bin_size
+                           / "custom_binning" / "count_area_filtered_adata.h5ad")
     dir_spagcn_data = dir_sample / "02_baselines/spagcn/data"
     dir_spagcn_results = dir_sample / "02_baselines/spagcn/results"
 
     if args.stage in ("search", "all"):
-        build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
+        build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
                                  dir_spagcn_data, dir_spagcn_results, args.sample, args.beta, args.alpha,
                                  force_recompute=args.force_recompute)
         run_search(dir_spagcn_data, args.n_clusters, args.p, args.seed,

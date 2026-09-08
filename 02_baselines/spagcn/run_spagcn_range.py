@@ -40,6 +40,8 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
     dir_base_input = dir_sample / "input"
     dir_base_output = dir_sample / f"output/binned_outputs/square_{args.bin_size}"
     dir_custom_binning = dir_sample / "01_preprocessing" / args.cellseg_dir / args.bin_size / "custom_binning"
+    dir_combined_adata = (basedir / "combined" / "01_preprocessing" / args.cellseg_dir / args.bin_size
+                           / "custom_binning" / "count_area_filtered_adata.h5ad")
     dir_spagcn_data = dir_sample / "02_baselines/spagcn/data"
     dir_spagcn_results = dir_sample / "02_baselines/spagcn/results"
     suffix = "_svggenes" if args.svg_genes_only else ""
@@ -50,7 +52,7 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
     # at the end of every sample regardless, so there is never a legitimate cache
     # to reuse between invocations -- only stale/pre-patch leftovers from outside
     # this script, which we don't want silently reused.
-    core.build_adj_and_centroids(dir_custom_binning, dir_base_input, dir_base_output,
+    core.build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
                                   dir_spagcn_data, dir_spagcn_results, sample,
                                   args.beta, args.alpha, force_recompute=True)
 
