@@ -534,8 +534,20 @@ def merge_anndatas(
     if stray_nones:
         print(f"  sanitized {len(stray_nones)} stray null uns entries before writing: {stray_nones}")
 
+    # X arrives as float64 (upcast somewhere in the per-sample read/concat path) even
+    # though it only ever holds raw UMI counts -- halves X's on-disk footprint with no
+    # precision loss. .astype() on a sparse matrix only touches .data (the values),
+    # not .indices/.indptr, so this doesn't touch anything already appropriately sized.
+    if adata_merged.X.dtype != np.float32:
+        print(f"  casting X from {adata_merged.X.dtype} to float32 before writing")
+        adata_merged.X = adata_merged.X.astype(np.float32)
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    adata_merged.write(out_path)
+    # compression="gzip": every per-sample file this merges (see get_svg.py's own
+    # final write) is already gzip-compressed -- without it here, the combined file
+    # was coming out LARGER than the sum of its (compressed) inputs, purely from
+    # this one write call skipping compression. Sparse count data compresses well.
+    adata_merged.write(out_path, compression="gzip")
 
     return adata_merged
 
