@@ -131,15 +131,27 @@ def load_sample_adata(dir_custom_binning, dir_combined_adata, sample):
 
 def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
                              dir_spagcn_data, dir_spagcn_results, sample, beta, alpha,
-                             force_recompute=False):
+                             force_recompute=False, skip_adj_disk=False):
+    """
+    Returns (adata, adj) -- the same objects the adjacency graph was built
+    from, so a caller that already holds them in memory (run_spagcn_range.py)
+    doesn't have to round-trip them through disk to use them.
+
+    skip_adj_disk=True never writes adj.npy at all (nuclei_centroids_svg.h5ad
+    still is -- it's a few hundred MB at most, not the multi-GB/TB item).
+    Only safe when the whole build->search->train sequence for this sample
+    runs in one continuous process (run_spagcn_range.py): run_spagcn_svg.py's
+    own --stage search/--stage train CLI runs those as separate SLURM jobs,
+    which can only share state through disk, so it always leaves this False.
+    """
     nuclei_centroids_path = dir_spagcn_data / "nuclei_centroids_svg.h5ad"
     adj_path = dir_spagcn_data / "adj.npy"
 
-    if nuclei_centroids_path.exists() and adj_path.exists():
+    if not skip_adj_disk and nuclei_centroids_path.exists() and adj_path.exists():
         if not force_recompute:
             print(f"Found existing {nuclei_centroids_path.name} and adj.npy, skipping prep "
                   "(pass --force-recompute, or delete them, to force recompute)")
-            return
+            return None, None
         print(f"--force-recompute set: deleting existing {nuclei_centroids_path.name} and adj.npy")
         nuclei_centroids_path.unlink()
         adj_path.unlink()
@@ -241,19 +253,35 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
     gc.collect()
 
     dir_spagcn_data.mkdir(parents=True, exist_ok=True)
-    np.save(adj_path, adj.astype(np.float32))
     adata.write_h5ad(nuclei_centroids_path)
-    print(f"Wrote {nuclei_centroids_path} and {adj_path}")
+    if skip_adj_disk:
+        print(f"Wrote {nuclei_centroids_path} (adj.npy skipped -- kept in memory only)")
+    else:
+        np.save(adj_path, adj.astype(np.float32))
+        print(f"Wrote {nuclei_centroids_path} and {adj_path}")
+    return adata, adj
 
 
-def load_prepped_adata_and_adj(dir_spagcn_data):
-    adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
-    adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
+def prep_adata_for_search(adata):
+    """
+    Prefilter/normalize/log1p in place, matching load_prepped_adata_and_adj's
+    prep steps -- factored out so a caller that already has adata in memory
+    (run_spagcn_range.py) can prep it directly instead of round-tripping
+    through disk first. Mutates and returns `adata`; pass a copy in if the
+    original (unfiltered/unnormalized) adata is still needed afterward.
+    """
     adata.var_names_make_unique()
     spg.prefilter_genes(adata, min_cells=3)
     spg.prefilter_specialgenes(adata)
     sc.pp.normalize_per_cell(adata)
     sc.pp.log1p(adata)
+    return adata
+
+
+def load_prepped_adata_and_adj(dir_spagcn_data):
+    adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
+    adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
+    prep_adata_for_search(adata)
     return adata, adj
 
 
@@ -309,9 +337,24 @@ def run_search(dir_spagcn_data, n_clusters, p, seed, l_start, l_end, l_tol, l_ma
     find_res(dir_spagcn_data, adata, adj, l, n_clusters, seed)
 
 
-def run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, seed, svg_genes_only):
-    adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
-    adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
+def run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, seed, svg_genes_only,
+               adata=None, adj=None):
+    """
+    If adata/adj are not given, loads them fresh from disk, matching the
+    original behavior exactly. If given (run_spagcn_range.py's in-memory
+    path), operates on a COPY of adata rather than the caller's object --
+    required because this function's own prefilter/subset/normalize/log1p
+    steps are destructive, and it's called once per n_clusters value against
+    what would otherwise be the same shared, already-mutated adata on the
+    second call onward.
+    """
+    if adata is None:
+        adata = sc.read_h5ad(dir_spagcn_data / "nuclei_centroids_svg.h5ad")
+    else:
+        adata = adata.copy()
+    if adj is None:
+        adj = np.load(dir_spagcn_data / "adj.npy", mmap_mode="r")
+
     adata.var_names_make_unique()
     spg.prefilter_genes(adata, min_cells=3)
     spg.prefilter_specialgenes(adata)

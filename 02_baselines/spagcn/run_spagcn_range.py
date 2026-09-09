@@ -1,13 +1,16 @@
 """
 Sequential batch runner: for each --sample, in order,
-  1. build the adjacency matrix + prepped centroids once (build_adj_and_centroids)
+  1. build the adjacency matrix + prepped centroids once (build_adj_and_centroids),
+     keeping the matrix itself purely in memory (adj.npy is never written to
+     disk -- see skip_adj_disk in build_adj_and_centroids)
   2. find l once (spatial-only, independent of n_clusters)
   3. for n_clusters in [--n-clusters-min, --n-clusters-max]: find its resolution,
      train, and write one compact {sample}_cluster_{n}.parquet (id, sample,
      n_clusters, pred, refined_pred) to --outputs-dir
-  4. delete every intermediate/heavy file created for that sample (adj.npy,
-     nuclei_centroids_svg.h5ad, l.txt, res_cluster_*.txt, results_cluster_*.h5ad,
-     plots) -- only the parquet/csv files in --outputs-dir survive
+  4. delete every intermediate/heavy file actually written to disk for that
+     sample (nuclei_centroids_svg.h5ad, l.txt, res_cluster_*.txt,
+     results_cluster_*.h5ad, plots) -- only the parquet/csv files in
+     --outputs-dir survive
   5. only then move to the next sample
 
 Samples are processed strictly one at a time within this single process --
@@ -18,11 +21,14 @@ build_adj_and_centroids/find_l/find_res/run_train from run_spagcn_svg.py rather
 than duplicating that logic, so it also inherits the NaN-adjacency-matrix fix
 and the scipy `.A` compat shim defined there.
 
-Since this is one continuous process/job, its --mem/--time on the cluster must
-cover the LARGEST sample in --samples, not the average -- see
-run_all_samples.sh's per-sample nuclei-count table for sizing guidance, and
-don't mix a huge sample into the same invocation as several small ones if that
-means requesting memory the small ones will sit around not using.
+Keeping the adjacency matrix in memory only (never on disk) trades disk for
+RAM: it does NOT reduce how much RAM a sample needs -- the matrix always had
+to be resident to be used for anything -- it only removes the redundant disk
+copy. So --mem on the cluster still needs to cover the LARGEST sample in
+--samples (not the average, since samples run sequentially, not in parallel,
+within this one process), same as before; it's --storage that this change
+actually relieves. See run_all_samples.sh's per-sample nuclei-count table for
+sizing guidance either way.
 
 Usage:
     python run_spagcn_range.py --samples CRC_P1 CRC_P6_5mm \\
@@ -52,19 +58,36 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
     # at the end of every sample regardless, so there is never a legitimate cache
     # to reuse between invocations -- only stale/pre-patch leftovers from outside
     # this script, which we don't want silently reused.
-    core.build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
-                                  dir_spagcn_data, dir_spagcn_results, sample,
-                                  args.beta, args.alpha, force_recompute=True)
+    #
+    # skip_adj_disk=True: adj.npy is never written at all -- it's kept purely in
+    # memory for this sample's entire lifetime (build -> search -> every
+    # n_clusters' train -> cleanup), since this whole sequence runs in one
+    # continuous process here. This trades disk for RAM: RAM usage is unchanged
+    # (the matrix always had to be resident to be used at all), but disk usage
+    # for the dominant multi-GB/TB item drops to zero. Only valid because this
+    # script never splits search/train across separate processes/SLURM jobs --
+    # run_spagcn_svg.py's own --stage search/--stage train CLI still needs it on
+    # disk to hand off between those.
+    raw_adata, adj = core.build_adj_and_centroids(
+        dir_custom_binning, dir_combined_adata, dir_base_input, dir_base_output,
+        dir_spagcn_data, dir_spagcn_results, sample,
+        args.beta, args.alpha, force_recompute=True, skip_adj_disk=True,
+    )
 
-    adata, adj = core.load_prepped_adata_and_adj(dir_spagcn_data)
+    # Separate prepped copy for search (find_l/find_res reuse this one object
+    # across every n_clusters value, same as before) -- raw_adata itself is kept
+    # untouched so run_train can take its own fresh copy from it every
+    # iteration, exactly matching its original disk-reload-every-call behavior.
+    search_adata = core.prep_adata_for_search(raw_adata.copy())
     l = core.find_l(dir_spagcn_data, adj, args.p, args.l_start, args.l_end, args.l_tol, args.l_max_run)
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
     written = []
     for n_clusters in range(n_clusters_min, n_clusters_max + 1):
         print(f"\n--- {sample}: n_clusters={n_clusters} ---", flush=True)
-        core.find_res(dir_spagcn_data, adata, adj, l, n_clusters, args.seed)
-        core.run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, args.seed, args.svg_genes_only)
+        core.find_res(dir_spagcn_data, search_adata, adj, l, n_clusters, args.seed)
+        core.run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, args.seed, args.svg_genes_only,
+                        adata=raw_adata, adj=adj)
 
         result_h5ad = dir_spagcn_results / f"results_cluster_{n_clusters}{suffix}.h5ad"
         result_adata = core.sc.read_h5ad(result_h5ad)
@@ -91,7 +114,10 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
         (dir_spagcn_results / f"refined_pred_cluster_{n_clusters}{suffix}.png").unlink(missing_ok=True)
 
     # Shared prep files -- only removable now that every n_clusters is done.
-    del adata, adj
+    # adj.npy was never written to disk in the first place (skip_adj_disk=True
+    # above), so that unlink is a no-op; kept for symmetry/defensiveness in
+    # case that ever changes.
+    del raw_adata, search_adata, adj
     (dir_spagcn_data / "nuclei_centroids_svg.h5ad").unlink(missing_ok=True)
     (dir_spagcn_data / "adj.npy").unlink(missing_ok=True)
     (dir_spagcn_data / "l.txt").unlink(missing_ok=True)
