@@ -1,28 +1,35 @@
 """
-Disk-budget-aware job supervisor for SpaGCN. Submits one
+RAM-budget-aware job supervisor for SpaGCN. Submits one
 `sbatch run_spagcn_range.sbatch --samples <sample> ...` job per sample in
 --samples, capped by BOTH --max-concurrent (how many may run at once) and
---storage-budget-gb (the sum of currently-running jobs' adjacency-matrix disk
-usage may never exceed this). Always submits the next queued sample as soon
-as a running one finishes and frees enough budget -- same spirit as SLURM's
-array `%K` throttle, but admitting by disk size, not just job count.
+--mem-budget-gb (the sum of currently-running jobs' estimated peak RAM usage
+may never exceed this). Always submits the next queued sample as soon as a
+running one finishes and frees enough budget -- same spirit as SLURM's array
+`%K` throttle, but admitting by size, not just job count.
+
+Gates by RAM, not disk: run_spagcn_range.py (as of the skip_adj_disk change)
+keeps the adjacency matrix purely in memory and never writes adj.npy to disk
+at all, so disk is no longer the resource that needs rationing across
+concurrent jobs -- RAM is. Earlier versions of this script tracked disk usage
+instead; if you're pointing this at a version of run_spagcn_range.py that
+still writes adj.npy to disk, this script's admission logic no longer applies
+to that constraint.
 
 Why size-aware admission matters here: SpaGCN's adjacency matrix is a dense
 n_nuclei x n_nuclei float32 array, and nuclei counts vary by >30x across
 samples (e.g. CRC_P6_5mm ~75k vs CRC_P2 ~225k). "3 jobs at a time" by count
-alone can still blow a fixed storage budget depending on which 3 happen to
-overlap -- e.g. CRC_P2's matrix alone is ~202GB, already most of a 250GB
-budget on its own.
+alone can still blow a fixed RAM budget depending on which 3 happen to
+overlap -- e.g. CRC_P2's peak RAM need alone is ~600GB, already most of an
+800GB budget on its own.
 
-Per-sample nuclei counts (and therefore disk estimates) are read directly
-from the combined adata's obs['Slide_ID'] counts at startup (backed mode, no
-full load), not hardcoded, so this stays correct as that file changes.
+Per-sample nuclei counts (and therefore RAM estimates) are read directly from
+the combined adata's obs['Slide_ID'] counts at startup (backed mode, no full
+load), not hardcoded, so this stays correct as that file changes.
 
-Robustness: a job that dies mid-run (before run_spagcn_range.py's own
-cleanup executes) leaves its adj.npy on disk. This script checks for that
-directly on every poll -- if a "finished" job's adj.npy still exists, its
-budget is NOT released and a warning is printed, rather than silently
-over-committing disk for the next job.
+No "stuck budget" handling is needed here, unlike a disk-based version: RAM
+is reclaimed unconditionally by the OS the instant a process exits, clean
+finish or crash alike -- there's no equivalent of a leftover file on disk to
+check for.
 
 This script itself is meant to run for the whole multi-day batch -- submit it
 as its own tiny long-running SLURM job (schedule_spagcn_jobs.sbatch) rather
@@ -32,7 +39,7 @@ Usage:
     python schedule_spagcn_jobs.py \\
         --samples CRC_P6_5mm CRC_P11mm_2_cut CRC_P4_SMAP CRC_P5 CRC_P2 \\
         --n-clusters-min 7 --n-clusters-max 10 \\
-        --max-concurrent 3 --storage-budget-gb 220
+        --max-concurrent 3 --mem-budget-gb 700
 """
 import argparse
 import subprocess
@@ -52,18 +59,25 @@ def get_nuclei_counts(dir_combined_adata, samples):
     return {s: int(counts[s]) for s in samples}
 
 
-def estimate_disk_gb(n_nuclei):
-    # Dense n x n float32 adjacency matrix -- the dominant disk cost by far.
-    # nuclei_centroids_svg.h5ad and the transient per-n_clusters results.h5ad
-    # are each under ~200MB, folded into the +2GB fixed overhead below.
-    return (n_nuclei ** 2 * 4) / 1e9 + 2
+def estimate_matrix_gb(n_nuclei):
+    # Dense n x n float32 adjacency matrix.
+    return (n_nuclei ** 2 * 4) / 1e9
 
 
-def mem_and_time_for(gb):
-    # ~3x the adjacency matrix as peak RAM (see run_all_samples.sh's sizing
-    # rationale); time is a generous, unmeasured guess scaled the same way.
-    mem_gb = max(32, round(gb * 3))
-    hours = max(6, round(gb / 6))
+def estimate_peak_ram_gb(n_nuclei):
+    # ~3x the adjacency matrix (raw adj + adj_exp + a torch copy of it, all
+    # resident at once at points in the pipeline -- traced for CRC_P1 in an
+    # earlier debugging session), +2GB fixed overhead for
+    # nuclei_centroids_svg.h5ad / the transient per-n_clusters results.h5ad.
+    return estimate_matrix_gb(n_nuclei) * 3 + 2
+
+
+def mem_and_time_for(peak_ram_gb):
+    # time is a generous, unmeasured guess -- /18 rather than the raw matrix
+    # size's old /6 keeps the same hour estimates as before now that the
+    # input here is already the 3x-scaled peak RAM figure, not the raw matrix.
+    mem_gb = max(32, round(peak_ram_gb))
+    hours = max(6, round(peak_ram_gb / 18))
     return f"{mem_gb}G", f"{hours:02d}:00:00"
 
 
@@ -73,10 +87,6 @@ def squeue_alive(job_ids):
     out = subprocess.run(["squeue", "-h", "-j", ",".join(job_ids), "-o", "%i"],
                           capture_output=True, text=True)
     return set(out.stdout.split())
-
-
-def adj_still_present(sample):
-    return (Path("../../data") / sample / "02_baselines/spagcn/data/adj.npy").exists()
 
 
 def submit(sample, n_clusters_min, n_clusters_max, mem, time_, outputs_dir, extra_args):
@@ -100,10 +110,9 @@ def main():
     parser.add_argument("--n-clusters-min", type=int, required=True)
     parser.add_argument("--n-clusters-max", type=int, required=True)
     parser.add_argument("--max-concurrent", type=int, default=3)
-    parser.add_argument("--storage-budget-gb", type=float, default=220,
-                         help="Sum of currently-running jobs' estimated adjacency-matrix "
-                              "disk usage may never exceed this (leave margin below your "
-                              "actual free space)")
+    parser.add_argument("--mem-budget-gb", type=float, default=700,
+                         help="Sum of currently-running jobs' estimated peak RAM usage may "
+                              "never exceed this (leave margin below your actual available RAM)")
     parser.add_argument("--outputs-dir", default="outputs")
     parser.add_argument("--poll-seconds", type=int, default=300)
     parser.add_argument("--combined-adata",
@@ -111,59 +120,52 @@ def main():
                                  "002um/custom_binning/count_area_filtered_adata.h5ad")
     args, extra_args = parser.parse_known_args()
 
-    sizes_gb = {s: estimate_disk_gb(n) for s, n in
-                get_nuclei_counts(Path(args.combined_adata), args.samples).items()}
+    ram_gb = {s: estimate_peak_ram_gb(n) for s, n in
+              get_nuclei_counts(Path(args.combined_adata), args.samples).items()}
 
     queue = []
     for s in args.samples:
-        if sizes_gb[s] > args.storage_budget_gb:
-            print(f"SKIPPING {s}: needs ~{sizes_gb[s]:.0f}GB alone, more than "
-                  f"--storage-budget-gb={args.storage_budget_gb:.0f} -- it can never be admitted.",
+        if ram_gb[s] > args.mem_budget_gb:
+            print(f"SKIPPING {s}: needs ~{ram_gb[s]:.0f}GB peak RAM alone, more than "
+                  f"--mem-budget-gb={args.mem_budget_gb:.0f} -- it can never be admitted.",
                   flush=True)
         else:
             queue.append(s)
     # Largest-first (best-fit-decreasing): packs the awkward big samples while
     # budget is fully free, rather than stranding them behind small ones.
-    queue.sort(key=lambda s: sizes_gb[s], reverse=True)
+    queue.sort(key=lambda s: ram_gb[s], reverse=True)
 
     running = {}  # job_id -> (sample, reserved_gb)
-    stuck = {}    # sample -> gb, for jobs whose adj.npy outlived the SLURM job (never released)
 
     def reserved_total():
-        return sum(gb for _, gb in running.values()) + sum(stuck.values())
+        return sum(gb for _, gb in running.values())
 
     while queue or running:
         alive = squeue_alive(list(running.keys()))
         for jid in [j for j in running if j not in alive]:
             sample, gb = running.pop(jid)
-            if adj_still_present(sample):
-                print(f"WARNING: job {jid} ({sample}) is no longer in squeue but "
-                      f"data/{sample}/02_baselines/spagcn/data/adj.npy still exists -- "
-                      f"it likely died before its own cleanup ran. NOT releasing its "
-                      f"~{gb:.0f}GB budget; please check this job's logs and clean up "
-                      f"manually.", flush=True)
-                stuck[sample] = gb
-            else:
-                print(f"Job {jid} ({sample}) finished cleanly, freeing ~{gb:.0f}GB "
-                      f"({reserved_total():.0f}/{args.storage_budget_gb:.0f}GB now reserved)",
-                      flush=True)
+            # RAM is reclaimed unconditionally by the OS the instant a process
+            # exits -- clean finish or crash alike -- so unlike a disk-based
+            # budget, there's no "did it actually get released" check needed.
+            print(f"Job {jid} ({sample}) finished, freeing ~{gb:.0f}GB "
+                  f"({reserved_total():.0f}/{args.mem_budget_gb:.0f}GB now reserved)", flush=True)
 
         progressed = True
         while progressed and queue:
             progressed = False
             for i, sample in enumerate(queue):
-                gb = sizes_gb[sample]
+                gb = ram_gb[sample]
                 if len(running) >= args.max_concurrent:
                     break
-                if reserved_total() + gb > args.storage_budget_gb:
+                if reserved_total() + gb > args.mem_budget_gb:
                     continue
                 mem, time_ = mem_and_time_for(gb)
                 job_id = submit(sample, args.n_clusters_min, args.n_clusters_max, mem, time_,
                                  args.outputs_dir, extra_args)
                 running[job_id] = (sample, gb)
                 queue.pop(i)
-                print(f"Started {sample} as job {job_id} (~{gb:.0f}GB, mem={mem}, time={time_}); "
-                      f"{reserved_total():.0f}/{args.storage_budget_gb:.0f}GB reserved, "
+                print(f"Started {sample} as job {job_id} (~{gb:.0f}GB peak RAM, mem={mem}, time={time_}); "
+                      f"{reserved_total():.0f}/{args.mem_budget_gb:.0f}GB reserved, "
                       f"{len(running)}/{args.max_concurrent} slots used", flush=True)
                 progressed = True
                 break
@@ -171,11 +173,7 @@ def main():
         if queue or running:
             time.sleep(args.poll_seconds)
 
-    if stuck:
-        print(f"\nDone, but {len(stuck)} sample(s) left stuck/unreleased: {list(stuck)} -- "
-              f"check these manually.", flush=True)
-    else:
-        print("\nAll samples submitted and finished cleanly.", flush=True)
+    print("\nAll samples submitted and finished.", flush=True)
 
 
 if __name__ == "__main__":
