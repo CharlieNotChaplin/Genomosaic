@@ -1,5 +1,6 @@
 # import
 import anndata as ad
+import gc
 import geopandas as gpd
 import numpy as np
 import pandas as pd
@@ -1696,6 +1697,15 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     f_hist_held = f_hist_adata[hist_slide == held_out_slide].copy()
     f_trans_held = f_trans_adata[trans_slide == held_out_slide].copy()
     f_token_held = f_token_adata[token_slide == held_out_slide].copy()
+
+    # The full, un-split f_hist_adata/f_trans_adata/f_token_adata are never read
+    # again below -- only the six train/held splits above are. At bin scale
+    # (~4.8M rows, 1536-dim token embeddings) each one is tens of GB, and keeping
+    # the originals resident alongside their own train+held copies nearly triples
+    # peak memory for no reason (confirmed directly from a bin-level LOSO run's
+    # CPU-RAM ArrayMemoryError on the f_token_train copy). Free them immediately.
+    del f_hist_adata, f_trans_adata, f_token_adata, hist_slide, trans_slide, token_slide
+    gc.collect()
 
     # f_trans_coord is None for bins (no nuclei_geometry.parquet side-car -- bins
     # carry obsm['spatial'] directly, see extract_cell_xy's own None-safe priority

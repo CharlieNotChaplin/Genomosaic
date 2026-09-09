@@ -6,18 +6,26 @@
 #SBATCH --gres=gpu:1
 #SBATCH -c 20
 #SBATCH --mem=128G
-#SBATCH --time=04:00:00
+#SBATCH --time=10:00:00
 #SBATCH --array=0-8
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
 # Bin-level LOSO array -- mirrors submit_run_loso_array.sbatch exactly, just calling
-# run_loso_bins.py instead. --mem bumped to 128G (vs. the cell-level script's 64G):
+# run_loso_bins.py instead. --mem at 128G (vs. the cell-level script's 64G):
 # CRC_P11mm alone is ~1.54M bins, and the combined bin file (4.79M bins total) is
 # larger on disk than the cell-level combined file, so this needs more headroom.
-# --time bumped to 4h as a first guess -- check actual wall-clock on the first array
-# task and adjust once real numbers are in (bin epochs may cost more per step than
-# cell epochs simply from more nodes per slide, even with the same cells_per_batch).
+# functions/dual_autoencoder.py's run_leave_one_slide_out_token now frees the
+# un-split f_hist_adata/f_trans_adata/f_token_adata as soon as the train/held
+# splits exist (run_loso_bins.py hands them off via a pop()'d list so this
+# script's own references don't keep them alive too -- see both files' comments)
+# instead of holding originals + splits simultaneously, which is what caused
+# plain CPU-RAM ArrayMemoryErrors on 6/9 folds under the previous 128G cap.
+# --time bumped from 4h to 10h: 3/9 folds hit the old 4h wall clock while still
+# building the HELD-OUT slide's spatial graph, before training even started --
+# check actual wall-clock on this run and adjust once real numbers are in (bin
+# epochs may cost more per step than cell epochs simply from more nodes per
+# slide, even with the same cells_per_batch).
 #
 # CRC_P6_5mm dropped from this array, same rationale as the cell-level script.
 SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P3_SMAP CRC_P4_SMAP CRC_P5 Normal_P3 Normal_P5)

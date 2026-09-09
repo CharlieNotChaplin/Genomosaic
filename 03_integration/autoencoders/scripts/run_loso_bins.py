@@ -222,8 +222,20 @@ def run_it(held_out_slide="CRC_P1"):
 
     print(f"\n=== [BIN-LEVEL] Leave-one-slide-out (token branch): holding out {HELD_OUT_SLIDE} "
           f"(freeze_token={CONFIG['freeze_token']}) ===\n")
+    # Hand off f_hist_adata/f_trans_adata/f_token_adata via a list + pop() rather
+    # than passing the names directly: a plain call would leave THIS frame's own
+    # f_hist_adata/f_trans_adata/f_token_adata bindings alive (on the call stack)
+    # for the entire duration of run_leave_one_slide_out_token, so its own
+    # del+gc.collect() after splitting (see that function's comment) would find a
+    # second live reference here and free nothing -- at bin scale (~4.8M rows,
+    # tens of GB per array) that's the difference between the split step needing
+    # ~1x vs ~2x these objects' combined size. Popping empties this frame's
+    # references as each argument is evaluated, so run_leave_one_slide_out_token
+    # ends up holding the only reference once the call is entered.
+    _handoff = [f_hist_adata, f_trans_adata, f_token_adata]
+    del f_hist_adata, f_trans_adata, f_token_adata
     metrics, model, history = run_leave_one_slide_out_token(
-        HELD_OUT_SLIDE, f_hist_adata, f_trans_adata, f_trans_coord, f_token_adata, CONFIG, device,
+        HELD_OUT_SLIDE, _handoff.pop(0), _handoff.pop(0), f_trans_coord, _handoff.pop(0), CONFIG, device,
         log_path=log_path, checkpoint_dir=checkpoint_dir, seed=0, verbose=True, run_tag=RUN_TAG,
     )
 
