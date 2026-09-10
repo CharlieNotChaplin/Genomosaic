@@ -208,7 +208,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
     adata.obs["x_array"] = np.clip(np.floor(array_coords[:, 0]).astype(int), array_x_min, array_x_max)
     adata.obs["y_array"] = np.clip(np.floor(array_coords[:, 1]).astype(int), array_y_min, array_y_max)
 
-    del tissue_positions, tissue_pos_array
+    del tissue_positions
     gc.collect()
 
     # --- crop WSI to tissue bounding box and load into memory ---
