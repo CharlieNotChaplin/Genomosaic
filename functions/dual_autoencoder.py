@@ -13,6 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from plyer import notification
+from scipy.spatial import cKDTree
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Data
 from torch_geometric.loader import NeighborLoader
@@ -27,7 +28,7 @@ class SVGGraphEncoder_SAGE(nn.Module):
     one latent vector per CELL -- this is the object the reconstruction loss
     supervises, and the input to patch-level pooling below."""
  
-    def __init__(self, in_dim, hidden_dim=256, latent_dim=64, n_slides=5, dropout=0.1):
+    def __init__(self, in_dim, hidden_dim=256, latent_dim=64, dropout=0.1):
         super().__init__()
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
@@ -57,7 +58,7 @@ class SVGGraphEncoder_TransConv(nn.Module):
     to hidden_dim // heads to keep the layer's total output width == hidden_dim.
     """
 
-    def __init__(self, in_dim, hidden_dim=256, latent_dim=64, n_slides=5,
+    def __init__(self, in_dim, hidden_dim=256, latent_dim=64,
                  dropout=0.1, heads=4, edge_dim=None):
         super().__init__()
         if hidden_dim % heads != 0:
@@ -174,9 +175,9 @@ class DualAutoencoder(nn.Module):
         """
         super().__init__()
         if encoder_type == "sage":
-            self.trans_enc = SVGGraphEncoder_SAGE(n_svg, 256, latent_dim, n_slides)
+            self.trans_enc = SVGGraphEncoder_SAGE(n_svg, 256, latent_dim)
         elif encoder_type == "transconv":
-            self.trans_enc = SVGGraphEncoder_TransConv(n_svg, 256, latent_dim, n_slides, heads=transconv_heads)
+            self.trans_enc = SVGGraphEncoder_TransConv(n_svg, 256, latent_dim, heads=transconv_heads)
         else:
             raise ValueError(f"Unsupported ecnoder_type: '{encoder_type}'. Choose from 'sage', 'transconv'.")
         self.trans_dec = MLPDecoder(latent_dim, [256, 512], n_svg, n_slides,
@@ -318,11 +319,13 @@ def build_spatial_graph(trans_adata, library_key="Slide_ID", n_neighs=6, delauna
 def build_pairing(trans_adata, hist_adata, trans_patch_col="Patch_ID", hist_patch_col="Patch_ID",
                    slide_col="Slide_ID"):
     """
-    Matches each nucleus to the histology patch it falls in -- still needed even
-    with per-cell random batching (SlideStratifiedLoader), since patch_row_trans
-    is what `compute_patch_metadata` uses to build the per-cell reconstruction-
-    loss density weight (patch_meta["weight"], looked up via data.patch_row in
-    train_step), not itself patch-branch-only.
+    Matches each nucleus to the histology patch it falls in. The reconstruction
+    loss itself no longer weights by this (see `compute_local_density_weight`
+    instead); the remaining reason this is still called is that `keep_mask`
+    restricts training to cells with a histology-patch match, and
+    `patch_row_trans` feeds `compute_patch_metadata`'s `slide_id`, used by
+    `run_leave_one_slide_out_token`'s bounds assertion against `trans_dec`'s
+    one-hot slide-coding.
 
     Returns:
       keep_mask: (n_trans,) bool array, nuclei with a matching histology patch
@@ -431,7 +434,7 @@ def extract_cell_xy(trans_sub, f_trans_coord=None):
  
  
 def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row=None,
-                            trans_sub=None, slide_col="Slide_ID", patch_col="Patch_ID",
+                            trans_sub=None, slide_col="Slide_ID",
                             neighbor_radius=None, slide_categories=None):
     """
     Builds one row of metadata per unique histology patch, aligned by integer
@@ -439,17 +442,16 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
     into `hist_emb`). Includes:
       - centroid: mean (x, y) position of nuclei assigned to the patch
       - n_cells: number of paired nuclei
-      - weight: inverse-frequency weight (mean-normalized to ~1), for use in both
-        the patch-level contrastive loss and (optionally) the cell reconstruction loss
-      - slide_id: integer code per patch. IMPORTANT for multi-slide runs: raw
-        spatial coordinates are per-slide, and different slides commonly have
-        overlapping coordinate ranges (e.g. both indexed from ~(0,0)). A patch on
-        slide A and an unrelated patch on slide B can end up with a small
-        `cdist` distance purely by coincidence. `slide_id` lets the neighbor-radius
-        masking in `patch_level_infonce` require "same slide AND close distance"
-        instead of just "close distance", so cross-slide pairs are never
-        incorrectly excluded from the negative set.
-    Also returns a plain pandas DataFrame version for saving/inspection.
+      - weight: inverse-frequency weight (mean-normalized to ~1). No longer used
+        to weight the reconstruction loss (see `compute_local_density_weight`
+        instead) -- kept for whoever still wants a patch-level density readout.
+      - slide_id: integer code per patch, used by `run_leave_one_slide_out_token`'s
+        bounds assertion against `trans_dec`'s one-hot slide-coding. IMPORTANT for
+        multi-slide runs: raw spatial coordinates are per-slide, and different
+        slides commonly have overlapping coordinate ranges (e.g. both indexed from
+        ~(0,0)) -- `slide_id` also lets other code require "same slide AND close
+        distance" instead of just "close distance", so cross-slide pairs are never
+        incorrectly conflated.
 
     slide_categories: canonical, ordered list of slide names to code against (pass the
       same `slide_uniques` used for the cell/graph side). Previously this ran its own
@@ -501,17 +503,7 @@ def compute_patch_metadata(patch_row_trans, cell_xy, hist_adata, key_to_hist_row
         "neighbor_radius": neighbor_radius,
     }
 
-    meta_df = pd.DataFrame({
-        "patch_row": np.arange(n_hist_patches),
-        "Patch_ID": hist_adata.obs[patch_col].values if patch_col in hist_adata.obs else None,
-        "Slide_ID": hist_adata.obs[slide_col].values if slide_col in hist_adata.obs else None,
-        "centroid_x": centroid[:, 0],
-        "centroid_y": centroid[:, 1],
-        "n_cells": n_cells,
-        "weight": weight,
-    })
-
-    return meta_tensors, meta_df
+    return meta_tensors
 
 
 def build_cell_meta(cell_xy, slide_codes, neighbor_radius=None):
@@ -539,13 +531,56 @@ def build_cell_meta(cell_xy, slide_codes, neighbor_radius=None):
     }
 
 
-def build_pyg_data(X_svg, conn, patch_row_trans, slide_codes):
+def compute_local_density_weight(cell_xy, slide_codes, k=15):
+    """
+    Per-unit inverse-density weight for the reconstruction loss's
+    `weight_reconstruction` branch (see `train_step`), replacing
+    `compute_patch_metadata`'s patch-bucketed `weight`. Density is estimated
+    directly per unit from its own local spatial neighborhood -- the distance
+    to its k-th nearest neighbor WITHIN THE SAME SLIDE (raw coordinates aren't
+    comparable across slides, same convention as `build_spatial_graph`/
+    `local_infonce`'s `neighbor_radius` masking) -- via the standard 2D
+    kNN density estimator density ~ k / (pi * r_k^2), rather than "how many
+    units share this unit's 224px histology patch". Two units immediately
+    adjacent to each other now get almost the same weight, even where a patch
+    boundary would previously have fallen between them.
+
+    Returns 1/density as a (n_units,) float32 tensor, normalized so the mean
+    weight across all units is ~1 (same normalization convention
+    `compute_patch_metadata`'s weight used).
+
+    `cell_xy`/`slide_codes` must be row-aligned with `data.x` (same contract as
+    `build_cell_meta`), since `train_step` indexes into the result using
+    `batch.n_id` (global node ids) directly.
+    """
+    cell_xy = np.asarray(cell_xy, dtype=np.float64)
+    slide_codes = np.asarray(slide_codes)
+    density = np.zeros(len(cell_xy), dtype=np.float64)
+
+    for code in np.unique(slide_codes):
+        mask = slide_codes == code
+        xy = cell_xy[mask]
+        n = len(xy)
+        k_eff = min(k, n - 1)
+        if k_eff < 1:
+            density[mask] = 1.0  # degenerate (single-unit slide) -- weight stays neutral
+            continue
+        tree = cKDTree(xy)
+        dist, _ = tree.query(xy, k=k_eff + 1)  # column 0 is self, at distance 0
+        r_k = np.maximum(dist[:, -1], 1e-6)  # guard against coincident points
+        density[mask] = k_eff / (np.pi * r_k ** 2)
+
+    weight = 1.0 / density
+    weight = weight / weight.mean()
+    return torch.tensor(weight, dtype=torch.float32)
+
+
+def build_pyg_data(X_svg, conn, slide_codes):
     edge_index = torch.tensor(np.vstack(conn.tocoo().nonzero()), dtype=torch.long)
     data = Data(
         x=torch.tensor(X_svg, dtype=torch.float32),
         edge_index=edge_index,
     )
-    data.patch_row = torch.tensor(patch_row_trans, dtype=torch.long)
     data.slide_code = torch.tensor(slide_codes, dtype=torch.long)
     return data
  
@@ -554,17 +589,17 @@ class SlideStratifiedLoader:
     """
     Slide-stratified random mini-batch loader: seed cells are drawn uniformly at
     random per slide (batches are never mixed across slides -- see
-    `patch_level_infonce`'s `slide_ids` masking for why that matters), then
+    `local_infonce`'s `slide_ids` masking for why that matters), then
     expanded via `NeighborLoader`'s standard k-hop neighbor sampling for message
     passing.
 
     Supersedes the earlier `PatchGroupedLoader`, which grouped seed cells by
     shared histology-patch membership so a (since-removed) patch-level pooled
     contrastive loss saw complete patches per batch. That constraint no longer
-    applies: the token/cell contrastive term (`patch_level_infonce` called on
+    applies: the token/cell contrastive term (`local_infonce` called on
     `p_trans_local`/`p_token` in `train_step`) and the cell reconstruction loss
-    are already both genuinely per-cell, needing only a per-cell patch-weight
-    LOOKUP (via `data.patch_row`, see `train_step`) rather than patch-complete
+    are already both genuinely per-cell, needing only a per-cell density-weight
+    LOOKUP (via `batch.n_id`, see `train_step`) rather than patch-complete
     batches. Plain per-slide random seed sampling is simpler, and gives more
     spatially diverse (less clustered, so less frequently excluded by
     `neighbor_radius` masking) in-batch negatives for the contrastive term
@@ -711,16 +746,18 @@ def encode_full_graph_batched(encoder, data, device, num_neighbors=(10, 10), bat
  
 # ---- loss ----
 
-def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
-                         neighbor_radius=None, weight=None, anchor_sim_threshold=None,
-                         return_stats=False):
+def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
+                   neighbor_radius=None, weight=None, anchor_sim_threshold=None,
+                   return_stats=False):
     """
-    One-to-one patch-level InfoNCE (post-pooling: each row is a genuine patch, not
-    a cell). Optionally:
-      - `neighbor_radius`: excludes spatially close, non-matching patches from the
+    One-to-one InfoNCE between a unit's (cell or bin) transcriptomics and local
+    histology projections -- each row is a genuine unit, not a pooled patch (the
+    old patch-level branch this once served is gone; see this project's history
+    for that design). Optionally:
+      - `neighbor_radius`: excludes spatially close, non-matching units from the
         negative set instead of forcing them apart -- nearby tissue can be
         genuinely similar in both modalities under spatial autocorrelation.
-      - `anchor_sim_threshold`: same false-negative problem, but for patches that
+      - `anchor_sim_threshold`: same false-negative problem, but for units that
         are transcriptomically near-duplicate regardless of distance (e.g. two
         separate tumor nests of the same subtype) -- without it, InfoNCE pushes
         them apart via spurious non-biological signal (staining, slide identity)
@@ -732,7 +769,9 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
         Masking-only, never an added attractive term. Assumes L2-normalized
         inputs, so this is a cosine-similarity cutoff in [-1, 1] (e.g. 0.9 =
         near-duplicates only).
-      - `weight`: inverse-frequency weighting per patch.
+      - `weight`: inverse-frequency weighting per unit. Not passed by
+        `train_step`'s own call today (defaults to a plain per-unit mean) --
+        left available for a caller that wants it.
 
     `return_stats=True` also returns `frac_masked` (fraction of candidate
     negatives excluded by any mask) -- a collapse early-warning signal, since
@@ -796,12 +835,12 @@ def patch_level_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=
     log_prob_h2t = logits_h2t - torch.logsumexp(logits_h2t, dim=1, keepdim=True)
     loss_h2t = -log_prob_h2t[idx, idx]
 
-    per_patch_loss = 0.5 * (loss_t2h + loss_h2t)
+    per_unit_loss = 0.5 * (loss_t2h + loss_h2t)
 
     if weight is not None:
-        loss = (per_patch_loss * weight).sum() / weight.sum().clamp(min=1e-8)
+        loss = (per_unit_loss * weight).sum() / weight.sum().clamp(min=1e-8)
     else:
-        loss = per_patch_loss.mean()
+        loss = per_unit_loss.mean()
 
     if return_stats:
         return loss, stats
@@ -935,25 +974,24 @@ def freeze_token_encoder(model, freeze_decoder=True):
         model.token_dec.eval()
 
 
-def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstruction=True,
+def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_reconstruction=True,
                edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
                token_emb_all=None, cell_meta=None, local_contrast_weight=0.0, freeze_token=False,
                local_anchor_sim_threshold=None):
     """
-    patch_meta is still needed here even though the patch-level (histology)
-    branch is gone: `weight_reconstruction`'s per-patch inverse-frequency
-    weighting of the CELL reconstruction loss looks up each seed cell's patch
-    via `batch.patch_row` (a per-cell attribute, sliced by NeighborLoader same
-    as `batch.slide_code`) -- no patch-complete batching (SlideStratifiedLoader)
-    is required for this, just the lookup.
+    density_weight_all: per-unit inverse-density weight (see
+    `compute_local_density_weight`), used by `weight_reconstruction` to weight
+    the CELL reconstruction loss -- looked up per seed cell via `batch.n_id`
+    (global node ids, same lookup token_emb_all/cell_meta already use below),
+    not tied to any histology-patch grouping.
 
     token_emb_all / cell_meta: token_emb_all and cell_meta["xy"]/["slide_id"]
     must be row-aligned with data.x -- seed cells are looked up via
     batch.n_id[:n_seed] (NeighborLoader puts seed nodes first).
 
-    local_anchor_sim_threshold: forwarded to patch_level_infonce -- cosine-
+    local_anchor_sim_threshold: forwarded to local_infonce -- cosine-
     similarity cutoff excluding transcriptomically near-duplicate, non-matching
-    cells from hard negatives (see patch_level_infonce's docstring).
+    cells from hard negatives (see local_infonce's docstring).
 
     edge_dropout_p / gene_dropout_p: denoising-style corruption applied only to
     what trans_enc sees (reconstruction target stays clean). Targets two Slide_ID
@@ -991,8 +1029,7 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
     recon_per_cell = F.mse_loss(x_recon, x[:n_seed], reduction="none").mean(dim=1)
 
     if weight_reconstruction:
-        cell_patch_row = batch.patch_row[:n_seed].to(device)
-        cell_weight = patch_meta["weight"][cell_patch_row]
+        cell_weight = density_weight_all[batch.n_id[:n_seed].to(device)]
         loss_recon_trans = (recon_per_cell * cell_weight).sum() / cell_weight.sum().clamp(min=1e-8)
     else:
         loss_recon_trans = recon_per_cell.mean()
@@ -1014,7 +1051,7 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
         p_trans_local = model.proj_trans_local(z_cells)
         p_token = model.proj_token(z_token_cells)
         cell_xy = cell_meta["xy"][seed_global_ids]
-        loss_contrast_local, local_mask_stats = patch_level_infonce(
+        loss_contrast_local, local_mask_stats = local_infonce(
             p_trans_local, p_token, cell_xy, slide_ids=cell_slide_ids,
             temperature=temperature, neighbor_radius=cell_meta["neighbor_radius"],
             anchor_sim_threshold=local_anchor_sim_threshold,
@@ -1039,17 +1076,21 @@ def train_step(model, batch, patch_meta, opt, temperature=0.07, weight_reconstru
     }
 
 
-def train(model, loader, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5, temperature=0.07,
+def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs=5, temperature=0.07,
           weight_reconstruction=True,
           weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
           token_emb_all=None, cell_meta=None, max_local_contrast_weight=0.0,
           local_warmup_epochs=None, freeze_token=False, token_lr_mult=1.0,
           local_anchor_sim_threshold=None):
     """
+    density_weight_all: per-unit inverse-density weight from
+      `compute_local_density_weight`, required (not None) when
+      weight_reconstruction=True -- see `train_step`'s docstring.
+
     token_emb_all / cell_meta: see `build_cell_meta`. None (default) trains as
       before, including for models with no token branch.
 
-    local_anchor_sim_threshold: forwarded to `patch_level_infonce` -- cosine-
+    local_anchor_sim_threshold: forwarded to `local_infonce` -- cosine-
       similarity cutoff excluding transcriptomically near-duplicate, non-matching
       cells from hard negatives (same false-negative protection as
       `neighbor_radius`, gated on expression similarity instead of distance).
@@ -1077,7 +1118,11 @@ def train(model, loader, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5, temp
     if token_params:
         param_groups.append({"params": token_params, "lr": lr * token_lr_mult, "weight_decay": weight_decay})
     opt = torch.optim.Adam(param_groups)
-    patch_meta = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in patch_meta.items()}
+    if weight_reconstruction:
+        if density_weight_all is None:
+            raise ValueError("weight_reconstruction=True requires density_weight_all (see compute_local_density_weight)")
+        # Small (n_units,) tensor -- unlike token_emb_all, no per-batch slicing needed.
+        density_weight_all = density_weight_all.to(device)
 
     use_tokens = model.token_enc is not None and token_emb_all is not None
     if use_tokens:
@@ -1103,7 +1148,7 @@ def train(model, loader, patch_meta, n_epochs=30, lr=1e-3, warmup_epochs=5, temp
                         "recon_token": 0.0, "contrast_local": 0.0, "local_frac_masked": 0.0}
         n_batches = 0
         for batch in loader:
-            stats = train_step(model, batch, patch_meta, opt,
+            stats = train_step(model, batch, density_weight_all, opt,
                                 temperature=temperature,
                                 weight_reconstruction=weight_reconstruction,
                                 edge_dropout_p=edge_dropout_p, gene_dropout_p=gene_dropout_p,
@@ -1391,7 +1436,7 @@ def pretrain_token_once(model_kwargs, token_emb_all, cell_meta, pretrain_kwargs,
     }
 
 
-def run_token_experiment(run_id, config, model_template_state, data, loader, patch_meta,
+def run_token_experiment(run_id, config, model_template_state, data, loader, density_weight_all,
                           token_emb_all, cell_meta, n_slides, n_svg, token_dim,
                           cell_type_labels, log_path, checkpoint_dir=None, seed=0, device="cuda",
                           leakage_subsample=20_000):
@@ -1442,7 +1487,7 @@ def run_token_experiment(run_id, config, model_template_state, data, loader, pat
         freeze_token_encoder(model, freeze_decoder=True)
 
     history = train(
-        model, loader, patch_meta,
+        model, loader, density_weight_all,
         n_epochs=config["n_epochs"], lr=config["lr"], warmup_epochs=config["warmup_epochs"],
         temperature=config["temperature"],
         weight_reconstruction=config["weight_reconstruction_by_patch_freq"],
@@ -1538,7 +1583,7 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
       held-out slice, same leakage rationale.
 
     Returns a dict: svg_mask, svg_scaler, hist_scaler, X_svg, hist_emb,
-    hist_emb_t, trans_sub, patch_meta, patch_meta_df, data, loader, n_slides,
+    hist_emb_t, trans_sub, patch_meta, density_weight, data, loader, n_slides,
     n_svg, hist_dim, and (only when f_token_adata is given) token_scaler,
     token_emb, token_emb_t, cell_meta, token_dim.
     """
@@ -1608,15 +1653,21 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
             print(f"  token_emb: {token_emb.shape}")
 
     cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
-    patch_meta, patch_meta_df = compute_patch_metadata(
+    # patch_meta is kept only for run_leave_one_slide_out_token's slide_id bounds
+    # assertion -- not the reconstruction loss's weight source anymore (see below).
+    patch_meta = compute_patch_metadata(
         patch_row_trans, cell_xy, f_hist_adata, neighbor_radius=CONFIG["neighbor_radius"],
         slide_categories=slide_uniques,
     )
+    # Per-unit inverse-density weight for weight_reconstruction (see train_step) --
+    # supersedes patch_meta["weight"] as the reconstruction loss's actual weight
+    # source (see compute_local_density_weight's docstring for why).
+    density_weight = compute_local_density_weight(cell_xy, slide_codes)
 
     if f_token_adata is not None:
         cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=local_neighbor_radius)
 
-    data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
+    data = build_pyg_data(X_svg, conn_sub, slide_codes)
     loader = SlideStratifiedLoader(
         data, data.slide_code,
         num_neighbors=CONFIG["num_neighbors"], cells_per_batch=CONFIG["cells_per_batch"],
@@ -1627,7 +1678,8 @@ def build_pipeline_data(f_hist_adata, f_trans_adata, f_trans_coord, CONFIG,
     result = {
         "svg_mask": svg_mask, "svg_scaler": svg_scaler, "hist_scaler": hist_scaler,
         "X_svg": X_svg, "hist_emb": hist_emb, "hist_emb_t": hist_emb_t,
-        "trans_sub": trans_sub, "patch_meta": patch_meta, "patch_meta_df": patch_meta_df,
+        "trans_sub": trans_sub, "patch_meta": patch_meta,
+        "density_weight": density_weight,
         "data": data, "loader": loader, "n_slides": n_slides,
         "n_svg": X_svg.shape[1], "hist_dim": hist_emb.shape[1],
     }
@@ -1798,7 +1850,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     )
 
     history = train(
-        model, train_pipe["loader"], train_pipe["patch_meta"],
+        model, train_pipe["loader"], train_pipe["density_weight"],
         n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
         temperature=CONFIG["temperature"],
         weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
@@ -1903,9 +1955,30 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     if checkpoint_dir is not None:
         checkpoint_dir = Path(checkpoint_dir)
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        # gene_names / *_scaler: fit ONLY on the training slides (see build_pipeline_data's
+        # svg_mask/svg_scaler/hist_scaler/token_scaler docstring -- the held-out call reuses
+        # these exact fitted objects rather than refitting, to avoid leakage). Saved here so
+        # a genuinely new sample can later be matched to and preprocessed for this specific
+        # trained model (same gene subset in the same order, same normalize_total+log1p ->
+        # StandardScaler.transform() the model actually saw) without needing to re-run this
+        # LOSO split to regenerate them -- previously these existed only in train_pipe, in
+        # memory, for the duration of this one call. token_scaler is only present when the
+        # token branch was used (mirrors train_pipe's own optional key).
+        gene_names = train_pipe["trans_sub"].var_names[train_pipe["svg_mask"]].tolist()
         torch.save(
-            {"model_state_dict": model.state_dict(), "config": CONFIG, "metrics": metrics, "history": history},
+            {
+                "model_state_dict": model.state_dict(), "config": CONFIG, "metrics": metrics, "history": history,
+                "gene_names": gene_names,
+                "svg_scaler": train_pipe["svg_scaler"], "hist_scaler": train_pipe["hist_scaler"],
+                "token_scaler": train_pipe.get("token_scaler"),
+            },
             checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}.pt",
+        )
+        # Plain-text gene panel, one gene per line, in the exact column order the model's
+        # trans_enc expects -- lets a new sample's panel be checked/matched against this
+        # model without loading torch at all.
+        (checkpoint_dir / f"loso_token_{held_out_slide}{run_tag}_gene_panel.txt").write_text(
+            "\n".join(gene_names) + "\n"
         )
         # Full (uncapped) cell embeddings, saved alongside the checkpoint as the actual
         # deliverable -- can be large (a multi-hundred-MB .npz) when the training pool

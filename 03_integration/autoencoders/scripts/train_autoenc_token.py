@@ -74,11 +74,9 @@ CONFIG = dict(
 
     # loss
     temperature=0.07,
-    neighbor_radius=2912,     # still required by compute_patch_metadata/build_pipeline_data's
-                                # shared patch-batching path (2x patch diameter, 224x224px)
 
     # false-negative protection: excludes transcriptomically near-duplicate,
-    # non-matching cells from hard negatives (see patch_level_infonce). None disables.
+    # non-matching cells from hard negatives (see local_infonce). None disables.
     # None (was 0.9): the 18-config sweep showed this masking doesn't clearly help
     # (None beat 0.9 in most pairs, e.g. weight=1.0/warmup=10: cell_top1 0.0663 vs
     # 0.0579) and it was the collapse mechanism (checks the model's own live
@@ -260,17 +258,15 @@ print(f"  token_emb: {token_emb.shape}")
 
 print("5. centroids")
 cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
-patch_meta, patch_meta_df = compute_patch_metadata(
-    patch_row_trans, cell_xy, f_hist_adata,
-    neighbor_radius=CONFIG["neighbor_radius"],
-    slide_categories=slide_uniques,
-)
-patch_meta_df.to_csv(dir_output / "patch_metadata.csv", index=False)
+# Reconstruction-loss weight source (see train_step) -- compute_patch_metadata's
+# patch-bucketed weight isn't computed here anymore: nothing in this script read
+# it beyond a patch_metadata.csv dump and an unused local, both dropped.
+density_weight = compute_local_density_weight(cell_xy, slide_codes)
 
 cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=CONFIG["local_neighbor_radius"])
 
 print("6. pyg")
-data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
+data = build_pyg_data(X_svg, conn_sub, slide_codes)
 loader = SlideStratifiedLoader(
     data, data.slide_code,
     num_neighbors=CONFIG["num_neighbors"], cells_per_batch=CONFIG["cells_per_batch"],
@@ -306,7 +302,7 @@ if CONFIG["freeze_token"]:
 # ---- Phase 3: joint training (cell-level contrastive) ------------------
 print("\n=== Phase 3: joint contrastive training ===")
 train(
-    model, loader, patch_meta,
+    model, loader, density_weight,
     n_epochs=CONFIG["n_epochs"], lr=CONFIG["lr"], warmup_epochs=CONFIG["warmup_epochs"],
     weight_reconstruction=CONFIG["weight_reconstruction_by_patch_freq"],
     device=device,
@@ -359,7 +355,6 @@ np.savez(
     dir_output / "dual_ae_latents.npz",
     z_trans_cell=z_trans_all,
     z_token_cell=z_token_all,
-    patch_row=data.patch_row.numpy(),
     slide_code=data.slide_code.numpy(),
 )
 

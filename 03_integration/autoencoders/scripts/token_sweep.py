@@ -186,13 +186,14 @@ print(f"  token_emb: {token_emb.shape}")
 
 print("5. centroids")
 cell_xy = extract_cell_xy(trans_sub, f_trans_coord)
-patch_meta, patch_meta_df = compute_patch_metadata(
-    patch_row_trans, cell_xy, f_hist_adata, neighbor_radius=2912,
-)
+# Reconstruction-loss weight source (see train_step) -- compute_patch_metadata
+# isn't called here anymore: nothing in this script read its output beyond
+# feeding this same loss, now superseded by the per-unit density weight below.
+density_weight = compute_local_density_weight(cell_xy, slide_codes)
 cell_meta = build_cell_meta(cell_xy, slide_codes, neighbor_radius=100)
 
 print("6. pyg")
-data = build_pyg_data(X_svg, conn_sub, patch_row_trans, slide_codes)
+data = build_pyg_data(X_svg, conn_sub, slide_codes)
 loader = SlideStratifiedLoader(
     data, data.slide_code, num_neighbors=(10, 10), cells_per_batch=1024,
 )
@@ -239,7 +240,7 @@ for i, combo in enumerate(combos):
 
     print(f"\n--- [{i + 1}/{len(combos)}] run_id={run_id} ---")
     run_token_experiment(
-        run_id, config, model_template_state, data, loader, patch_meta,
+        run_id, config, model_template_state, data, loader, density_weight,
         token_emb_t, cell_meta, n_slides, X_svg.shape[1], token_emb.shape[1],
         cluster_labels, log_path=LOG_PATH, checkpoint_dir=CHECKPOINT_DIR, device=device,
     )
