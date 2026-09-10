@@ -43,7 +43,15 @@ for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().pa
 from functions.dual_autoencoder import *
 
 
-def run_it(held_out_slide="CRC_P1"):
+def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
+           local_neighbor_radius=100, local_anchor_sim_threshold=None,
+           skip_token_pretrain=False, freeze_token=False):
+    """
+    Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
+    __main__'s CLI parsing can override them per sbatch submission without touching
+    this file -- defaults here exactly reproduce the previously-hardcoded values,
+    so a plain `run_it(held_out_slide=...)` call is unchanged from before.
+    """
     set_seed(42)
 
     # ---- CONFIG -------------------------------------------------------------
@@ -88,12 +96,24 @@ def run_it(held_out_slide="CRC_P1"):
         temperature=0.07,
         neighbor_radius=2912,       # still required by compute_patch_metadata/
                                      # build_pipeline_data's shared patch-batching path
-        local_neighbor_radius=100,  # cell-level analogue, first attempt
+        local_neighbor_radius=local_neighbor_radius,  # cell-level analogue, first attempt
 
-        local_anchor_sim_threshold=None,  # sweep showed masking here doesn't help and
-                                           # triggers collapse -- see train_autoenc_token.py
+        local_anchor_sim_threshold=local_anchor_sim_threshold,  # None (default): the
+                                           # 18-config sweep showed masking here doesn't
+                                           # help and can trigger collapse -- see
+                                           # train_autoenc_token.py. Ablatable via CLI.
 
         weight_reconstruction_by_patch_freq=True,
+
+        # Denoising corruption (see train_step's own docstring) -- 0.0/0.0 (default)
+        # means this has never actually been exercised in any run to date; both are
+        # ablation knobs, not yet-validated defaults.
+        edge_dropout_p=edge_dropout_p,
+        gene_dropout_p=gene_dropout_p,
+
+        # Ablation hook: True skips Phase-1 token pretraining entirely, so token_enc/
+        # token_dec start from the same random init as the rest of the model.
+        skip_token_pretrain=skip_token_pretrain,
 
         # training (Phase 3)
         n_epochs=100,
@@ -107,7 +127,7 @@ def run_it(held_out_slide="CRC_P1"):
         token_pretrain_val_frac=0.1,
         token_pretrain_patience=15,
         token_lr_mult=0.3,
-        freeze_token=False,
+        freeze_token=freeze_token,
         max_local_contrast_weight=1.0,   # winner of run_token_sweep.py's 18-config sweep
         local_warmup_epochs=10,
 
@@ -246,6 +266,14 @@ def run_it(held_out_slide="CRC_P1"):
     _tag_parts = []
     if CONFIG["freeze_token"]:
         _tag_parts.append("frozen_token")
+    if CONFIG.get("skip_token_pretrain"):
+        _tag_parts.append("nopretrain")
+    if CONFIG.get("edge_dropout_p", 0.0) > 0.0 or CONFIG.get("gene_dropout_p", 0.0) > 0.0:
+        _tag_parts.append(f"edrop{CONFIG.get('edge_dropout_p', 0.0)}_gdrop{CONFIG.get('gene_dropout_p', 0.0)}")
+    if CONFIG.get("local_neighbor_radius") != 100:
+        _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
+    if CONFIG.get("local_anchor_sim_threshold") is not None:
+        _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -306,11 +334,50 @@ def run_it(held_out_slide="CRC_P1"):
         print(f"(desktop notification skipped: {e})")
 
 
+def _float_or_none(s):
+    """argparse type: accepts a float, or the literal string 'none' (any case)."""
+    return None if s.lower() == "none" else float(s)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--held_out_slide", default="CRC_P1",
                          help="Slide to hold out for this fold (default: CRC_P1). "
                               "submit_run_loso_array.sbatch sets this per array task "
                               "for the full N-fold run.")
+    # ---- ablation knobs -- all default to exactly the prior hardcoded CONFIG values,
+    # so omitting a flag reproduces the pre-ablation-CLI behavior exactly. ----
+    parser.add_argument("--edge-dropout-p", type=float, default=0.0,
+                         help="Denoising: fraction of graph edges dropped per training "
+                              "step, encoder's view only (default: 0.0, i.e. off -- "
+                              "never yet exercised in any run before this flag existed).")
+    parser.add_argument("--gene-dropout-p", type=float, default=0.0,
+                         help="Denoising: fraction of gene entries masked per training "
+                              "step (default: 0.0, i.e. off, same caveat as above).")
+    parser.add_argument("--local-neighbor-radius", type=_float_or_none, default=100,
+                         help="Cell<->token contrastive loss: spatial exclusion radius, "
+                              "or 'none' to disable spatial exclusion entirely "
+                              "(default: 100, the value every existing run has used).")
+    parser.add_argument("--local-anchor-sim-threshold", type=_float_or_none, default=None,
+                         help="Cell<->token contrastive loss: semantic (cosine-similarity) "
+                              "exclusion threshold, or 'none' to disable (default: none, "
+                              "the value every existing run has used).")
+    parser.add_argument("--skip-token-pretrain", action="store_true",
+                         help="Skip Phase-1 token-branch pretraining entirely -- "
+                              "token_enc/token_dec start from the same random init as "
+                              "the rest of the model (default: pretraining is kept).")
+    parser.add_argument("--freeze-token", action="store_true",
+                         help="Freeze token_enc/token_dec during Phase 3 joint training "
+                              "(default: not frozen). Pair with pretraining left ON "
+                              "(the default) -- freezing a randomly-initialized token "
+                              "branch is not a meaningful test.")
     args = parser.parse_args()
-    run_it(held_out_slide=args.held_out_slide)
+    run_it(
+        held_out_slide=args.held_out_slide,
+        edge_dropout_p=args.edge_dropout_p,
+        gene_dropout_p=args.gene_dropout_p,
+        local_neighbor_radius=args.local_neighbor_radius,
+        local_anchor_sim_threshold=args.local_anchor_sim_threshold,
+        skip_token_pretrain=args.skip_token_pretrain,
+        freeze_token=args.freeze_token,
+    )

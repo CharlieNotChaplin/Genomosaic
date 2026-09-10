@@ -1340,6 +1340,65 @@ def evaluate_latent_spatial_autocorr(z, centroids, n_neighs=6):
     }
 
 
+def refine_domains(cluster_labels, conn, mode="hard"):
+    """
+    Spatial smoothing of cluster labels into contiguous domains, applied as a
+    post-processing step over an EXISTING sparse spatial connectivity matrix --
+    reuses whatever `build_spatial_graph` already built for a slide (Delaunay for
+    nuclei, grid for bins), rather than constructing a second graph purely for
+    this. Plain clustering on z (e.g. Leiden) groups units by embedding similarity
+    alone, so two feature-identical but spatially disjoint regions can end up in
+    the same cluster; this reassigns labels using only spatial neighbors, which a
+    plain clustering step never looks at.
+
+    Call this on ONE slide's units at a time (same cross-slide-coordinate caveat
+    as evaluate_latent_spatial_autocorr/retrieval_accuracy's neighbor_tolerant
+    check) -- `conn` must already be restricted to that slide's own edges.
+
+    mode="hard": unconditional mode over each unit's spatial neighbors --
+      every unit is reassigned to whatever label is most common among its
+      neighbors, every call.
+    mode="spagcn": SpaGCN's own conditional rule (Hu et al., "SpaGCN", Nature
+      Methods 2021; vendored in this repo under 02_baselines/spagcn/) -- only
+      reassigns a unit when its current label is a clear minority among
+      neighbors (held by fewer than half) AND some other label is a clear
+      majority (held by more than half); otherwise the label is left alone.
+      SpaGCN's original implementation assumes a fixed Visium hex (6) or old-ST
+      square (4) neighborhood rebuilt from a dense distance matrix -- this
+      version instead uses however many neighbors `conn` actually gives each
+      unit (variable for Delaunay, fixed at 8 for a bin grid), so it isn't a
+      literal drop-in of their function, just the same rule.
+
+    Ties (no strict majority) leave the unit's own label unchanged in both modes.
+    """
+    if torch.is_tensor(cluster_labels):
+        cluster_labels = cluster_labels.detach().cpu().numpy()
+    labels = np.asarray(cluster_labels)
+    conn = conn.tocsr()
+    refined = labels.copy()
+
+    for i in range(len(labels)):
+        nbrs = conn.indices[conn.indptr[i]:conn.indptr[i + 1]]
+        if len(nbrs) == 0:
+            continue
+        vals, counts = np.unique(labels[nbrs], return_counts=True)
+        maj_count = counts.max()
+        is_tie = (counts == maj_count).sum() > 1
+        maj_label = vals[counts.argmax()]
+
+        if mode == "hard":
+            if not is_tie:
+                refined[i] = maj_label
+        elif mode == "spagcn":
+            self_count = counts[vals == labels[i]].sum() if labels[i] in vals else 0
+            if self_count < len(nbrs) / 2 and maj_count > len(nbrs) / 2:
+                refined[i] = maj_label
+        else:
+            raise ValueError(f"Unsupported mode: {mode!r}. Choose from 'hard', 'spagcn'.")
+
+    return refined
+
+
 def evaluate_disease_signal(z_train, train_slide_name, z_held, held_slide_name,
                              tumor_prefix="CRC", max_iter=5000, class_weight=None):
     """
@@ -1818,10 +1877,18 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
 
     set_seed(seed)
     model = DualAutoencoder(**model_kwargs)
-    pretrain_info = pretrain_token_autoencoder(
-        model, train_pipe["token_emb_t"], train_pipe["cell_meta"],
-        device=device, verbose=verbose, **pretrain_kwargs,
-    )
+    # skip_token_pretrain: ablation hook for "is Phase-1 pretraining useful at all" --
+    # False (default) reproduces existing behavior exactly. When True, token_enc/
+    # token_dec start from the same random init as the rest of the model and go
+    # straight into Phase 3 -- best_val_mse/stopped_epoch are reported as NaN/-1
+    # rather than omitted, so the log CSV keeps a fixed column set across both arms.
+    if CONFIG.get("skip_token_pretrain", False):
+        pretrain_info = {"best_val_mse": float("nan"), "stopped_epoch": -1}
+    else:
+        pretrain_info = pretrain_token_autoencoder(
+            model, train_pipe["token_emb_t"], train_pipe["cell_meta"],
+            device=device, verbose=verbose, **pretrain_kwargs,
+        )
 
     freeze_token = CONFIG.get("freeze_token", False)
     if freeze_token:
@@ -1860,6 +1927,8 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         local_warmup_epochs=CONFIG.get("local_warmup_epochs"),
         freeze_token=freeze_token, token_lr_mult=CONFIG.get("token_lr_mult", 1.0),
         local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
+        edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0),
+        gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
     )
 
     # cluster labels (independent, pre-existing trans-only clustering) computed
