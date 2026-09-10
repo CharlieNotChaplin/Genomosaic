@@ -186,25 +186,19 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
     array_x_min, array_y_min = tissue_positions["array_col"].min(), tissue_positions["array_row"].min()
     array_x_max, array_y_max = tissue_positions["array_col"].max(), tissue_positions["array_row"].max()
 
-    tissue_pos_array = tissue_positions[
-        ((tissue_positions["array_col"] == array_x_min) | (tissue_positions["array_col"] == array_x_max)) &
-        ((tissue_positions["array_row"] == array_y_min) | (tissue_positions["array_row"] == array_y_max))
-    ]
+    # Fit the pixel -> array affine transform via least squares over EVERY bin,
+    # not just the 4 extreme grid corners (min/max array_row combined with
+    # min/max array_col): tissue often doesn't fill its full rectangular
+    # array_row/array_col bounding box (e.g. an irregular or cut tissue shape),
+    # so one specific corner combination may not exist as an actual row in
+    # tissue_positions.parquet at all -- CRC_P11mm_2_cut hit exactly this,
+    # raising IndexError on an empty filtered lookup. Using every bin needs no
+    # specific corner to exist and is strictly more robust regardless (fits
+    # from thousands of points instead of 4).
+    pixel_pts = tissue_positions[["pxl_col_in_fullres", "pxl_row_in_fullres"]].to_numpy()
+    array_pts = tissue_positions[["array_col", "array_row"]].to_numpy()
 
-    def get_pxl_value(tissue_pos, col_val, row_val):
-        row = tissue_pos.loc[(tissue_pos["array_row"] == row_val) & (tissue_pos["array_col"] == col_val)]
-        return row["pxl_col_in_fullres"].iloc[0], row["pxl_row_in_fullres"].iloc[0]
-
-    px_tl, py_tl = get_pxl_value(tissue_pos_array, array_x_min, array_y_max)
-    px_tr, py_tr = get_pxl_value(tissue_pos_array, array_x_max, array_y_max)
-    px_bl, py_bl = get_pxl_value(tissue_pos_array, array_x_min, array_y_min)
-    px_br, py_br = get_pxl_value(tissue_pos_array, array_x_max, array_y_min)
-
-    array_pts = np.array([[array_x_min, array_y_min], [array_x_max, array_y_min],
-                           [array_x_min, array_y_max], [array_x_max, array_y_max]])
-    pixel_pts = np.array([[px_bl, py_bl], [px_br, py_br], [px_tl, py_tl], [px_tr, py_tr]])
-
-    A = np.hstack([pixel_pts, np.ones((4, 1))])
+    A = np.hstack([pixel_pts, np.ones((len(pixel_pts), 1))])
     params, _, _, _ = np.linalg.lstsq(A, array_pts, rcond=None)
 
     px, py = adata.obs["x_pixel"].to_numpy(), adata.obs["y_pixel"].to_numpy()
@@ -264,17 +258,29 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
 
 def prep_adata_for_search(adata):
     """
-    Prefilter/normalize/log1p in place, matching load_prepped_adata_and_adj's
-    prep steps -- factored out so a caller that already has adata in memory
+    Prefilter in place, matching load_prepped_adata_and_adj's prep steps --
+    factored out so a caller that already has adata in memory
     (run_spagcn_range.py) can prep it directly instead of round-tripping
     through disk first. Mutates and returns `adata`; pass a copy in if the
-    original (unfiltered/unnormalized) adata is still needed afterward.
+    original (unfiltered) adata is still needed afterward.
+
+    Does NOT normalize/log1p: count_area_filtered_adata.h5ad (both the
+    per-sample and combined versions) is already sc.pp.normalize_total
+    (target_sum=1e4) + sc.pp.log1p'd by cell_preprocessing.py before it's
+    ever written to disk -- confirmed directly in that script (2026-09-10).
+    Calling normalize_per_cell/log1p again here was a real double-transform
+    of every SpaGCN run before this fix (not just a harmless idempotent
+    no-op): normalize_per_cell is scanpy's older name for normalize_total,
+    called here with a DIFFERENT (default) target_sum than the 1e4 already
+    applied upstream, so it isn't even a clean double-log1p, it's
+    log1p(renormalize(log1p(normalize_total(raw)))) feeding SpaGCN's PCA --
+    a materially different, wrong distribution. Only spg.prefilter_genes/
+    prefilter_specialgenes (which drop genes, not rescale values) are safe
+    to reapply here regardless of upstream state.
     """
     adata.var_names_make_unique()
     spg.prefilter_genes(adata, min_cells=3)
     spg.prefilter_specialgenes(adata)
-    sc.pp.normalize_per_cell(adata)
-    sc.pp.log1p(adata)
     return adata
 
 
@@ -364,8 +370,12 @@ def run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, seed, svg_genes_o
         adata = adata[:, adata.var["spatially_variable"].fillna(False)].copy()
         print(f"Restricted to {adata.n_vars}/{n_before} spatially variable genes")
 
-    sc.pp.normalize_per_cell(adata)
-    sc.pp.log1p(adata)
+    # NOT normalize_per_cell/log1p here: count_area_filtered_adata.h5ad is
+    # already normalize_total(target_sum=1e4) + log1p'd by
+    # cell_preprocessing.py before it's ever written -- see
+    # prep_adata_for_search's docstring for the full explanation. Doing it
+    # again here was a real double-transform of every SpaGCN run before this
+    # fix, not a harmless no-op.
 
     with open(dir_spagcn_data / "l.txt") as f:
         l = float(f.read().strip())

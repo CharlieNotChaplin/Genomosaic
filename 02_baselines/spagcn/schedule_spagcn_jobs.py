@@ -15,12 +15,25 @@ instead; if you're pointing this at a version of run_spagcn_range.py that
 still writes adj.npy to disk, this script's admission logic no longer applies
 to that constraint.
 
-Why size-aware admission matters here: SpaGCN's adjacency matrix is a dense
-n_nuclei x n_nuclei float32 array, and nuclei counts vary by >30x across
-samples (e.g. CRC_P6_5mm ~75k vs CRC_P2 ~225k). "3 jobs at a time" by count
-alone can still blow a fixed RAM budget depending on which 3 happen to
-overlap -- e.g. CRC_P2's peak RAM need alone is ~600GB, already most of an
-800GB budget on its own.
+--mem-budget-gb is a courtesy ceiling, not the actual safety mechanism, now
+that the cluster's real topology is known: `sinfo -N -o "%N %m"` (2026-09-10)
+shows 6 compute nodes, each with its OWN ~1008GB of physical RAM -- not one
+800GB pool shared across all your jobs. SLURM's own scheduler already refuses
+to place a job on a node that can't satisfy its --mem request, so it cannot
+actually oversubscribe a node's real memory regardless of what this script
+does. What --mem-budget-gb/--max-concurrent still do is cap how much you ask
+for/how many jobs you keep in flight at once, so as not to try to claim every
+node on a cluster other people also use (we've directly observed another
+user's job running alongside ours). Defaults below assume ~5 of the 6 nodes
+as a reasonable share, not a hard technical ceiling -- raise both if you want
+to use more of the cluster and know it's actually free (`squeue`).
+
+Why size-aware admission still matters even per-node: SpaGCN's adjacency
+matrix is a dense n_nuclei x n_nuclei float32 array, and nuclei counts vary by
+>30x across samples (e.g. CRC_P6_5mm ~75k vs CRC_P2 ~225k) -- "N jobs at a
+time" by count alone could still ask for far more total memory than intended
+if several large samples happen to queue up together, even though no single
+one would ever oversubscribe an actual node on its own.
 
 Per-sample nuclei counts (and therefore RAM estimates) are read directly from
 the combined adata's obs['Slide_ID'] counts at startup (backed mode, no full
@@ -39,7 +52,7 @@ Usage:
     python schedule_spagcn_jobs.py \\
         --samples CRC_P6_5mm CRC_P11mm_2_cut CRC_P4_SMAP CRC_P5 CRC_P2 \\
         --n-clusters-min 7 --n-clusters-max 10 \\
-        --max-concurrent 3 --mem-budget-gb 700
+        --max-concurrent 5 --mem-budget-gb 4750
 """
 import argparse
 import subprocess
@@ -109,10 +122,17 @@ def main():
     parser.add_argument("--samples", nargs="+", required=True)
     parser.add_argument("--n-clusters-min", type=int, required=True)
     parser.add_argument("--n-clusters-max", type=int, required=True)
-    parser.add_argument("--max-concurrent", type=int, default=3)
-    parser.add_argument("--mem-budget-gb", type=float, default=700,
-                         help="Sum of currently-running jobs' estimated peak RAM usage may "
-                              "never exceed this (leave margin below your actual available RAM)")
+    parser.add_argument("--max-concurrent", type=int, default=5,
+                         help="Cluster has 6 compute nodes (`sinfo -N -o \"%%N %%m\"`), each with "
+                              "its own independent RAM -- this isn't a shared pool. Default reserves "
+                              "~1 node's worth of headroom for other users; raise toward 6 if you "
+                              "know the cluster is free (`squeue`)")
+    parser.add_argument("--mem-budget-gb", type=float, default=4750,
+                         help="Sum of currently-running jobs' estimated peak RAM usage may never "
+                              "exceed this. A courtesy ceiling on how much you claim at once, not "
+                              "the real safety mechanism -- SLURM won't place a job on a node that "
+                              "can't satisfy its --mem regardless. Default is ~5 nodes' worth "
+                              "(~950GB usable each, leaving OS/other-process headroom per node)")
     parser.add_argument("--outputs-dir", default="outputs")
     parser.add_argument("--poll-seconds", type=int, default=300)
     parser.add_argument("--combined-adata",
