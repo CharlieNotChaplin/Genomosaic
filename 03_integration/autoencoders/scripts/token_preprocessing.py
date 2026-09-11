@@ -1,35 +1,51 @@
 """
 Distills the raw per-patch ViT token grid (256 tokens x 1536-dim per 224px
-patch, ~9GB/slide) down to two compact, per-CELL feature vectors:
+patch, ~9GB/slide) down to two compact, per-UNIT feature vectors, where unit
+is either a segmented nucleus ("nuclei") or a fixed-size spatial bin ("bins"):
 
-  - footprint: area-weighted average of the token embeddings overlapping a
-    cell's segmented nucleus polygon.
+  - footprint: area-weighted average of the token embeddings overlapping the
+    unit's own footprint (a nucleus polygon, or a bin's known axis-aligned
+    square).
   - halo: area-weighted average of the token embeddings overlapping a small
-    ring around the nucleus (nucleus dilated by `halo_px`, minus the nucleus
-    itself) -- captures immediate membrane/cytoplasm/microenvironment context
-    that StarDist's nuclear-only segmentation misses.
+    ring around the unit (footprint dilated by `halo_px`, minus the
+    footprint itself) -- captures immediate membrane/cytoplasm/microenvironment
+    context that the footprint alone misses.
 
 Kept as two separate vectors (rather than one blended average) so the model
-can treat "this cell's own tissue" and "immediately around this cell" as
+can treat "this unit's own tissue" and "immediately around this unit" as
 distinct signals -- see conversation notes (TRIPLEX's target/neighbor split).
 
-Why per-cell distillation at all: the raw token file is one row per token
+Why per-unit distillation at all: the raw token file is one row per token
 (256/patch), which is only tractable to keep on disk per-slide. Once every
-cell has been resolved to its own footprint+halo vector, the result is one
-row per CELL (same order of magnitude as the existing transcriptomics/SVG
+unit has been resolved to its own footprint+halo vector, the result is one
+row per unit (same order of magnitude as the existing transcriptomics/SVG
 data), cheap enough to load whole across every slide at once.
 
-Coordinate system: cell centroids (`trans_adata.obsm['spatial']`), nucleus
-polygons (`nuclei_geometry.parquet`), and token positions (`Token_X`/`Token_Y`
-in the token h5ad) all live in the same per-slide WSI pixel space -- verified
-directly against this project's data (see conversation notes). Patch linkage
-uses the existing `Patch_ID` string (e.g. "patch_123.png"), which is shared
-between the transcriptomics obs and the token obs for a given slide.
+Nuclei ("--unit nuclei") use exact polygon-overlap-area weighting
+(compute_cell_token_features), needed since a nucleus is an irregular shape.
+Bins ("--unit bins") use functions.label_transfer's exact
+rectangle-overlap-area weighting (aggregate_tokens_to_grid_footprint_halo) --
+a bin has no polygon, just a known center and fixed physical size, so both
+the bin and a raw token are axis-aligned squares. Both branches write output
+matching the same contract (obsm['X_token_footprint']/['X_token_halo'], obs
+Slide_ID/Patch_ID/id/matched) so a later autoencoder-side integration is a
+path change, not a code change -- see functions/dual_autoencoder.py's
+build_pairing.
+
+Coordinate system: cell/bin centroids (`trans_adata.obsm['spatial']`),
+nucleus polygons (`nuclei_geometry.parquet`), and token positions
+(`Token_X`/`Token_Y` in the token h5ad) all live in the same per-slide WSI
+pixel space -- verified directly against this project's data (see
+conversation notes). Patch linkage uses the existing `Patch_ID` string (e.g.
+"patch_123.png"), which is shared between the transcriptomics obs and the
+token obs for a given slide.
 
 Usage:
-    python token_preprocessing.py --slide CRC_P1
+    python token_preprocessing.py --unit nuclei --slide CRC_P1
+    python token_preprocessing.py --unit bins --slide CRC_P1
 """
 import argparse
+import sys
 from pathlib import Path
 
 import anndata as ad
@@ -41,6 +57,7 @@ from shapely.geometry import box as shapely_box
 
 TOKEN_SIZE_PX = 14.0
 TOKENS_PER_SIDE = 16
+GROUP_SIZE = 4  # 2um x 4 = 8um, matches BinPreprocessing.ipynb's bin_size="008um"
 
 
 def _find_data_dir():
@@ -50,6 +67,13 @@ def _find_data_dir():
         if (candidate / "data").is_dir():
             return candidate / "data"
     raise RuntimeError("Could not find a 'data' directory in any ancestor of this script")
+
+
+for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().parents):
+    if (_candidate / "functions").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+from functions.label_transfer import aggregate_tokens_to_grid_footprint_halo, microns_per_pixel
 
 
 def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_tokens=1):
@@ -269,8 +293,28 @@ def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad
     return footprint, halo, matched
 
 
-def run(slide, basedir=_find_data_dir(), halo_px=15.0, out_name="cell_token_embeddings.h5ad",
-        token_filename="WSI_patch_token_embeddings_filtered.h5ad", correct_positional_bias=True):
+def _write_output(slide, out_path, obs_names, slide_col, patch_col, id_col, matched, footprint, halo, extra_uns):
+    out = ad.AnnData(
+        X=np.empty((len(matched), 0), dtype=np.float32),
+        obs=pd.DataFrame({
+            "Slide_ID": slide_col,
+            "Patch_ID": patch_col,
+            "id": id_col,
+            "matched": matched,
+        }, index=obs_names),
+    )
+    out.obsm["X_token_footprint"] = footprint
+    out.obsm["X_token_halo"] = halo
+    for k, v in extra_uns.items():
+        out.uns[k] = v
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out.write_h5ad(out_path)
+    print(f"[{slide}] wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+
+
+def run_nuclei(slide, basedir, halo_px=15.0, out_name="cell_token_embeddings.h5ad",
+               token_filename="WSI_patch_token_embeddings_filtered.h5ad", correct_positional_bias=True):
     trans_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/count_area_filtered_adata.h5ad"
     nuclei_path = basedir / "combined/01_preprocessing/cell_seg_stardist/002um/custom_binning/nuclei_geometry.parquet"
     token_path = basedir / slide / "01_preprocessing/unimodel/metadata" / token_filename
@@ -302,44 +346,87 @@ def run(slide, basedir=_find_data_dir(), halo_px=15.0, out_name="cell_token_embe
     # stored twice (an earlier version of this script set X=footprint AND
     # obsm["X_token_footprint"]=footprint, silently doubling the footprint
     # array's storage for no reason).
-    out = ad.AnnData(
-        X=np.empty((len(matched), 0), dtype=np.float32),
-        obs=pd.DataFrame({
-            "Slide_ID": trans_slide.obs["Slide_ID"].values,
-            "Patch_ID": trans_slide.obs["Patch_ID"].values,
-            "id": trans_slide.obs["id"].values,
-            "matched": matched,
-        }, index=trans_slide.obs_names),
+    _write_output(
+        slide, out_path, trans_slide.obs_names,
+        trans_slide.obs["Slide_ID"].values, trans_slide.obs["Patch_ID"].values, trans_slide.obs["id"].values,
+        matched, footprint, halo,
+        extra_uns={
+            "halo_px": halo_px,
+            "token_size_px": TOKEN_SIZE_PX,
+            "positional_bias_corrected": correct_positional_bias,
+        },
     )
-    out.obsm["X_token_footprint"] = footprint
-    out.obsm["X_token_halo"] = halo
-    out.uns["halo_px"] = halo_px
-    out.uns["token_size_px"] = TOKEN_SIZE_PX
-    out.uns["positional_bias_corrected"] = correct_positional_bias
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out.write_h5ad(out_path)
-    print(f"[{slide}] wrote {out_path} ({out_path.stat().st_size / 1e6:.1f} MB)")
+
+def run_bins(slide, basedir, halo_px=15.0, out_name="bin_token_embeddings.h5ad",
+             trans_filename="count_area_filtered_adata.h5ad"):
+    trans_path = basedir / "combined/01_preprocessing/grid_bin/008um/custom_binning" / trans_filename
+    out_path = basedir / slide / "01_preprocessing/unimodel/metadata" / out_name
+
+    trans_adata = ad.read_h5ad(trans_path, backed="r")
+    bin_slide = trans_adata[trans_adata.obs["Slide_ID"].astype(str) == slide].to_memory()
+    if bin_slide.n_obs == 0:
+        raise ValueError(f"No bins found for Slide_ID={slide!r} in {trans_path} -- run "
+                          f"BinPreprocessing.ipynb (load+QC+merge) for this slide first.")
+
+    grid_um = GROUP_SIZE * 2.0
+    # Exact half-side of the bin's own known physical square footprint -- no fudge
+    # factor needed (unlike main_grid's own radius_factor-tuned circular radius,
+    # which was calibrated for a soft classifier feature, not an exact boundary).
+    half_side_px = grid_um / (2 * microns_per_pixel(slide, data_dir=basedir))
+    print(f"[{slide}] {bin_slide.n_obs} bins, half_side_px={half_side_px:.2f} "
+          f"halo_px={halo_px}")
+
+    footprint, halo, matched = aggregate_tokens_to_grid_footprint_halo(
+        slide, bin_slide.obsm["spatial"], half_side_px, halo_px, data_dir=basedir,
+    )
+    print(f"[{slide}] matched {matched.sum()}/{len(matched)} bins ({matched.mean():.1%})")
+
+    _write_output(
+        slide, out_path, bin_slide.obs_names,
+        bin_slide.obs["Slide_ID"].values, bin_slide.obs["Patch_ID"].values, bin_slide.obs["id"].values,
+        matched, footprint, halo,
+        extra_uns={"half_side_px": half_side_px, "halo_width_px": halo_px},
+    )
+
+
+def run(unit, slide, basedir=None, halo_px=15.0, out_name=None, correct_positional_bias=True):
+    basedir = basedir or _find_data_dir()
+    if unit == "nuclei":
+        kwargs = {"out_name": out_name} if out_name else {}
+        run_nuclei(slide, basedir, halo_px=halo_px, correct_positional_bias=correct_positional_bias, **kwargs)
+    elif unit == "bins":
+        kwargs = {"out_name": out_name} if out_name else {}
+        run_bins(slide, basedir, halo_px=halo_px, **kwargs)
+    else:
+        raise ValueError(f"unit must be 'nuclei' or 'bins', got {unit!r}")
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--unit", required=True, choices=["nuclei", "bins"],
+                         help="distill per-nucleus (cell_token_embeddings.h5ad) or per-bin "
+                              "(bin_token_embeddings.h5ad) footprint+halo features")
     parser.add_argument("--slide", required=True, help="Slide_ID, e.g. CRC_P1")
     parser.add_argument("--halo-px", type=float, default=15.0,
-                         help="halo ring dilation in pixels. Was 6.0 (nucleus[~21px]+halo "
-                              "~33px wide, only ~2-3 tokens[14px] contributing per cell -- too "
-                              "few to average out per-cell noise, confirmed via conversation-notes "
-                              "diagnostics: raw pre-autoencoder footprint/halo features already show "
-                              "fine-scale spatial speckle in cluster assignment). 15.0 widens the "
-                              "window to ~51px (~3.6 tokens) for better SNR, at the cost of pulling "
-                              "in more neighboring-cell signal (median nearest-cell spacing ~27px, "
-                              "so halo rings now commonly extend into neighboring cells' territory "
-                              "-- an accepted tradeoff, not an oversight)")
-    parser.add_argument("--basedir", type=Path, default=_find_data_dir())
+                         help="halo ring dilation in pixels, same meaning/default for both units "
+                              "(nucleus[~21px]+halo ~33px wide would only pull in ~2-3 tokens[14px] "
+                              "per cell -- too few to average out per-cell noise, confirmed via "
+                              "conversation-notes diagnostics: raw pre-autoencoder footprint/halo "
+                              "features already show fine-scale spatial speckle in cluster "
+                              "assignment. 15.0 widens the window to ~51px (~3.6 tokens) for better "
+                              "SNR, at the cost of pulling in more neighboring-unit signal -- an "
+                              "accepted tradeoff, not an oversight)")
+    parser.add_argument("--basedir", type=Path, default=None)
+    parser.add_argument("--out-name", default=None,
+                         help="override the output filename (default: cell_token_embeddings.h5ad "
+                              "for --unit nuclei, bin_token_embeddings.h5ad for --unit bins)")
     parser.add_argument("--no-bias-correction", action="store_true",
-                         help="skip the per-(row,col) positional-bias correction (on by default) -- "
-                              "e.g. to reproduce the older, uncorrected cell_token_embeddings.h5ad "
-                              "for comparison")
+                         help="[--unit nuclei only] skip the per-(row,col) positional-bias "
+                              "correction (on by default) -- e.g. to reproduce the older, "
+                              "uncorrected cell_token_embeddings.h5ad for comparison")
     args = parser.parse_args()
-    run(args.slide, basedir=args.basedir, halo_px=args.halo_px,
+    if args.no_bias_correction and args.unit != "nuclei":
+        parser.error("--no-bias-correction only applies to --unit nuclei")
+    run(args.unit, args.slide, basedir=args.basedir, halo_px=args.halo_px, out_name=args.out_name,
         correct_positional_bias=not args.no_bias_correction)

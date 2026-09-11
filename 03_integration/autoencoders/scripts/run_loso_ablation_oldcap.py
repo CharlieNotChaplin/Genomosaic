@@ -191,7 +191,7 @@ def run_it(held_out_slide="CRC_P1"):
             token_adatas.append(sc.read_h5ad(p))
             slides_with_tokens.append(s)
         else:
-            print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py for it first")
+            print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py --unit nuclei for it first")
 
     missing = sorted(set(slides_needed) - set(slides_with_tokens))
     if missing:
@@ -201,7 +201,7 @@ def run_it(held_out_slide="CRC_P1"):
         if f_trans_coord is not None:
             f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
     if not token_adatas:
-        raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py first")
+        raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py --unit nuclei first")
     if HELD_OUT_SLIDE not in slides_with_tokens:
         raise ValueError(f"HELD_OUT_SLIDE={HELD_OUT_SLIDE!r} has no token data -- pick one of {slides_with_tokens}")
 

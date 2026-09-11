@@ -130,7 +130,7 @@ for s in slides_needed:
         token_adatas.append(sc.read_h5ad(p))
         slides_with_tokens.append(s)
     else:
-        print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py for it first")
+        print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py --unit nuclei for it first")
 missing = sorted(set(slides_needed) - set(slides_with_tokens))
 if missing:
     print(f"Restricting to slides with token data: {slides_with_tokens} (dropping {missing})")
@@ -138,7 +138,7 @@ if missing:
     f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].astype(str).isin(slides_with_tokens)].copy()
     f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
 if not token_adatas:
-    raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py first")
+    raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py --unit nuclei first")
 
 f_token_adata = ad.concat(token_adatas, join="outer")
 token_key = f_token_adata.obs["Slide_ID"].astype(str) + "_" + f_token_adata.obs["id"].astype(str)

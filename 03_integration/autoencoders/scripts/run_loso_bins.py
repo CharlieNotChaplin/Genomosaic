@@ -25,7 +25,7 @@ CAVEATS not yet resolved (flagging rather than guessing):
   - local_neighbor_radius=100 is carried over UNCHANGED from the cell-level script,
     where it was calibrated to median nearest-CELL spacing (~27px). Bins sit on a
     regular 8um lattice, a different physical spacing in pixels (see
-    bin_token_preprocessing.py's own half_side_px = grid_um / (2 * microns_per_pixel)
+    token_preprocessing.py's own half_side_px = grid_um / (2 * microns_per_pixel)
     calculation for the actual pitch) -- this value should be re-derived from that
     conversion rather than assumed correct for bins.
 
@@ -179,7 +179,7 @@ def run_it(held_out_slide="CRC_P1"):
             token_adatas.append(sc.read_h5ad(p))
             slides_with_tokens.append(s)
         else:
-            print(f"WARNING: no token data for slide {s} ({p}) -- run bin_token_preprocessing.py for it first")
+            print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py --unit bins for it first")
 
     missing = sorted(set(slides_needed) - set(slides_with_tokens))
     if missing:
@@ -189,7 +189,7 @@ def run_it(held_out_slide="CRC_P1"):
         if f_trans_coord is not None:
             f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
     if not token_adatas:
-        raise RuntimeError("no in-scope slide has token data -- run bin_token_preprocessing.py first")
+        raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py --unit bins first")
     if HELD_OUT_SLIDE not in slides_with_tokens:
         raise ValueError(f"HELD_OUT_SLIDE={HELD_OUT_SLIDE!r} has no token data -- pick one of {slides_with_tokens}")
 

@@ -7,7 +7,7 @@ removed from this project entirely.
 
 Before running: per-slide token data must exist at
 data/{slide}/01_preprocessing/unimodel/metadata/cell_token_embeddings.h5ad
-(from `token_preprocessing.py --slide <slide>`, run separately).
+(from `token_preprocessing.py --unit nuclei --slide <slide>`, run separately).
 
 To change slides/config, edit CONFIG below before submitting -- duplicate this
 file or override per sbatch job rather than adding CLI flags, so each run's
@@ -179,7 +179,7 @@ f_hist_adata.obs = f_hist_adata.obs.set_index(hist_global_id)
 
 # ---- load token data --------------------------------------------------
 # Loads each in-scope slide's token embeddings (CONFIG["token_filename"] -- cell or
-# bin, from token_preprocessing.py / bin_token_preprocessing.py), concatenates them,
+# bin, from token_preprocessing.py --unit nuclei / --unit bins), concatenates them,
 # and -- if some in-scope slides don't have token data yet -- restricts training to
 # the slides that do (rather than silently zero-filling, which would let the model
 # learn "zero vector = slide X" as a shortcut).
@@ -191,7 +191,7 @@ for s in slides_needed:
         token_adatas.append(sc.read_h5ad(p))
         slides_with_tokens.append(s)
     else:
-        print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py for it first")
+        print(f"WARNING: no token data for slide {s} ({p}) -- run token_preprocessing.py --unit nuclei for it first")
 
 missing = sorted(set(slides_needed) - set(slides_with_tokens))
 if missing:
@@ -201,7 +201,7 @@ if missing:
     if f_trans_coord is not None:
         f_trans_coord = f_trans_coord[f_trans_coord["Slide_ID"].isin(slides_with_tokens)].copy()
 if not token_adatas:
-    raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py first")
+    raise RuntimeError("no in-scope slide has token data -- run token_preprocessing.py --unit nuclei first")
 
 f_token_adata = ad.concat(token_adatas, join="outer")
 token_key = f_token_adata.obs["Slide_ID"].astype(str) + "_" + f_token_adata.obs["id"].astype(str)
