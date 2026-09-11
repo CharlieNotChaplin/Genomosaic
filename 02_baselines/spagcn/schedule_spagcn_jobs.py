@@ -78,11 +78,18 @@ def estimate_matrix_gb(n_nuclei):
 
 
 def estimate_peak_ram_gb(n_nuclei):
-    # ~3x the adjacency matrix (raw adj + adj_exp + a torch copy of it, all
-    # resident at once at points in the pipeline -- traced for CRC_P1 in an
-    # earlier debugging session), +2GB fixed overhead for
-    # nuclei_centroids_svg.h5ad / the transient per-n_clusters results.h5ad.
-    return estimate_matrix_gb(n_nuclei) * 3 + 2
+    # `3x + 2` (raw adj + adj_exp + a torch copy of it) was traced analytically
+    # for CRC_P1, but an 8-sample real run (2026-09-10) showed it sits almost
+    # exactly ON the true boundary rather than safely under it: every success
+    # implied a true multiplier <=3.01-3.03x, every OOM implied >3.02-3.13x --
+    # the same razor-thin line from both directions, meaning which side a job
+    # landed on came down to per-sample noise (gene count after prefiltering,
+    # sparsity, etc.), not a formula that was wrong by a large margin. Given
+    # per-node RAM is genuinely abundant here (~1TB x 6 nodes, confirmed via
+    # `sinfo`), there's no reason to keep cutting this close -- 4x + 10GB
+    # gives real margin above every observed failure without materially
+    # denting how many samples fit per node.
+    return estimate_matrix_gb(n_nuclei) * 4 + 10
 
 
 def mem_and_time_for(peak_ram_gb):
