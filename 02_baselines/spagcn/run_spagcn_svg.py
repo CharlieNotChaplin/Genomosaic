@@ -29,6 +29,7 @@ import gc
 import math
 import os
 import random
+import resource
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +45,20 @@ import torch
 # rather than patching vendored code in site-packages.
 if not hasattr(sp.spmatrix, "A"):
     sp.spmatrix.A = property(lambda self: self.toarray())
+
+
+def log_rss(tag):
+    # ru_maxrss is the process's PEAK resident set size SO FAR (cumulative,
+    # never decreases), in KB on Linux. Cheap (a single syscall), so left in
+    # permanently rather than stripped after debugging -- added 2026-09-11
+    # after estimate_peak_ram_gb's 3x and then 4x formulas both undershot for
+    # several samples in ways that didn't fit a clean per-matrix-size model,
+    # and the failures traced back to somewhere inside find_l's calculate_p
+    # calls specifically (before clf.train() ever runs) -- narrower, direct
+    # checkpoints here beat inferring the cause indirectly from which --mem
+    # values happened to OOM.
+    gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
+    print(f"[mem] {tag}: peak RSS so far = {gb:.1f} GB", flush=True)
 
 
 def _calculate_adj_matrix_patched(x, y, x_pixel=None, y_pixel=None, image=None, beta=49, alpha=1, histology=True):
@@ -245,6 +260,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
     )
     del img
     gc.collect()
+    log_rss("build_adj_and_centroids: after calculate_adj_matrix")
 
     dir_spagcn_data.mkdir(parents=True, exist_ok=True)
     adata.write_h5ad(nuclei_centroids_path)
@@ -253,6 +269,7 @@ def build_adj_and_centroids(dir_custom_binning, dir_combined_adata, dir_base_inp
     else:
         np.save(adj_path, adj.astype(np.float32))
         print(f"Wrote {nuclei_centroids_path} and {adj_path}")
+    log_rss("build_adj_and_centroids: return")
     return adata, adj
 
 
@@ -291,14 +308,47 @@ def load_prepped_adata_and_adj(dir_spagcn_data):
     return adata, adj
 
 
+def _calculate_p_instrumented(adj, l, label):
+    # Same math as spg.calculate_p(adj, l), broken into named steps with
+    # log_rss between each -- see log_rss's docstring for why this exists.
+    # adj itself is NOT re-logged here (its size is already known/logged
+    # right after build_adj_and_centroids returns); this isolates what this
+    # one line of vendored SpaGCN code costs on top of that.
+    log_rss(f"calculate_p({label}): before")
+    squared = adj ** 2
+    log_rss(f"calculate_p({label}): after adj**2")
+    scaled = squared / (2 * (l ** 2))
+    del squared
+    log_rss(f"calculate_p({label}): after /(2l^2)")
+    negated = -1 * scaled
+    del scaled
+    log_rss(f"calculate_p({label}): after negate")
+    exped = np.exp(negated)
+    del negated
+    log_rss(f"calculate_p({label}): after exp")
+    row_sums = np.sum(exped, 1)
+    del exped
+    log_rss(f"calculate_p({label}): after row sum")
+    result = float(np.mean(row_sums)) - 1
+    log_rss(f"calculate_p({label}): done")
+    return result
+
+
 def find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run):
     # Diagnose the search range ourselves before calling spg.search_l: SpaGCN's own
     # diagnostic prints ("l not found, try smaller/bigger ...") go to a block-buffered
     # stdout and can be lost if the process later dies, leaving only the confusing
     # downstream "l should not be set" ValueError with no explanation. flush=True here
     # so this always lands in the log regardless of buffering.
-    p_low = spg.calculate_p(adj, l_start)
-    p_high = spg.calculate_p(adj, l_end)
+    #
+    # Using the instrumented version here, not spg.calculate_p directly: the
+    # last several OOMs all died somewhere in these first two calls, before
+    # any other output printed, and a 3x/4x-of-matrix-size formula undershot
+    # in ways that don't fit a clean model -- this pins down exactly which
+    # sub-step is responsible instead of guessing at another multiplier.
+    log_rss("find_l: start (adj already resident)")
+    p_low = _calculate_p_instrumented(adj, l_start, "l_start")
+    p_high = _calculate_p_instrumented(adj, l_end, "l_end")
     print(f"Searching for l (p target = {p}); p(l={l_start}) = {p_low:.4f}, "
           f"p(l={l_end}) = {p_high:.4f}", flush=True)
     if p_low > p + l_tol:

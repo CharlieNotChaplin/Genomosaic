@@ -79,6 +79,7 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
     # untouched so run_train can take its own fresh copy from it every
     # iteration, exactly matching its original disk-reload-every-call behavior.
     search_adata = core.prep_adata_for_search(raw_adata.copy())
+    core.log_rss(f"{sample}: after raw_adata.copy()+prep_adata_for_search")
     l = core.find_l(dir_spagcn_data, adj, args.p, args.l_start, args.l_end, args.l_tol, args.l_max_run)
 
     outputs_dir.mkdir(parents=True, exist_ok=True)
