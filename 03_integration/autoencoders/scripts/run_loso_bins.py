@@ -57,7 +57,7 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
-           skip_token_pretrain=False, freeze_token=False):
+           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True):
     """
     Ablation-relevant knobs mirror run_loso.py's own -- see that file's run_it
     docstring. Defaults here exactly reproduce the previously-hardcoded values.
@@ -99,7 +99,9 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
 
         local_anchor_sim_threshold=local_anchor_sim_threshold,
 
-        weight_reconstruction_by_patch_freq=True,
+        # Name predates the compute_local_density_weight swap -- gates the per-unit
+        # DENSITY weight now, not a patch-frequency one. See run_loso.py's own note.
+        weight_reconstruction_by_patch_freq=weight_reconstruction,
 
         # Denoising corruption -- see run_loso.py's own CONFIG comment. 0.0/0.0
         # (default) means never yet exercised for bins prior to these flags.
@@ -230,6 +232,8 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
     if CONFIG.get("local_anchor_sim_threshold") is not None:
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
+    if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
+        _tag_parts.append("noweight")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -311,6 +315,7 @@ if __name__ == "__main__":
     parser.add_argument("--local-anchor-sim-threshold", type=_float_or_none, default=None)
     parser.add_argument("--skip-token-pretrain", action="store_true")
     parser.add_argument("--freeze-token", action="store_true")
+    parser.add_argument("--no-weight-reconstruction", action="store_true")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -320,4 +325,5 @@ if __name__ == "__main__":
         local_anchor_sim_threshold=args.local_anchor_sim_threshold,
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
+        weight_reconstruction=not args.no_weight_reconstruction,
     )

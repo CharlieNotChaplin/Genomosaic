@@ -45,7 +45,7 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
-           skip_token_pretrain=False, freeze_token=False):
+           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True):
     """
     Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
     __main__'s CLI parsing can override them per sbatch submission without touching
@@ -103,7 +103,11 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
                                            # help and can trigger collapse -- see
                                            # train_autoenc_token.py. Ablatable via CLI.
 
-        weight_reconstruction_by_patch_freq=True,
+        # Name predates the compute_local_density_weight swap (see functions/
+        # dual_autoencoder.py) -- this now gates the per-unit DENSITY weight, not
+        # a patch-frequency one, despite the key name. Never independently
+        # ablated against a plain unweighted mean -- see run_it's own param.
+        weight_reconstruction_by_patch_freq=weight_reconstruction,
 
         # Denoising corruption (see train_step's own docstring) -- 0.0/0.0 (default)
         # means this has never actually been exercised in any run to date; both are
@@ -274,6 +278,8 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
     if CONFIG.get("local_anchor_sim_threshold") is not None:
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
+    if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
+        _tag_parts.append("noweight")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -371,6 +377,11 @@ if __name__ == "__main__":
                               "(default: not frozen). Pair with pretraining left ON "
                               "(the default) -- freezing a randomly-initialized token "
                               "branch is not a meaningful test.")
+    parser.add_argument("--no-weight-reconstruction", action="store_true",
+                         help="Disable weighting the transcriptomics reconstruction loss "
+                              "by per-unit inverse density (default: weighted). Never "
+                              "independently ablated against a plain unweighted mean "
+                              "before this flag existed.")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -380,4 +391,5 @@ if __name__ == "__main__":
         local_anchor_sim_threshold=args.local_anchor_sim_threshold,
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
+        weight_reconstruction=not args.no_weight_reconstruction,
     )
