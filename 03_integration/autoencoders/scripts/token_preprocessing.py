@@ -73,7 +73,12 @@ for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().pa
     if (_candidate / "functions").is_dir():
         sys.path.insert(0, str(_candidate))
         break
-from functions.label_transfer import aggregate_tokens_to_grid_footprint_halo, microns_per_pixel
+from functions.label_transfer import (
+    aggregate_tokens_to_grid_footprint_halo,
+    compute_token_positional_bias as compute_positional_bias,
+    microns_per_pixel,
+    resolve_token_h5ad_path,
+)
 
 
 def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_tokens=1):
@@ -89,86 +94,6 @@ def _candidate_token_range(minx, miny, maxx, maxy, origin_x, origin_y, margin_to
     col_lo, col_hi = max(0, col_lo), min(TOKENS_PER_SIDE - 1, col_hi)
     row_lo, row_hi = max(0, row_lo), min(TOKENS_PER_SIDE - 1, row_hi)
     return col_lo, col_hi, row_lo, row_hi
-
-
-def compute_positional_bias(token_h5ad_path, chunk_size=50_000, verbose=True):
-    """
-    Returns bias_grid, shape (TOKENS_PER_SIDE, TOKENS_PER_SIDE, token_dim):
-    the mean token embedding at each (row, col) position within a patch,
-    minus the grand mean across every token on this slide.
-
-    Real, confirmed artifact, not a hypothesis: each 224px patch is run
-    through UNI2h independently, so tokens near a patch's edge (row/col 0 or
-    15) systematically lack the surrounding tissue context that interior
-    tokens have. This shows up as a real per-position bias that survives
-    averaging over 100k+ tokens (i.e. it isn't just content variance
-    cancelling out unevenly), strongest at the edges and smoothly varying
-    across the patch -- and was shown directly (see conversation notes) to
-    drive leiden cluster assignment as a function of a cell's position
-    *within its own patch*, independent of actual tissue content: cluster
-    composition swings from one leiden cluster to a totally different one
-    across a single patch's width, reproducibly across thousands of
-    unrelated patches. That's what produced the "striping" tied to the
-    224px patch grid seen in cell-level clustering.
-
-    Computed fresh per-slide from that slide's own raw token grid (not a
-    hardcoded correction from some other slide) and applied by subtracting
-    bias_grid[row, col] from each token before it ever gets pooled into a
-    cell's footprint/halo vector. Streamed in chunks so the full
-    (n_tokens x token_dim) array is never held in memory at once.
-    """
-    f = h5py.File(token_h5ad_path, "r")
-    token_patch_codes = f["obs/Patch_ID/codes"][:]
-    token_X = f["obs/Token_X"][:]
-    token_Y = f["obs/Token_Y"][:]
-    token_dim = f["X"].shape[1]
-    n_tokens = f["X"].shape[0]
-
-    order = np.argsort(token_patch_codes, kind="stable")
-    sorted_codes = token_patch_codes[order]
-    uniq_codes, start_idx = np.unique(sorted_codes, return_index=True)
-    groups = np.split(order, start_idx[1:])
-
-    tok_col_all = np.zeros(n_tokens, dtype=np.int16)
-    tok_row_all = np.zeros(n_tokens, dtype=np.int16)
-    for code, g in zip(uniq_codes, groups):
-        g = np.sort(g)
-        x, y = token_X[g], token_Y[g]
-        ox, oy = x.min(), y.min()
-        tok_col_all[g] = np.round((x - ox) / TOKEN_SIZE_PX).astype(np.int16)
-        tok_row_all[g] = np.round((y - oy) / TOKEN_SIZE_PX).astype(np.int16)
-
-    grid_sum = np.zeros((TOKENS_PER_SIDE, TOKENS_PER_SIDE, token_dim), dtype=np.float64)
-    grid_count = np.zeros((TOKENS_PER_SIDE, TOKENS_PER_SIDE), dtype=np.int64)
-    grand_sum = np.zeros(token_dim, dtype=np.float64)
-
-    for start in range(0, n_tokens, chunk_size):
-        end = min(start + chunk_size, n_tokens)
-        if verbose:
-            print(f"  [positional bias] tokens {start}/{n_tokens}")
-        # read+sum in float32 (source is float16 on disk) -- only the running
-        # accumulators need float64 precision, not each transient chunk, which
-        # matters here: a float64 chunk at the old 200k chunk_size was ~3.7GB,
-        # enough to OOM on top of whatever else is already resident
-        chunk = f["X"][start:end].astype(np.float32)
-        grand_sum += chunk.sum(axis=0, dtype=np.float64)
-        rows, cols = tok_row_all[start:end], tok_col_all[start:end]
-        for r in range(TOKENS_PER_SIDE):
-            for c in range(TOKENS_PER_SIDE):
-                m = (rows == r) & (cols == c)
-                if m.any():
-                    grid_sum[r, c] += chunk[m].sum(axis=0, dtype=np.float64)
-                    grid_count[r, c] += m.sum()
-        del chunk
-
-    f.close()
-    grand_mean = grand_sum / n_tokens
-    grid_mean = grid_sum / grid_count[:, :, None]
-    bias_grid = (grid_mean - grand_mean).astype(np.float32)
-    if verbose:
-        dev_norms = np.linalg.norm(bias_grid.reshape(-1, token_dim), axis=1).reshape(TOKENS_PER_SIDE, TOKENS_PER_SIDE)
-        print(f"  [positional bias] deviation norm range: {dev_norms.min():.2f} - {dev_norms.max():.2f}")
-    return bias_grid
 
 
 def compute_cell_token_features(trans_adata_slide, nuclei_geom_slide, token_h5ad_path,
@@ -359,9 +284,10 @@ def run_nuclei(slide, basedir, halo_px=15.0, out_name="cell_token_embeddings.h5a
 
 
 def run_bins(slide, basedir, halo_px=15.0, out_name="bin_token_embeddings.h5ad",
-             trans_filename="count_area_filtered_adata.h5ad"):
+             trans_filename="count_area_filtered_adata.h5ad", correct_positional_bias=True):
     trans_path = basedir / "combined/01_preprocessing/grid_bin/008um/custom_binning" / trans_filename
     out_path = basedir / slide / "01_preprocessing/unimodel/metadata" / out_name
+    token_path = resolve_token_h5ad_path(slide, data_dir=basedir)
 
     trans_adata = ad.read_h5ad(trans_path, backed="r")
     bin_slide = trans_adata[trans_adata.obs["Slide_ID"].astype(str) == slide].to_memory()
@@ -374,11 +300,18 @@ def run_bins(slide, basedir, halo_px=15.0, out_name="bin_token_embeddings.h5ad",
     # factor needed (unlike main_grid's own radius_factor-tuned circular radius,
     # which was calibrated for a soft classifier feature, not an exact boundary).
     half_side_px = grid_um / (2 * microns_per_pixel(slide, data_dir=basedir))
+
+    positional_bias = None
+    if correct_positional_bias:
+        print(f"[{slide}] computing per-(row,col) positional bias from {token_path.name}...")
+        positional_bias = compute_positional_bias(token_path)
+
     print(f"[{slide}] {bin_slide.n_obs} bins, half_side_px={half_side_px:.2f} "
-          f"halo_px={halo_px}")
+          f"halo_px={halo_px}, positional_bias_correction={correct_positional_bias}")
 
     footprint, halo, matched = aggregate_tokens_to_grid_footprint_halo(
         slide, bin_slide.obsm["spatial"], half_side_px, halo_px, data_dir=basedir,
+        positional_bias=positional_bias,
     )
     print(f"[{slide}] matched {matched.sum()}/{len(matched)} bins ({matched.mean():.1%})")
 
@@ -386,18 +319,21 @@ def run_bins(slide, basedir, halo_px=15.0, out_name="bin_token_embeddings.h5ad",
         slide, out_path, bin_slide.obs_names,
         bin_slide.obs["Slide_ID"].values, bin_slide.obs["Patch_ID"].values, bin_slide.obs["id"].values,
         matched, footprint, halo,
-        extra_uns={"half_side_px": half_side_px, "halo_width_px": halo_px},
+        extra_uns={
+            "half_side_px": half_side_px,
+            "halo_px": halo_px,
+            "positional_bias_corrected": correct_positional_bias,
+        },
     )
 
 
 def run(unit, slide, basedir=None, halo_px=15.0, out_name=None, correct_positional_bias=True):
     basedir = basedir or _find_data_dir()
+    kwargs = {"out_name": out_name} if out_name else {}
     if unit == "nuclei":
-        kwargs = {"out_name": out_name} if out_name else {}
         run_nuclei(slide, basedir, halo_px=halo_px, correct_positional_bias=correct_positional_bias, **kwargs)
     elif unit == "bins":
-        kwargs = {"out_name": out_name} if out_name else {}
-        run_bins(slide, basedir, halo_px=halo_px, **kwargs)
+        run_bins(slide, basedir, halo_px=halo_px, correct_positional_bias=correct_positional_bias, **kwargs)
     else:
         raise ValueError(f"unit must be 'nuclei' or 'bins', got {unit!r}")
 
@@ -422,11 +358,9 @@ if __name__ == "__main__":
                          help="override the output filename (default: cell_token_embeddings.h5ad "
                               "for --unit nuclei, bin_token_embeddings.h5ad for --unit bins)")
     parser.add_argument("--no-bias-correction", action="store_true",
-                         help="[--unit nuclei only] skip the per-(row,col) positional-bias "
-                              "correction (on by default) -- e.g. to reproduce the older, "
-                              "uncorrected cell_token_embeddings.h5ad for comparison")
+                         help="skip the per-(row,col) positional-bias correction (on by default "
+                              "for both units) -- e.g. to reproduce the older, uncorrected "
+                              "cell_token_embeddings.h5ad / bin_token_embeddings.h5ad for comparison")
     args = parser.parse_args()
-    if args.no_bias_correction and args.unit != "nuclei":
-        parser.error("--no-bias-correction only applies to --unit nuclei")
     run(args.unit, args.slide, basedir=args.basedir, halo_px=args.halo_px, out_name=args.out_name,
         correct_positional_bias=not args.no_bias_correction)

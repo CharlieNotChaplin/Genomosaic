@@ -55,7 +55,13 @@ for _candidate in (Path(__file__).resolve().parent, *Path(__file__).resolve().pa
 from functions.dual_autoencoder import *
 
 
-def run_it(held_out_slide="CRC_P1"):
+def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
+           local_neighbor_radius=100, local_anchor_sim_threshold=None,
+           skip_token_pretrain=False, freeze_token=False):
+    """
+    Ablation-relevant knobs mirror run_loso.py's own -- see that file's run_it
+    docstring. Defaults here exactly reproduce the previously-hardcoded values.
+    """
     set_seed(42)
 
     # ---- CONFIG -------------------------------------------------------------
@@ -87,12 +93,20 @@ def run_it(held_out_slide="CRC_P1"):
         temperature=0.07,
         neighbor_radius=2912,       # patch-geometry-derived (2x 224px patch diameter),
                                      # not unit-size-derived -- unchanged for bins
-        local_neighbor_radius=100,  # CARRIED OVER from the cell-level value, NOT
-                                     # re-derived for bin pitch -- see module docstring
+        local_neighbor_radius=local_neighbor_radius,  # CARRIED OVER from the cell-level
+                                     # value by default, NOT re-derived for bin pitch --
+                                     # see module docstring. Ablatable via CLI.
 
-        local_anchor_sim_threshold=None,
+        local_anchor_sim_threshold=local_anchor_sim_threshold,
 
         weight_reconstruction_by_patch_freq=True,
+
+        # Denoising corruption -- see run_loso.py's own CONFIG comment. 0.0/0.0
+        # (default) means never yet exercised for bins prior to these flags.
+        edge_dropout_p=edge_dropout_p,
+        gene_dropout_p=gene_dropout_p,
+
+        skip_token_pretrain=skip_token_pretrain,
 
         # training (Phase 3)
         n_epochs=100,
@@ -106,7 +120,7 @@ def run_it(held_out_slide="CRC_P1"):
         token_pretrain_val_frac=0.1,
         token_pretrain_patience=15,
         token_lr_mult=0.3,
-        freeze_token=False,
+        freeze_token=freeze_token,
         max_local_contrast_weight=1.0,
         local_warmup_epochs=10,
 
@@ -208,6 +222,14 @@ def run_it(held_out_slide="CRC_P1"):
     # values ever coincide numerically.
     if CONFIG["freeze_token"]:
         _tag_parts.append("frozen_token")
+    if CONFIG.get("skip_token_pretrain"):
+        _tag_parts.append("nopretrain")
+    if CONFIG.get("edge_dropout_p", 0.0) > 0.0 or CONFIG.get("gene_dropout_p", 0.0) > 0.0:
+        _tag_parts.append(f"edrop{CONFIG.get('edge_dropout_p', 0.0)}_gdrop{CONFIG.get('gene_dropout_p', 0.0)}")
+    if CONFIG.get("local_neighbor_radius") != 100:
+        _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
+    if CONFIG.get("local_anchor_sim_threshold") is not None:
+        _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -270,9 +292,32 @@ def run_it(held_out_slide="CRC_P1"):
         print(f"(desktop notification skipped: {e})")
 
 
+def _float_or_none(s):
+    """argparse type: accepts a float, or the literal string 'none' (any case)."""
+    return None if s.lower() == "none" else float(s)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--held_out_slide", default="CRC_P1",
                          help="Slide to hold out for this fold (default: CRC_P1).")
+    # ---- ablation knobs -- mirror run_loso.py's own, same defaults/semantics ----
+    parser.add_argument("--edge-dropout-p", type=float, default=0.0)
+    parser.add_argument("--gene-dropout-p", type=float, default=0.0)
+    parser.add_argument("--local-neighbor-radius", type=_float_or_none, default=100,
+                         help="'none' disables spatial exclusion. Default 100 is the "
+                              "cell-level value carried over UNCHANGED for bins -- see "
+                              "this module's docstring caveat.")
+    parser.add_argument("--local-anchor-sim-threshold", type=_float_or_none, default=None)
+    parser.add_argument("--skip-token-pretrain", action="store_true")
+    parser.add_argument("--freeze-token", action="store_true")
     args = parser.parse_args()
-    run_it(held_out_slide=args.held_out_slide)
+    run_it(
+        held_out_slide=args.held_out_slide,
+        edge_dropout_p=args.edge_dropout_p,
+        gene_dropout_p=args.gene_dropout_p,
+        local_neighbor_radius=args.local_neighbor_radius,
+        local_anchor_sim_threshold=args.local_anchor_sim_threshold,
+        skip_token_pretrain=args.skip_token_pretrain,
+        freeze_token=args.freeze_token,
+    )

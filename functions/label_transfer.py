@@ -69,6 +69,9 @@ TOKEN_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/WSI_patch_token
 # top-left pixel corner (not its center), so a token's own box is
 # [Token_X, Token_X+TOKEN_SIZE_PX) x [Token_Y, Token_Y+TOKEN_SIZE_PX).
 TOKEN_SIZE_PX = 14.0
+# Matches 03_integration/autoencoders/scripts/token_preprocessing.py's own TOKENS_PER_SIDE --
+# each 224px patch is tiled 16x16 by TOKEN_SIZE_PX (224/14=16).
+TOKENS_PER_SIDE = 16
 PATCH_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/filtered_WSI_patch_embeddings.h5ad"
 
 # Defaults for main()'s keyword parameters below -- used by plain
@@ -449,9 +452,113 @@ def _rect_overlap_area(cx1, cy1, cx2, cy2, bx1, by1, bx2, by2):
     return ox * oy
 
 
+def resolve_token_h5ad_path(sample: str, data_dir: Path = DATA_DIR) -> Path:
+    """Resolves a sample's raw ViT token h5ad path -- the single place both
+    aggregate_tokens_to_grid_footprint_halo and any caller needing the same
+    path (e.g. to compute a positional-bias grid up front) derive it from."""
+    return data_dir / TOKEN_METADATA_TEMPLATE.format(sample)
+
+
+def _token_grid_rowcol(token_patch_codes, token_X, token_Y):
+    """Returns (tok_row_all, tok_col_all): each token's (row, col) position
+    within its own patch's TOKENS_PER_SIDE x TOKENS_PER_SIDE grid, derived
+    from that patch's own min-x/min-y origin (tokens are stored contiguously
+    per patch, but this only assumes shared patch codes, not contiguity).
+    Shared by compute_token_positional_bias (buckets tokens for the bias
+    grid) and aggregate_tokens_to_grid_footprint_halo (looks up each
+    candidate token's own bias correction)."""
+    n_tokens = len(token_patch_codes)
+    order = np.argsort(token_patch_codes, kind="stable")
+    sorted_codes = token_patch_codes[order]
+    uniq_codes, start_idx = np.unique(sorted_codes, return_index=True)
+    groups = np.split(order, start_idx[1:])
+
+    tok_col_all = np.zeros(n_tokens, dtype=np.int16)
+    tok_row_all = np.zeros(n_tokens, dtype=np.int16)
+    for code, g in zip(uniq_codes, groups):
+        g = np.sort(g)
+        x, y = token_X[g], token_Y[g]
+        ox, oy = x.min(), y.min()
+        tok_col_all[g] = np.round((x - ox) / TOKEN_SIZE_PX).astype(np.int16)
+        tok_row_all[g] = np.round((y - oy) / TOKEN_SIZE_PX).astype(np.int16)
+    return tok_row_all, tok_col_all
+
+
+def compute_token_positional_bias(token_h5ad_path: Path, chunk_size: int = 50_000, verbose: bool = True) -> np.ndarray:
+    """
+    Returns bias_grid, shape (TOKENS_PER_SIDE, TOKENS_PER_SIDE, token_dim):
+    the mean token embedding at each (row, col) position within a patch,
+    minus the grand mean across every token on this slide.
+
+    Real, confirmed artifact, not a hypothesis: each 224px patch is run
+    through UNI2h independently, so tokens near a patch's edge (row/col 0 or
+    15) systematically lack the surrounding tissue context that interior
+    tokens have. This shows up as a real per-position bias that survives
+    averaging over 100k+ tokens (i.e. it isn't just content variance
+    cancelling out unevenly), strongest at the edges and smoothly varying
+    across the patch -- and was shown directly (see conversation notes) to
+    drive leiden cluster assignment as a function of a cell's position
+    *within its own patch*, independent of actual tissue content: cluster
+    composition swings from one leiden cluster to a totally different one
+    across a single patch's width, reproducibly across thousands of
+    unrelated patches. That's what produced the "striping" tied to the
+    224px patch grid seen in cell-level clustering.
+
+    Computed fresh per-slide from that slide's own raw token grid (not a
+    hardcoded correction from some other slide) and applied by subtracting
+    bias_grid[row, col] from each token before it ever gets pooled into a
+    unit's (cell's or bin's) footprint/halo vector. Streamed in chunks so the
+    full (n_tokens x token_dim) array is never held in memory at once.
+
+    Shared by 03_integration/autoencoders/scripts/token_preprocessing.py for
+    both --unit nuclei (feeds compute_cell_token_features) and --unit bins
+    (feeds aggregate_tokens_to_grid_footprint_halo below).
+    """
+    f = h5py.File(token_h5ad_path, "r")
+    token_patch_codes = f["obs/Patch_ID/codes"][:]
+    token_X = f["obs/Token_X"][:]
+    token_Y = f["obs/Token_Y"][:]
+    token_dim = f["X"].shape[1]
+    n_tokens = f["X"].shape[0]
+
+    tok_row_all, tok_col_all = _token_grid_rowcol(token_patch_codes, token_X, token_Y)
+
+    grid_sum = np.zeros((TOKENS_PER_SIDE, TOKENS_PER_SIDE, token_dim), dtype=np.float64)
+    grid_count = np.zeros((TOKENS_PER_SIDE, TOKENS_PER_SIDE), dtype=np.int64)
+    grand_sum = np.zeros(token_dim, dtype=np.float64)
+
+    for start in range(0, n_tokens, chunk_size):
+        end = min(start + chunk_size, n_tokens)
+        if verbose:
+            print(f"  [positional bias] tokens {start}/{n_tokens}")
+        # read+sum in float32 (source is float16 on disk) -- only the running
+        # accumulators need float64 precision, not each transient chunk, which
+        # matters here: a float64 chunk at the old 200k chunk_size was ~3.7GB,
+        # enough to OOM on top of whatever else is already resident
+        chunk = f["X"][start:end].astype(np.float32)
+        grand_sum += chunk.sum(axis=0, dtype=np.float64)
+        rows, cols = tok_row_all[start:end], tok_col_all[start:end]
+        for r in range(TOKENS_PER_SIDE):
+            for c in range(TOKENS_PER_SIDE):
+                m = (rows == r) & (cols == c)
+                if m.any():
+                    grid_sum[r, c] += chunk[m].sum(axis=0, dtype=np.float64)
+                    grid_count[r, c] += m.sum()
+        del chunk
+
+    f.close()
+    grand_mean = grand_sum / n_tokens
+    grid_mean = grid_sum / grid_count[:, :, None]
+    bias_grid = (grid_mean - grand_mean).astype(np.float32)
+    if verbose:
+        dev_norms = np.linalg.norm(bias_grid.reshape(-1, token_dim), axis=1).reshape(TOKENS_PER_SIDE, TOKENS_PER_SIDE)
+        print(f"  [positional bias] deviation norm range: {dev_norms.min():.2f} - {dev_norms.max():.2f}")
+    return bias_grid
+
+
 def aggregate_tokens_to_grid_footprint_halo(
     sample: str, bin_coords: np.ndarray, half_side_px: float, halo_width_px: float,
-    data_dir: Path = DATA_DIR, batch_size: int = 20_000,
+    data_dir: Path = DATA_DIR, batch_size: int = 20_000, positional_bias: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Footprint+halo analogue of aggregate_tokens_to_grid, mirroring
@@ -518,8 +625,15 @@ def aggregate_tokens_to_grid_footprint_halo(
     overlap between bins. Sorting first means each batch's bins are actually
     near each other, so their candidate windows overlap heavily and dedup
     (see all_idx below) shrinks the per-batch token read/matmul by 3-4x.
+
+    `positional_bias`: optional (TOKENS_PER_SIDE, TOKENS_PER_SIDE, token_dim)
+    array from `compute_token_positional_bias` -- if given, subtracted from
+    every candidate token's embedding (by its (row, col) position within its
+    own patch) before it contributes to any footprint/halo weighting, same
+    correction and same rationale as compute_cell_token_features's own
+    `positional_bias` param (see compute_token_positional_bias's docstring).
     """
-    path = data_dir / TOKEN_METADATA_TEMPLATE.format(sample)
+    path = resolve_token_h5ad_path(sample, data_dir)
     bin_coords = np.asarray(bin_coords)[:, :2]
     order = np.lexsort((bin_coords[:, 0], bin_coords[:, 1]))
     bin_coords = bin_coords[order]
@@ -531,6 +645,11 @@ def aggregate_tokens_to_grid_footprint_halo(
         tok_y = f["obs/Token_Y"][:].astype(np.float64)
         n_dims = f["X"].shape[1]
         tree = cKDTree(np.stack([tok_x, tok_y], axis=1))
+
+        tok_row_all = tok_col_all = None
+        if positional_bias is not None:
+            tok_row_all, tok_col_all = _token_grid_rowcol(f["obs/Patch_ID/codes"][:], tok_x, tok_y)
+
         del tok_x, tok_y
 
         n = len(bin_coords)
@@ -575,6 +694,8 @@ def aggregate_tokens_to_grid_footprint_halo(
 
                 all_idx, col_pos = np.unique(tok_idx, return_inverse=True)
                 sub_emb = f["X"][all_idx].astype(np.float32)
+                if positional_bias is not None:
+                    sub_emb = sub_emb - positional_bias[tok_row_all[all_idx], tok_col_all[all_idx]]
 
                 w_inner = sparse.coo_matrix((inner_w, (bin_idx, col_pos)), shape=(b, len(all_idx))).tocsr()
                 w_ring = sparse.coo_matrix((ring_w, (bin_idx, col_pos)), shape=(b, len(all_idx))).tocsr()
@@ -608,7 +729,10 @@ def aggregate_tokens_to_grid_footprint_halo(
                 _, nearest_global = tree.query(batch[not_matched])
                 nearest_global = np.atleast_1d(nearest_global)
                 uniq_g, pos_g = np.unique(nearest_global, return_inverse=True)
-                vals = f["X"][uniq_g].astype(np.float32)[pos_g]
+                vals = f["X"][uniq_g].astype(np.float32)
+                if positional_bias is not None:
+                    vals = vals - positional_bias[tok_row_all[uniq_g], tok_col_all[uniq_g]]
+                vals = vals[pos_g]
                 footprint_b[not_matched] = vals
                 halo_b[not_matched] = vals
 
