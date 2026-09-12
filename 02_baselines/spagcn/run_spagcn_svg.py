@@ -61,6 +61,46 @@ def log_rss(tag):
     print(f"[mem] {tag}: peak RSS so far = {gb:.1f} GB", flush=True)
 
 
+# Same math as the original spg.calculate_p(adj, l), but writing into one
+# reused buffer in place instead of letting numpy allocate a fresh full-size
+# n x n array at every operator (adj**2, /(2l^2), negate, exp each
+# independently allocated one in the original one-liner). Measured directly
+# (2026-09-11, CRC_P6_5mm, 22.7GB matrix, via log_rss checkpoints): the naive
+# version -- even rewritten with named intermediates and explicit `del`
+# between them -- peaked at 114.1GB (~5x the matrix size) for just two calls,
+# not the ~3x a simple object-count would suggest. `del` didn't help because
+# Python evaluates an expression's RHS (allocating the new array) before the
+# old variable's `del` on the next line runs, so old and new are briefly
+# resident together regardless of how the code is split; a jump between two
+# sequential calls also showed the allocator wasn't cleanly reusing freed
+# blocks between them. This needs at most 2x the matrix size (adj + the one
+# reused buffer) total -- verified numerically identical to the original.
+#
+# Patched at the module level (spg.util.calculate_p, not just spg.calculate_p)
+# because spg.util.search_l calls calculate_p as a bare name from within its
+# own module up to a dozen+ times per bisection search (one call per Run),
+# and Python resolves that at call time via search_l's own module globals --
+# patching only the flat spg.calculate_p alias would leave every one of
+# search_l's internal calls on the original, unpatched, 5x-peak version.
+_calc_p_buf = [None]
+
+
+def _calculate_p_low_mem(adj, l):
+    buf = _calc_p_buf[0]
+    if buf is None or buf.shape != adj.shape:
+        buf = np.empty(adj.shape, dtype=np.float32)
+        _calc_p_buf[0] = buf
+    np.square(adj, out=buf)
+    buf /= (2 * (l ** 2))
+    np.negative(buf, out=buf)
+    np.exp(buf, out=buf)
+    return float(np.mean(buf.sum(axis=1))) - 1
+
+
+spg.util.calculate_p = _calculate_p_low_mem
+spg.calculate_p = _calculate_p_low_mem
+
+
 def _calculate_adj_matrix_patched(x, y, x_pixel=None, y_pixel=None, image=None, beta=49, alpha=1, histology=True):
     # Same fix already applied once in this repo's local SpaGCN_package/SpaGCN/calculate_adj.py
     # (git commit 85f879a, Nov 2025) but never carried into a fresh `pip install SpaGCN` on the
@@ -308,32 +348,6 @@ def load_prepped_adata_and_adj(dir_spagcn_data):
     return adata, adj
 
 
-def _calculate_p_instrumented(adj, l, label):
-    # Same math as spg.calculate_p(adj, l), broken into named steps with
-    # log_rss between each -- see log_rss's docstring for why this exists.
-    # adj itself is NOT re-logged here (its size is already known/logged
-    # right after build_adj_and_centroids returns); this isolates what this
-    # one line of vendored SpaGCN code costs on top of that.
-    log_rss(f"calculate_p({label}): before")
-    squared = adj ** 2
-    log_rss(f"calculate_p({label}): after adj**2")
-    scaled = squared / (2 * (l ** 2))
-    del squared
-    log_rss(f"calculate_p({label}): after /(2l^2)")
-    negated = -1 * scaled
-    del scaled
-    log_rss(f"calculate_p({label}): after negate")
-    exped = np.exp(negated)
-    del negated
-    log_rss(f"calculate_p({label}): after exp")
-    row_sums = np.sum(exped, 1)
-    del exped
-    log_rss(f"calculate_p({label}): after row sum")
-    result = float(np.mean(row_sums)) - 1
-    log_rss(f"calculate_p({label}): done")
-    return result
-
-
 def find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run):
     # Diagnose the search range ourselves before calling spg.search_l: SpaGCN's own
     # diagnostic prints ("l not found, try smaller/bigger ...") go to a block-buffered
@@ -341,14 +355,14 @@ def find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run):
     # downstream "l should not be set" ValueError with no explanation. flush=True here
     # so this always lands in the log regardless of buffering.
     #
-    # Using the instrumented version here, not spg.calculate_p directly: the
-    # last several OOMs all died somewhere in these first two calls, before
-    # any other output printed, and a 3x/4x-of-matrix-size formula undershot
-    # in ways that don't fit a clean model -- this pins down exactly which
-    # sub-step is responsible instead of guessing at another multiplier.
+    # spg.calculate_p is monkeypatched (near the top of this file) to a
+    # low-memory in-place version -- these two calls, and every one of
+    # spg.search_l's own internal calls just below, all go through it.
     log_rss("find_l: start (adj already resident)")
-    p_low = _calculate_p_instrumented(adj, l_start, "l_start")
-    p_high = _calculate_p_instrumented(adj, l_end, "l_end")
+    p_low = spg.calculate_p(adj, l_start)
+    log_rss("find_l: after calculate_p(l_start)")
+    p_high = spg.calculate_p(adj, l_end)
+    log_rss("find_l: after calculate_p(l_end)")
     print(f"Searching for l (p target = {p}); p(l={l_start}) = {p_low:.4f}, "
           f"p(l={l_end}) = {p_high:.4f}", flush=True)
     if p_low > p + l_tol:
