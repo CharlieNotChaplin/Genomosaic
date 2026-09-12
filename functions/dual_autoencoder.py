@@ -101,7 +101,7 @@ class MLPDecoder(nn.Module):
     class's default) is the validated setting, paired with weight_decay on
     whichever encoder feeds this decoder (trans_enc/token_enc).
     """
-    def __init__(self, latent_dim, hidden_dims, out_dim, n_slides=5, condition_on_slide=True):
+    def __init__(self, latent_dim, hidden_dims, out_dim, n_slides=10, condition_on_slide=True):
         super().__init__()
         self.condition_on_slide = condition_on_slide
         in_dim = latent_dim + (n_slides if condition_on_slide else 0)
@@ -121,19 +121,22 @@ class MLPDecoder(nn.Module):
  
  
 class MLPEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dims, latent_dim, dropout=0.1, norm="batch"):
+    def __init__(self, in_dim, hidden_dims, latent_dim, dropout=0.1, norm="layer"):
         """
-        norm: "batch" (default, every run to date) or "layer" -- ablation hook.
-        Unlike trans_enc's own BatchNorm->LayerNorm switch (SVGGraphEncoder_TransConv),
-        this one isn't motivated by attention -- this is a plain MLP. The motivation
-        is that this encoder's input batches are always single-slide
-        (SlideStratifiedLoader), same as trans_enc's, and this encoder's raw output
-        (z_token) is the thing directly measured for Slide_ID leakage
-        (evaluate_latent_leakage) in every run -- unlike the decoders, which are
-        already explicitly slide-conditioned and so have nothing left to leak via
-        batch statistics. Token-branch leakage has stayed persistently high
-        (~0.8-0.88) across every other ablation factor tested; this checks whether
-        BatchNorm's single-slide-batch statistics are part of why.
+        norm: "layer" (default, adopted 2026-09) or "batch". Ablated directly against
+        this encoder's original BatchNorm1d: LayerNorm more than doubled in-sample
+        fit (train_top1 0.090->0.196 mean across a 3-slide probe), cut token-branch
+        leakage substantially (train_leak 0.809->0.658), and left held-out retrieval
+        flat (0.455->0.459) -- a clean overfitting-vs-generalization dissociation,
+        with the leakage reduction essentially free (unlike freeze_token, which cut
+        leakage further but cost real held-out retrieval). See
+        ablation_studies_summary.txt for the full comparison. Unlike trans_enc's own
+        BatchNorm->LayerNorm switch (SVGGraphEncoder_TransConv), this one isn't
+        motivated by attention -- this is a plain MLP; the motivation is that this
+        encoder's input batches are always single-slide (SlideStratifiedLoader), and
+        its raw output (z_token) is the thing directly measured for Slide_ID leakage,
+        unlike the decoders (already explicitly slide-conditioned, nothing left to
+        leak via batch statistics).
         """
         super().__init__()
         norm_cls = {"batch": nn.BatchNorm1d, "layer": nn.LayerNorm}[norm]
@@ -166,8 +169,7 @@ class DualAutoencoder(nn.Module):
     def __init__(self, n_svg, latent_dim=64, proj_dim=32, n_slides=5,
                  encoder_type="sage", transconv_heads=4,
                  token_dim=None, token_hidden=(512, 128),
-                 token_condition_on_slide=True, trans_condition_on_slide=True,
-                 token_norm="batch"):
+                 token_condition_on_slide=True, trans_condition_on_slide=True):
         """
         token_dim: dimensionality of the per-cell local histology token feature
             (footprint+halo ViT token embedding, see `token_preprocessing.py`).
@@ -187,9 +189,6 @@ class DualAutoencoder(nn.Module):
             the default -- pass False to ablate it, e.g. to test whether the
             latent absorbs slide-identifying technical variance without this
             escape hatch.
-
-        token_norm: "batch" (default) or "layer" -- see `MLPEncoder`'s own
-            docstring for the leakage-motivated rationale for the "layer" option.
         """
         super().__init__()
         if encoder_type == "sage":
@@ -203,7 +202,7 @@ class DualAutoencoder(nn.Module):
 
         self.token_dim = token_dim
         if token_dim is not None:
-            self.token_enc = MLPEncoder(token_dim, list(token_hidden), latent_dim, norm=token_norm)
+            self.token_enc = MLPEncoder(token_dim, list(token_hidden), latent_dim)
             self.token_dec = MLPDecoder(latent_dim, list(token_hidden)[::-1], token_dim, n_slides,
                                          condition_on_slide=token_condition_on_slide)
             self.proj_token = ProjectionHead(latent_dim, proj_dim)
@@ -1886,7 +1885,6 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         n_slides=train_pipe["n_slides"], encoder_type=CONFIG["encoder"],
         token_condition_on_slide=CONFIG.get("token_condition_on_slide", True),
         trans_condition_on_slide=CONFIG.get("trans_condition_on_slide", True),
-        token_norm=CONFIG.get("token_norm", "batch"),
     )
     pretrain_kwargs = dict(
         epochs=CONFIG["token_pretrain_epochs"], lr=CONFIG["token_pretrain_lr"],
