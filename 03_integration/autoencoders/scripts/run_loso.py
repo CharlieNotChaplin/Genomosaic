@@ -45,7 +45,8 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
-           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True):
+           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
+           token_norm="batch"):
     """
     Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
     __main__'s CLI parsing can override them per sbatch submission without touching
@@ -118,6 +119,13 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         # Ablation hook: True skips Phase-1 token pretraining entirely, so token_enc/
         # token_dec start from the same random init as the rest of the model.
         skip_token_pretrain=skip_token_pretrain,
+
+        # Ablation hook: token_enc's own normalization -- "batch" (default, every
+        # run to date) or "layer". See MLPEncoder's own docstring for why this is
+        # worth testing (single-slide batches + z_token is the thing directly
+        # measured for leakage, same underlying concern as trans_enc's own
+        # BatchNorm->LayerNorm switch, minus the attention-specific motivation).
+        token_norm=token_norm,
 
         # training (Phase 3)
         n_epochs=100,
@@ -280,6 +288,8 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
     if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
         _tag_parts.append("noweight")
+    if CONFIG.get("token_norm", "batch") != "batch":
+        _tag_parts.append(f"tokennorm_{CONFIG['token_norm']}")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -382,6 +392,12 @@ if __name__ == "__main__":
                               "by per-unit inverse density (default: weighted). Never "
                               "independently ablated against a plain unweighted mean "
                               "before this flag existed.")
+    parser.add_argument("--token-norm", choices=["batch", "layer"], default="batch",
+                         help="Normalization layer inside token_enc (default: batch, "
+                              "every run to date). 'layer' tests whether BatchNorm's "
+                              "single-slide-batch statistics contribute to the "
+                              "persistently high token-branch Slide_ID leakage seen "
+                              "across every other ablation factor.")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -392,4 +408,5 @@ if __name__ == "__main__":
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
         weight_reconstruction=not args.no_weight_reconstruction,
+        token_norm=args.token_norm,
     )
