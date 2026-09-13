@@ -32,8 +32,8 @@ class SVGGraphEncoder_SAGE(nn.Module):
         super().__init__()
         self.conv1 = SAGEConv(in_dim, hidden_dim)
         self.conv2 = SAGEConv(hidden_dim, hidden_dim)
-        self.bn1 = nn.BatchNorm1d(hidden_dim)
-        self.bn2 = nn.BatchNorm1d(hidden_dim)
+        self.bn1 = nn.LayerNorm(hidden_dim)
+        self.bn2 = nn.LayerNorm(hidden_dim)
         self.dropout = dropout
         self.out = nn.Linear(hidden_dim, latent_dim)
  
@@ -73,9 +73,7 @@ class SVGGraphEncoder_TransConv(nn.Module):
             hidden_dim, out_per_head, heads=heads, concat=True,
             dropout=dropout, edge_dim=edge_dim,
         )
-        # LayerNorm (per-node, over the feature dim) rather than BatchNorm (per-feature,
-        # over the batch/node-count dim) -- see conversation notes on why this matters
-        # for this attention-based, graph-sampled setup.
+
         self.norm1 = nn.LayerNorm(hidden_dim)
         self.norm2 = nn.LayerNorm(hidden_dim)
         self.dropout = dropout
@@ -100,6 +98,16 @@ class MLPDecoder(nn.Module):
     optimizer toward not encoding it anyway. `condition_on_slide=True` (this
     class's default) is the validated setting, paired with weight_decay on
     whichever encoder feeds this decoder (trans_enc/token_enc).
+
+    Uses LayerNorm (adopted 2026-09, previously BatchNorm1d, ablated against it
+    -- see git history / ablation_studies_summary.txt) for the same reason as
+    MLPEncoder: this decoder also sits on single-slide batches
+    (SlideStratifiedLoader). No leakage angle here specifically (slide identity is
+    already given directly via condition_on_slide), and no held-out reconstruction
+    metric exists to independently check generalization the way held-out retrieval
+    did for token_enc's own switch -- adopted on the strength of the encoder result
+    plus the shared batch-composition mechanism, not an independently re-derived
+    held-out check.
     """
     def __init__(self, latent_dim, hidden_dims, out_dim, n_slides=10, condition_on_slide=True):
         super().__init__()
@@ -107,7 +115,7 @@ class MLPDecoder(nn.Module):
         in_dim = latent_dim + (n_slides if condition_on_slide else 0)
         layers, d = [], in_dim
         for h in hidden_dims:
-            layers += [nn.Linear(d, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.1)]
+            layers += [nn.Linear(d, h), nn.LayerNorm(h), nn.ReLU(), nn.Dropout(0.1)]
             d = h
         layers.append(nn.Linear(d, out_dim))
         self.net = nn.Sequential(*layers)
@@ -121,28 +129,26 @@ class MLPDecoder(nn.Module):
  
  
 class MLPEncoder(nn.Module):
-    def __init__(self, in_dim, hidden_dims, latent_dim, dropout=0.1, norm="layer"):
-        """
-        norm: "layer" (default, adopted 2026-09) or "batch". Ablated directly against
-        this encoder's original BatchNorm1d: LayerNorm more than doubled in-sample
-        fit (train_top1 0.090->0.196 mean across a 3-slide probe), cut token-branch
-        leakage substantially (train_leak 0.809->0.658), and left held-out retrieval
-        flat (0.455->0.459) -- a clean overfitting-vs-generalization dissociation,
-        with the leakage reduction essentially free (unlike freeze_token, which cut
-        leakage further but cost real held-out retrieval). See
-        ablation_studies_summary.txt for the full comparison. Unlike trans_enc's own
-        BatchNorm->LayerNorm switch (SVGGraphEncoder_TransConv), this one isn't
-        motivated by attention -- this is a plain MLP; the motivation is that this
-        encoder's input batches are always single-slide (SlideStratifiedLoader), and
-        its raw output (z_token) is the thing directly measured for Slide_ID leakage,
-        unlike the decoders (already explicitly slide-conditioned, nothing left to
-        leak via batch statistics).
-        """
+    """
+    Uses LayerNorm (adopted 2026-09, previously BatchNorm1d, ablated directly
+    against it -- see git history / ablation_studies_summary.txt). LayerNorm more
+    than doubled in-sample fit (train_top1 0.090->0.196 mean across a 3-slide
+    probe), cut token-branch leakage substantially (train_leak 0.809->0.658), and
+    left held-out retrieval flat (0.455->0.459) -- a clean overfitting-vs-
+    generalization dissociation, with the leakage reduction essentially free
+    (unlike freeze_token, which cut leakage further but cost real held-out
+    retrieval). Unlike trans_enc's own BatchNorm->LayerNorm switch
+    (SVGGraphEncoder_TransConv), this one isn't motivated by attention -- this is
+    a plain MLP; the motivation is that this encoder's input batches are always
+    single-slide (SlideStratifiedLoader), and its raw output (z_token) is the
+    thing directly measured for Slide_ID leakage, unlike the decoders (already
+    explicitly slide-conditioned, nothing left to leak via batch statistics).
+    """
+    def __init__(self, in_dim, hidden_dims, latent_dim, dropout=0.1):
         super().__init__()
-        norm_cls = {"batch": nn.BatchNorm1d, "layer": nn.LayerNorm}[norm]
         layers, d = [], in_dim
         for h in hidden_dims:
-            layers += [nn.Linear(d, h), norm_cls(h), nn.ReLU(), nn.Dropout(dropout)]
+            layers += [nn.Linear(d, h), nn.LayerNorm(h), nn.ReLU(), nn.Dropout(dropout)]
             d = h
         layers.append(nn.Linear(d, latent_dim))
         self.net = nn.Sequential(*layers)
