@@ -46,7 +46,7 @@ from functions.dual_autoencoder import *
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
            skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
-           weight_decay=0.0, encoder_type="transconv"):
+           weight_decay=0.0, encoder_type="transconv", temperature=0.07):
     """
     Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
     __main__'s CLI parsing can override them per sbatch submission without touching
@@ -97,7 +97,11 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         cells_per_batch=1024,
 
         # loss
-        temperature=0.07,
+        # Contrastive logits are divided by this before softmax (see local_infonce) --
+        # lower = sharper/more confident distribution, higher = softer. 0.07 (default)
+        # has been the value in every run to date, inherited from CLIP/SimCLR without
+        # ever being independently ablated here. Ablatable via CLI.
+        temperature=temperature,
         neighbor_radius=2912,       # still required by compute_patch_metadata/
                                      # build_pipeline_data's shared patch-batching path
         local_neighbor_radius=local_neighbor_radius,  # cell-level analogue, first attempt
@@ -299,6 +303,8 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"wd{CONFIG['weight_decay']}")
     if CONFIG["encoder"] != "transconv":
         _tag_parts.append(f"enc_{CONFIG['encoder']}")
+    if CONFIG["temperature"] != 0.07:
+        _tag_parts.append(f"temp{CONFIG['temperature']}")
     if CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
@@ -415,6 +421,12 @@ if __name__ == "__main__":
                               "DualAutoencoder's other implementation (GraphSAGE, "
                               "nn.BatchNorm1d internally) -- never itself compared "
                               "against transconv before this flag existed.")
+    parser.add_argument("--temperature", type=float, default=0.07,
+                         help="Contrastive loss softmax temperature (see local_infonce) "
+                              "-- lower is a sharper/more confident distribution, higher "
+                              "is softer (default: 0.07, inherited from CLIP/SimCLR and "
+                              "unchanged in every run to date, never independently "
+                              "ablated before this flag existed).")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -427,4 +439,5 @@ if __name__ == "__main__":
         weight_reconstruction=not args.no_weight_reconstruction,
         weight_decay=args.weight_decay,
         encoder_type=args.encoder,
+        temperature=args.temperature,
     )
