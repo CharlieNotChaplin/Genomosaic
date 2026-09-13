@@ -1140,7 +1140,13 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
     param_groups = [{"params": other_params, "lr": lr, "weight_decay": weight_decay}]
     if token_params:
         param_groups.append({"params": token_params, "lr": lr * token_lr_mult, "weight_decay": weight_decay})
-    opt = torch.optim.Adam(param_groups)
+    # AdamW, not Adam: decoupled weight decay, matching pretrain_token_autoencoder's
+    # own optimizer -- plain Adam's weight_decay is an L2 penalty added to the
+    # gradient, which interacts inconsistently with Adam's per-parameter adaptive
+    # learning rates (the reason AdamW exists at all). Identical to the prior Adam
+    # at weight_decay=0.0 (every run to date), since the two only differ once decay
+    # is actually nonzero.
+    opt = torch.optim.AdamW(param_groups)
     if weight_reconstruction:
         if density_weight_all is None:
             raise ValueError("weight_reconstruction=True requires density_weight_all (see compute_local_density_weight)")
@@ -1242,7 +1248,7 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
 
     rng = np.random.default_rng(seed)
     results_per_slide = {}
-    all_top1, all_n, all_cluster_top1 = [], [], []
+    all_top1, all_n, all_cluster_top1, all_neighbor_acc = [], [], [], []
     for sid in torch.unique(slide_id_all).cpu().numpy():
         idx = (slide_id_all == int(sid)).nonzero(as_tuple=True)[0]
         if len(idx) > max_cells_per_slide:
@@ -1261,6 +1267,7 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
             xy = xy_all[idx]
             dist = (xy[pred] - xy).norm(dim=1)
             neighbor_acc = (dist < neighbor_radius).float().mean().item()
+            all_neighbor_acc.append(neighbor_acc)
 
         cluster_top1 = None
         if cell_type_labels is not None:
@@ -1281,6 +1288,10 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
     if all_cluster_top1:
         mean_cluster_top1 = float(np.average(all_cluster_top1, weights=all_n))
         print(f"Cell<->token retrieval, n-weighted mean cluster-level top-1: {mean_cluster_top1:.3f}")
+    mean_neighbor_tolerant = None
+    if all_neighbor_acc:
+        mean_neighbor_tolerant = float(np.average(all_neighbor_acc, weights=all_n))
+        print(f"Cell<->token retrieval, n-weighted mean neighbor-tolerant top-1: {mean_neighbor_tolerant:.3f}")
     print(f"Cell<->token retrieval, n-weighted mean exact-cell top-1 across slides: {mean_top1:.3f}")
     for sid, r in results_per_slide.items():
         msg = f"  slide {sid}:"
@@ -1292,7 +1303,8 @@ def token_retrieval_accuracy(model, data, token_emb_all, cell_meta, device="cuda
         msg += f" (n={r['n']}, chance={1 / r['n']:.5f})"
         print(msg)
 
-    return {"mean_top1": mean_top1, "mean_cluster_top1": mean_cluster_top1, "per_slide": results_per_slide,
+    return {"mean_top1": mean_top1, "mean_cluster_top1": mean_cluster_top1,
+            "mean_neighbor_tolerant": mean_neighbor_tolerant, "per_slide": results_per_slide,
             "z_trans_cell_full": z_cells_full.cpu().numpy(),
             "z_token_cell_full": z_token_full.cpu().numpy()}
 
@@ -1952,6 +1964,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
         edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0),
         gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
+        weight_decay=CONFIG.get("weight_decay", 0.0),
     )
 
     # cluster labels (independent, pre-existing trans-only clustering) computed
@@ -2021,8 +2034,10 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         "train_slides": ",".join(train_slides),
         "train_cell_top1_retrieval": train_eval["mean_top1"],
         "train_cell_cluster_top1_retrieval": train_eval["mean_cluster_top1"],
+        "train_cell_neighbor_tolerant_retrieval": train_eval["mean_neighbor_tolerant"],
         "held_out_cell_top1_retrieval": held_eval["mean_top1"],
         "held_out_cell_cluster_top1_retrieval": held_eval["mean_cluster_top1"],
+        "held_out_cell_neighbor_tolerant_retrieval": held_eval["mean_neighbor_tolerant"],
         "token_pretrain_best_val_mse": pretrain_info["best_val_mse"],
         "token_pretrain_stopped_epoch": pretrain_info["stopped_epoch"],
         "train_token_leakage_mean": train_leak_token["leakage_mean"],
