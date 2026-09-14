@@ -817,6 +817,7 @@ def encode_full_graph_batched(encoder, data, device, num_neighbors=(10, 10), bat
 
 def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
                    neighbor_radius=None, weight=None, anchor_sim_threshold=None,
+                   anchor_sim_source="projected", raw_trans=None, raw_hist=None,
                    return_stats=False):
     """
     One-to-one InfoNCE between a unit's (cell or bin) transcriptomics and local
@@ -830,14 +831,32 @@ def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
         are transcriptomically near-duplicate regardless of distance (e.g. two
         separate tumor nests of the same subtype) -- without it, InfoNCE pushes
         them apart via spurious non-biological signal (staining, slide identity)
-        as a tie-breaker. Checked on both `p_trans`-vs-`p_trans` and
-        `p_hist`-vs-`p_hist` similarity, since a pair can be a near-duplicate in
-        one modality but fail a strict cutoff in the other from noise/dropout
-        alone (checking only one side missed real false negatives -- traced a
-        checkerboard-like leiden-cluster artifact back to exactly this gap).
-        Masking-only, never an added attractive term. Assumes L2-normalized
-        inputs, so this is a cosine-similarity cutoff in [-1, 1] (e.g. 0.9 =
-        near-duplicates only).
+        as a tie-breaker. Checked on both a transcriptomics-side and a
+        histology-side similarity (source controlled by `anchor_sim_source`,
+        see below), since a pair can be a near-duplicate in one modality but
+        fail a strict cutoff in the other from noise/dropout alone (checking
+        only one side missed real false negatives -- traced a checkerboard-like
+        leiden-cluster artifact back to exactly this gap). Masking-only, never
+        an added attractive term. Assumes L2-normalized inputs, so this is a
+        cosine-similarity cutoff in [-1, 1] (e.g. 0.9 = near-duplicates only).
+      - `anchor_sim_source`: "projected" (default) checks `p_trans`-vs-`p_trans`
+        and `p_hist`-vs-`p_hist` -- the model's own LIVE, currently-training
+        projections. Ablated and found to hurt more than help (see
+        ablation_studies_summary.txt): the projections are exactly what the
+        model is actively learning, so if it starts collapsing (embeddings
+        drifting together for non-biological reasons, e.g. slide leakage), more
+        pairs cross the threshold and get masked, removing the gradient that
+        would correct the collapse -- self-reinforcing.
+        "raw" checks `raw_trans`-vs-`raw_trans` and `raw_hist`-vs-`raw_hist`
+        instead (L2-normalized here) -- fixed, pre-encoder feature vectors
+        (e.g. `x[:n_seed]`/`token_x` in `train_step`) that never change during
+        training, so this can't feed back into the same collapse loop. Not yet
+        validated (see run_it's own gene panel-style ablation script) -- the
+        raw-feature cosine-similarity distribution is unrelated to the
+        projected-space one, so a threshold value tuned for "projected"
+        (e.g. 0.7/0.9) does NOT carry over; re-tune against this mode's own
+        `frac_masked`/`contrast_local` (printed every epoch by `train`) before
+        trusting a specific value. Requires `raw_trans`/`raw_hist`.
       - `weight`: inverse-frequency weighting per unit. Not passed by
         `train_step`'s own call today (defaults to a plain per-unit mean) --
         left available for a caller that wants it.
@@ -881,8 +900,20 @@ def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
         logits = logits.masked_fill(neighbor_mask, float("-inf"))
 
     if anchor_sim_threshold is not None:
-        trans_sim = p_trans @ p_trans.T  # cosine sim, p_trans is L2-normalized
-        hist_sim = p_hist @ p_hist.T     # p_token for the local/cell-level call
+        if anchor_sim_source == "projected":
+            trans_sim = p_trans @ p_trans.T  # cosine sim, p_trans is L2-normalized
+            hist_sim = p_hist @ p_hist.T     # p_token for the local/cell-level call
+        elif anchor_sim_source == "raw":
+            if raw_trans is None or raw_hist is None:
+                raise ValueError("anchor_sim_source='raw' requires raw_trans and raw_hist "
+                                  "(fixed, pre-encoder feature vectors) to be passed in.")
+            raw_trans_n = F.normalize(raw_trans, dim=-1)
+            raw_hist_n = F.normalize(raw_hist, dim=-1)
+            trans_sim = raw_trans_n @ raw_trans_n.T
+            hist_sim = raw_hist_n @ raw_hist_n.T
+        else:
+            raise ValueError(f"Unsupported anchor_sim_source: {anchor_sim_source!r}. "
+                              f"Choose from 'projected', 'raw'.")
         false_neg_mask = (trans_sim > anchor_sim_threshold) | (hist_sim > anchor_sim_threshold)
         if slide_ids is not None:
             same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
@@ -1046,7 +1077,7 @@ def freeze_token_encoder(model, freeze_decoder=True):
 def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_reconstruction=True,
                edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
                token_emb_all=None, cell_meta=None, local_contrast_weight=0.0, freeze_token=False,
-               local_anchor_sim_threshold=None):
+               local_anchor_sim_threshold=None, local_anchor_sim_source="projected"):
     """
     density_weight_all: per-unit inverse-density weight (see
     `compute_local_density_weight`), used by `weight_reconstruction` to weight
@@ -1058,9 +1089,12 @@ def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_r
     must be row-aligned with data.x -- seed cells are looked up via
     batch.n_id[:n_seed] (NeighborLoader puts seed nodes first).
 
-    local_anchor_sim_threshold: forwarded to local_infonce -- cosine-
-    similarity cutoff excluding transcriptomically near-duplicate, non-matching
-    cells from hard negatives (see local_infonce's docstring).
+    local_anchor_sim_threshold / local_anchor_sim_source: forwarded to
+    local_infonce -- cosine-similarity cutoff excluding transcriptomically
+    near-duplicate, non-matching cells from hard negatives (see local_infonce's
+    docstring). When source=="raw", the clean x[:n_seed]/token_x computed below
+    are passed as the fixed comparison vectors -- no extra work needed here,
+    they already exist for reconstruction/the token branch.
 
     edge_dropout_p / gene_dropout_p: denoising-style corruption applied only to
     what trans_enc sees (reconstruction target stays clean). Targets two Slide_ID
@@ -1124,6 +1158,8 @@ def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_r
             p_trans_local, p_token, cell_xy, slide_ids=cell_slide_ids,
             temperature=temperature, neighbor_radius=cell_meta["neighbor_radius"],
             anchor_sim_threshold=local_anchor_sim_threshold,
+            anchor_sim_source=local_anchor_sim_source,
+            raw_trans=x[:n_seed], raw_hist=token_x,
             return_stats=True,
         )
         local_frac_masked = local_mask_stats["frac_masked"]
@@ -1150,7 +1186,7 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
           weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
           token_emb_all=None, cell_meta=None, max_local_contrast_weight=0.0,
           local_warmup_epochs=None, freeze_token=False, token_lr_mult=1.0,
-          local_anchor_sim_threshold=None):
+          local_anchor_sim_threshold=None, local_anchor_sim_source="projected"):
     """
     density_weight_all: per-unit inverse-density weight from
       `compute_local_density_weight`, required (not None) when
@@ -1159,11 +1195,12 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
     token_emb_all / cell_meta: see `build_cell_meta`. None (default) trains as
       before, including for models with no token branch.
 
-    local_anchor_sim_threshold: forwarded to `local_infonce` -- cosine-
-      similarity cutoff excluding transcriptomically near-duplicate, non-matching
-      cells from hard negatives (same false-negative protection as
-      `neighbor_radius`, gated on expression similarity instead of distance).
-      Default None (off).
+    local_anchor_sim_threshold / local_anchor_sim_source: forwarded to
+      `local_infonce` -- cosine-similarity cutoff excluding transcriptomically
+      near-duplicate, non-matching cells from hard negatives (same
+      false-negative protection as `neighbor_radius`, gated on expression
+      similarity instead of distance). threshold default None (off); source
+      default "projected" (see local_infonce's own docstring for "raw").
 
     max_local_contrast_weight / local_warmup_epochs: ramp schedule for the
       cell<->token contrastive term. local_warmup_epochs defaults to
@@ -1231,7 +1268,8 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
                                 token_emb_all=token_emb_all if use_tokens else None,
                                 cell_meta=cell_meta if use_tokens else None,
                                 local_contrast_weight=lcw, freeze_token=freeze_token,
-                                local_anchor_sim_threshold=local_anchor_sim_threshold)
+                                local_anchor_sim_threshold=local_anchor_sim_threshold,
+                                local_anchor_sim_source=local_anchor_sim_source)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
@@ -2010,6 +2048,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         local_warmup_epochs=CONFIG.get("local_warmup_epochs"),
         freeze_token=freeze_token, token_lr_mult=CONFIG.get("token_lr_mult", 1.0),
         local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
+        local_anchor_sim_source=CONFIG.get("local_anchor_sim_source", "projected"),
         edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0),
         gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
         weight_decay=CONFIG.get("weight_decay", 0.0),

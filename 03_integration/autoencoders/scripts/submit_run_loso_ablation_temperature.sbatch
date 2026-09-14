@@ -11,6 +11,13 @@
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
+# DONE (2026-09-14): all 3 points (0.03/0.05/0.2) completed, 0.05 adopted as the
+# new run_loso.py --temperature default (was 0.07) -- see
+# ablation_studies_summary.txt's "CONTRASTIVE TEMPERATURE SWEEP" section for the
+# full writeup. Kept for reference/rerun-ability, not meant to be resubmitted
+# as-is. NOTE: default has since changed, so the "don't add 0.07, it'll collide
+# with baseline" warning below is stale -- it's now 0.05 that would collide.
+#
 # Contrastive-loss temperature sweep (see local_infonce): 0.07 has been the value
 # in every run to date, inherited from CLIP/SimCLR and never independently
 # ablated. Unlike the other ablation factors so far (mostly on/off switches),

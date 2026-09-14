@@ -45,8 +45,9 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
+           local_anchor_sim_source="projected",
            skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
-           weight_decay=0.0, encoder_type="transconv", temperature=0.07, gene_panel=None,
+           weight_decay=0.0, encoder_type="transconv", temperature=0.05, gene_panel=None,
            gene_selection="svg"):
     """
     Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
@@ -104,9 +105,11 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
 
         # loss
         # Contrastive logits are divided by this before softmax (see local_infonce) --
-        # lower = sharper/more confident distribution, higher = softer. 0.07 (default)
-        # has been the value in every run to date, inherited from CLIP/SimCLR without
-        # ever being independently ablated here. Ablatable via CLI.
+        # lower = sharper/more confident distribution, higher = softer. 0.05 (default,
+        # changed from the CLIP/SimCLR-inherited 0.07 -- see ablation_studies_summary.txt's
+        # "CONTRASTIVE TEMPERATURE SWEEP" section) beat 0.07 on held-out retrieval for
+        # every slide in the 3-slide probe; 0.03 didn't improve further (plateau), 0.2
+        # was clearly worse. Ablatable via CLI.
         temperature=temperature,
         neighbor_radius=2912,       # still required by compute_patch_metadata/
                                      # build_pipeline_data's shared patch-batching path
@@ -116,6 +119,13 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
                                            # 18-config sweep showed masking here doesn't
                                            # help and can trigger collapse -- see
                                            # train_autoenc_token.py. Ablatable via CLI.
+        # "projected" (default) reproduces that same tested-and-rejected behavior
+        # (checks the model's own live projections). "raw" checks fixed,
+        # pre-encoder feature vectors instead -- not yet validated, see
+        # local_infonce's own docstring for why this might avoid the collapse
+        # feedback loop "projected" is prone to. Only has any effect when
+        # local_anchor_sim_threshold is not None.
+        local_anchor_sim_source=local_anchor_sim_source,
 
         # Name predates the compute_local_density_weight swap (see functions/
         # dual_autoencoder.py) -- this now gates the per-unit DENSITY weight, not
@@ -313,13 +323,15 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
     if CONFIG.get("local_anchor_sim_threshold") is not None:
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
+        if CONFIG.get("local_anchor_sim_source", "projected") != "projected":
+            _tag_parts.append(f"simsrc_{CONFIG['local_anchor_sim_source']}")
     if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
         _tag_parts.append("noweight")
     if CONFIG.get("weight_decay", 0.0) > 0.0:
         _tag_parts.append(f"wd{CONFIG['weight_decay']}")
     if CONFIG["encoder"] != "transconv":
         _tag_parts.append(f"enc_{CONFIG['encoder']}")
-    if CONFIG["temperature"] != 0.07:
+    if CONFIG["temperature"] != 0.05:
         _tag_parts.append(f"temp{CONFIG['temperature']}")
     if CONFIG.get("gene_panel_path") is not None:
         _tag_parts.append(f"panel_{CONFIG['gene_panel_path'].stem}")
@@ -411,6 +423,16 @@ if __name__ == "__main__":
                          help="Cell<->token contrastive loss: semantic (cosine-similarity) "
                               "exclusion threshold, or 'none' to disable (default: none, "
                               "the value every existing run has used).")
+    parser.add_argument("--local-anchor-sim-source", choices=["projected", "raw"], default="projected",
+                         help="What --local-anchor-sim-threshold checks similarity on "
+                              "(no effect if that threshold is unset): 'projected' (default) "
+                              "checks the model's own live projections -- tested, "
+                              "underperformed leaving masking off entirely (see "
+                              "ablation_studies_summary.txt). 'raw' checks fixed, "
+                              "pre-encoder feature vectors instead, which can't feed into "
+                              "the same collapse feedback loop -- not yet validated, "
+                              "thresholds tuned for 'projected' (0.7/0.9) do NOT carry "
+                              "over, see local_infonce's docstring before picking a value.")
     parser.add_argument("--skip-token-pretrain", action="store_true",
                          help="Skip Phase-1 token-branch pretraining entirely -- "
                               "token_enc/token_dec start from the same random init as "
@@ -439,12 +461,13 @@ if __name__ == "__main__":
                               "DualAutoencoder's other implementation (GraphSAGE, "
                               "nn.BatchNorm1d internally) -- never itself compared "
                               "against transconv before this flag existed.")
-    parser.add_argument("--temperature", type=float, default=0.07,
+    parser.add_argument("--temperature", type=float, default=0.05,
                          help="Contrastive loss softmax temperature (see local_infonce) "
                               "-- lower is a sharper/more confident distribution, higher "
-                              "is softer (default: 0.07, inherited from CLIP/SimCLR and "
-                              "unchanged in every run to date, never independently "
-                              "ablated before this flag existed).")
+                              "is softer (default: 0.05, adopted after a fixed-value sweep "
+                              "over {0.03, 0.05, 0.07, 0.2} on the 3-slide probe beat the "
+                              "CLIP/SimCLR-inherited 0.07 on every held-out slide; see "
+                              "ablation_studies_summary.txt).")
     parser.add_argument("--gene-panel", default=None,
                          help="Bare name (no path, no .json) of an external, predesigned "
                               "gene panel under data/combined/01_preprocessing/gene_panels/ "
@@ -463,6 +486,7 @@ if __name__ == "__main__":
         gene_dropout_p=args.gene_dropout_p,
         local_neighbor_radius=args.local_neighbor_radius,
         local_anchor_sim_threshold=args.local_anchor_sim_threshold,
+        local_anchor_sim_source=args.local_anchor_sim_source,
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
         weight_reconstruction=not args.no_weight_reconstruction,

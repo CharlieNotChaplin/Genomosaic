@@ -57,7 +57,8 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
-           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True):
+           skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
+           weight_decay=0.0, temperature=0.05, gene_panel=None, gene_selection="svg"):
     """
     Ablation-relevant knobs mirror run_loso.py's own -- see that file's run_it
     docstring. Defaults here exactly reproduce the previously-hardcoded values.
@@ -79,7 +80,9 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         proj_dim=32,
         encoder="transconv",
 
-        gene_selection="svg",
+        gene_selection=gene_selection,  # ignored entirely if gene_panel is set below
+        gene_panel_path=None,   # resolved from `gene_panel` just below, once basedir
+                                 # is known -- None (default): use gene_selection above.
 
         # graph / batching -- bin-specific: regular 8um lattice, not Delaunay
         n_neighs=8,                    # full Moore/queen neighborhood of a square grid
@@ -90,7 +93,11 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
                                 # against actual throughput/GPU memory for bins separately
 
         # loss
-        temperature=0.07,
+        # 0.05 default -- see run_loso.py's own CONFIG comment / ablation_studies_
+        # summary.txt's "CONTRASTIVE TEMPERATURE SWEEP" section (nuclei-only sweep,
+        # never independently re-tested for bins -- carried over on the same
+        # assumption-transfer basis as other nuclei-validated defaults here).
+        temperature=temperature,
         neighbor_radius=2912,       # patch-geometry-derived (2x 224px patch diameter),
                                      # not unit-size-derived -- unchanged for bins
         local_neighbor_radius=local_neighbor_radius,  # CARRIED OVER from the cell-level
@@ -109,6 +116,11 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         gene_dropout_p=gene_dropout_p,
 
         skip_token_pretrain=skip_token_pretrain,
+
+        # Phase 3 AdamW weight decay -- see run_loso.py's own CONFIG comment.
+        # 1e-5 (matching Phase 1's own, already-validated value) is the nuclei-
+        # adopted setting; never independently re-tested for bins.
+        weight_decay=weight_decay,
 
         # training (Phase 3)
         n_epochs=100,
@@ -155,6 +167,14 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
     dir_transcriptomics = basedir / "combined/01_preprocessing" / CONFIG["dir_cellseg"] / CONFIG["bin_size"] / "custom_binning"
     dir_output = basedir / "combined" / "03_integration/autoencoders" / CONFIG["bin_size"]
     dir_output.mkdir(parents=True, exist_ok=True)
+
+    # gene_panel is a bare name (e.g. "colon_xenium"), resolved against the fixed
+    # panel directory -- see run_loso.py's own comment for the full rationale.
+    if gene_panel is not None:
+        gene_panel_path = basedir / "combined/01_preprocessing/gene_panels" / f"{gene_panel}.json"
+        if not gene_panel_path.is_file():
+            raise FileNotFoundError(f"No gene panel named {gene_panel!r} at {gene_panel_path}")
+        CONFIG["gene_panel_path"] = gene_panel_path
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -234,7 +254,13 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
     if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
         _tag_parts.append("noweight")
-    if CONFIG["gene_selection"] != "svg":
+    if CONFIG.get("weight_decay", 0.0) > 0.0:
+        _tag_parts.append(f"wd{CONFIG['weight_decay']}")
+    if CONFIG["temperature"] != 0.05:
+        _tag_parts.append(f"temp{CONFIG['temperature']}")
+    if CONFIG.get("gene_panel_path") is not None:
+        _tag_parts.append(f"panel_{CONFIG['gene_panel_path'].stem}")
+    elif CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
         _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
@@ -316,6 +342,22 @@ if __name__ == "__main__":
     parser.add_argument("--skip-token-pretrain", action="store_true")
     parser.add_argument("--freeze-token", action="store_true")
     parser.add_argument("--no-weight-reconstruction", action="store_true")
+    parser.add_argument("--weight-decay", type=float, default=0.0,
+                         help="Phase 3 AdamW weight decay (default: 0.0). 1e-5 is the "
+                              "nuclei-adopted value -- see run_loso.py's own flag.")
+    parser.add_argument("--temperature", type=float, default=0.05,
+                         help="Contrastive loss softmax temperature (default: 0.05, "
+                              "the nuclei-adopted value -- see run_loso.py's own flag "
+                              "and ablation_studies_summary.txt; never independently "
+                              "re-tested for bins).")
+    parser.add_argument("--gene-panel", default=None,
+                         help="Bare name of an external gene panel under "
+                              "data/combined/01_preprocessing/gene_panels/ -- e.g. "
+                              "'colon_xenium'. Overrides --gene-selection entirely. "
+                              "See run_loso.py's own flag.")
+    parser.add_argument("--gene-selection", choices=["svg", "hvg", "intersection"], default="svg",
+                         help="Internal gene selection (default: svg). Ignored entirely "
+                              "if --gene-panel is given.")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -326,4 +368,8 @@ if __name__ == "__main__":
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
         weight_reconstruction=not args.no_weight_reconstruction,
+        weight_decay=args.weight_decay,
+        temperature=args.temperature,
+        gene_panel=args.gene_panel,
+        gene_selection=args.gene_selection,
     )
