@@ -2,6 +2,7 @@
 import anndata as ad
 import gc
 import geopandas as gpd
+import json
 import numpy as np
 import pandas as pd
 import random
@@ -260,7 +261,42 @@ def get_hvg_union_mask(trans_adata, per_sample_key="highly_variable_per_sample")
     return (trans_adata.var["highly_variable_n_samples"] >= 1).values
 
 
-def get_gene_mask(trans_adata, gene_selection="svg"):
+def load_gene_panel(panel_path):
+    """
+    Loads a predesigned external gene panel (e.g. a 10x Xenium panel JSON, see
+    data/combined/01_preprocessing/gene_panels/) and returns the set of gene
+    SYMBOLS it targets (payload.targets[].type.data.name). Only descriptor=="gene"
+    entries are kept -- these panel JSONs also list non-gene probes (Xenium's
+    negative controls, descriptor=="negative_control", carry a probe name but no
+    Ensembl id and can never match anything in var_names).
+    """
+    with open(panel_path) as f:
+        panel = json.load(f)
+    targets = panel["payload"]["targets"]
+    return {t["type"]["data"]["name"] for t in targets if t["type"]["descriptor"] == "gene"}
+
+
+def get_gene_panel_mask(trans_adata, panel_path):
+    """
+    Boolean mask over trans_adata.var_names, True for genes present in BOTH the
+    named external panel and this dataset's own gene expression matrix. Unlike
+    get_svg_union_mask/get_hvg_union_mask (which select a subset of an
+    already-fixed gene universe), an external panel is defined independently of
+    this data and routinely lists genes this dataset never measured or kept
+    (different platform, different QC/filtering) -- the match against var_names
+    can't be assumed total, so this reports the overlap rather than asserting it.
+    """
+    panel_genes = load_gene_panel(panel_path)
+    var_names = pd.Index(trans_adata.var_names)
+    mask = var_names.isin(panel_genes)
+    n_found, n_panel = int(mask.sum()), len(panel_genes)
+    print(f"  gene panel ({Path(panel_path).stem}): {n_found}/{n_panel} panel genes "
+          f"found in this dataset's {len(var_names)} genes "
+          f"({n_panel - n_found} panel genes not present in var_names).")
+    return mask
+
+
+def get_gene_mask(trans_adata, gene_selection="svg", gene_panel_path=None):
     """
     Dispatches to the gene-selection mask named by `gene_selection`:
       "svg": spatially-variable-genes union (default, validated regime) -- genes
@@ -273,7 +309,17 @@ def get_gene_mask(trans_adata, gene_selection="svg"):
         experiment to run via `run_leave_one_slide_out`, not a validated default.
       "intersection": SVG & HVG -- a middle ground, keeping only genes that are
         both spatially patterned and highly variable.
+
+    gene_panel_path: if given, OVERRIDES gene_selection entirely -- loads an
+      external, predesigned gene panel (e.g. a Xenium panel JSON) and selects
+      genes present in both that panel and this dataset's var_names, instead of
+      any internally-derived (svg/hvg/intersection) selection. Internal
+      selection needs nothing beyond `gene_selection`; an external panel needs
+      this path AND is checked against var_names, since (unlike svg/hvg) it
+      isn't guaranteed to be a subset of this dataset's genes to begin with.
     """
+    if gene_panel_path is not None:
+        return get_gene_panel_mask(trans_adata, gene_panel_path)
     if gene_selection == "svg":
         return get_svg_union_mask(trans_adata)
     elif gene_selection == "hvg":
@@ -1869,9 +1915,11 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
     # held-out slide alone would leak its own variability pattern into what "counts"
     # as a selected gene.
     gene_selection = CONFIG.get("gene_selection", "svg")
-    gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection)
+    gene_panel_path = CONFIG.get("gene_panel_path")
+    gene_mask = get_gene_mask(f_trans_train, gene_selection=gene_selection, gene_panel_path=gene_panel_path)
     if verbose:
-        print(f"  gene selection ({gene_selection}): {gene_mask.sum()} genes")
+        label = f"panel:{Path(gene_panel_path).stem}" if gene_panel_path is not None else gene_selection
+        print(f"  gene selection ({label}): {gene_mask.sum()} genes")
 
     if verbose:
         print("  building training-slide pipeline data (hist + token)...")

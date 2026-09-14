@@ -46,7 +46,8 @@ from functions.dual_autoencoder import *
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
            skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
-           weight_decay=0.0, encoder_type="transconv", temperature=0.07):
+           weight_decay=0.0, encoder_type="transconv", temperature=0.07, gene_panel=None,
+           gene_selection="svg"):
     """
     Ablation-relevant knobs are function params (not hardcoded in CONFIG below) so
     __main__'s CLI parsing can override them per sbatch submission without touching
@@ -75,8 +76,13 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         # internally, never itself ablated against transconv) at its own defaults.
         encoder=encoder_type,
 
-        gene_selection="svg",   # "svg" | "hvg" | "intersection" -- spatial patterning,
-                                 # the signal the alignment task needs
+        gene_selection=gene_selection,   # "svg" | "hvg" | "intersection" -- spatial
+                                 # patterning, the signal the alignment task needs.
+                                 # Ignored entirely if gene_panel is set below (an
+                                 # external panel overrides internal selection, see
+                                 # get_gene_mask).
+        gene_panel_path=None,   # resolved from `gene_panel` just below, once basedir
+                                 # is known -- None (default): use gene_selection above.
 
         # graph / batching
         # n_neighs: 6 for the (unused-by-default) KNN fallback; 8 for spatial_graph_grid=True
@@ -211,6 +217,16 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
     dir_output = basedir / "combined" / "03_integration/autoencoders" / CONFIG["bin_size"]
     dir_output.mkdir(parents=True, exist_ok=True)
 
+    # gene_panel is a bare name (e.g. "colon_xenium"), resolved against the fixed
+    # panel directory here rather than accepted as a raw path -- keeps the CLI/sbatch
+    # invocation short and stops a typo'd path from silently landing outside the
+    # repo's own tracked panel set.
+    if gene_panel is not None:
+        gene_panel_path = basedir / "combined/01_preprocessing/gene_panels" / f"{gene_panel}.json"
+        if not gene_panel_path.is_file():
+            raise FileNotFoundError(f"No gene panel named {gene_panel!r} at {gene_panel_path}")
+        CONFIG["gene_panel_path"] = gene_panel_path
+
     # ---- load data (ALL slides -- filtering into train/held-out happens inside ----
     # ---- run_leave_one_slide_out_token itself, not here) -----------------------
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -305,7 +321,9 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"enc_{CONFIG['encoder']}")
     if CONFIG["temperature"] != 0.07:
         _tag_parts.append(f"temp{CONFIG['temperature']}")
-    if CONFIG["gene_selection"] != "svg":
+    if CONFIG.get("gene_panel_path") is not None:
+        _tag_parts.append(f"panel_{CONFIG['gene_panel_path'].stem}")
+    elif CONFIG["gene_selection"] != "svg":
         _tag_parts.append(CONFIG["gene_selection"])
     if EXCLUDE_SLIDES:
         _tag_parts.append("excl_" + "_".join(EXCLUDE_SLIDES))
@@ -427,6 +445,17 @@ if __name__ == "__main__":
                               "is softer (default: 0.07, inherited from CLIP/SimCLR and "
                               "unchanged in every run to date, never independently "
                               "ablated before this flag existed).")
+    parser.add_argument("--gene-panel", default=None,
+                         help="Bare name (no path, no .json) of an external, predesigned "
+                              "gene panel under data/combined/01_preprocessing/gene_panels/ "
+                              "-- e.g. 'colon_xenium'. OVERRIDES --gene-selection entirely: "
+                              "trains on the intersection of this panel's genes and "
+                              "whatever's actually in var_names (reported at runtime), "
+                              "instead of any internally-derived (svg/hvg/intersection) "
+                              "selection (default: none, i.e. use --gene-selection).")
+    parser.add_argument("--gene-selection", choices=["svg", "hvg", "intersection"], default="svg",
+                         help="Internal gene selection (default: svg, the validated "
+                              "regime). Ignored entirely if --gene-panel is given.")
     args = parser.parse_args()
     run_it(
         held_out_slide=args.held_out_slide,
@@ -440,4 +469,6 @@ if __name__ == "__main__":
         weight_decay=args.weight_decay,
         encoder_type=args.encoder,
         temperature=args.temperature,
+        gene_panel=args.gene_panel,
+        gene_selection=args.gene_selection,
     )
