@@ -45,7 +45,7 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
-           local_anchor_sim_source="projected",
+           local_anchor_sim_source="projected", local_positive_mode="exclude",
            skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
            weight_decay=0.0, encoder_type="transconv", temperature=0.05, gene_panel=None,
            gene_selection="svg"):
@@ -126,6 +126,17 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         # feedback loop "projected" is prone to. Only has any effect when
         # local_anchor_sim_threshold is not None.
         local_anchor_sim_source=local_anchor_sim_source,
+
+        # "exclude" (default) reproduces the tested "projected"/"raw" masking
+        # behavior above unchanged -- flagged pairs (neighbor_radius and/or
+        # anchor_sim_threshold) are removed from the negative set. "attract"
+        # instead promotes them to ADDITIONAL positives (multi-positive
+        # InfoNCE / SupCon-style) -- see local_infonce's own docstring for the
+        # mechanism and the tradeoffs vs "exclude". Not yet validated. Applies
+        # to whichever of neighbor_radius/anchor_sim_threshold is actually
+        # active -- with anchor_sim_threshold at its off/None default, this
+        # only affects neighbor_radius (spatial neighbors) by default.
+        local_positive_mode=local_positive_mode,
 
         # Name predates the compute_local_density_weight swap (see functions/
         # dual_autoencoder.py) -- this now gates the per-unit DENSITY weight, not
@@ -321,6 +332,8 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"edrop{CONFIG.get('edge_dropout_p', 0.0)}_gdrop{CONFIG.get('gene_dropout_p', 0.0)}")
     if CONFIG.get("local_neighbor_radius") != 100:
         _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
+    if CONFIG.get("local_positive_mode", "exclude") != "exclude":
+        _tag_parts.append(f"posmode_{CONFIG['local_positive_mode']}")
     if CONFIG.get("local_anchor_sim_threshold") is not None:
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
         if CONFIG.get("local_anchor_sim_source", "projected") != "projected":
@@ -375,8 +388,10 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
     print(f"Held-out-vs-train token leakage: {metrics['combined_token_leakage_mean']:.4f} "
           f"(chance = {metrics['combined_token_leakage_chance']:.4f})")
     print(f"Final-epoch local_frac_masked={metrics['final_local_frac_masked']:.4f} "
+          f"local_frac_extra_positive={metrics['final_local_frac_extra_positive']:.4f} "
           f"contrast_local={metrics['final_contrast_local']:.4f} "
-          f"(frac_masked > 0.5 would indicate collapse)")
+          f"(frac_masked > 0.5 would indicate collapse; frac_extra_positive is only "
+          f"nonzero with --local-positive-mode attract)")
     print(f"\nFull results logged to {log_path}")
     print(f"Cell embeddings (trans/token, train + held-out) saved to "
           f"{checkpoint_dir / f'loso_token_{HELD_OUT_SLIDE}{RUN_TAG}_embeddings.npz'}")
@@ -433,6 +448,18 @@ if __name__ == "__main__":
                               "the same collapse feedback loop -- not yet validated, "
                               "thresholds tuned for 'projected' (0.7/0.9) do NOT carry "
                               "over, see local_infonce's docstring before picking a value.")
+    parser.add_argument("--local-positive-mode", choices=["exclude", "attract"], default="exclude",
+                         help="What to do with pairs flagged by --local-neighbor-radius "
+                              "and/or --local-anchor-sim-threshold (if set). 'exclude' "
+                              "(default) removes them from the negative set -- standard "
+                              "InfoNCE with false negatives masked out, every run to date. "
+                              "'attract' instead promotes them to ADDITIONAL positives "
+                              "(multi-positive InfoNCE / SupCon-style) -- actively pulls "
+                              "them together rather than just declining to push them apart. "
+                              "Not yet validated; see local_infonce's docstring for the "
+                              "mechanism and risks (actively attracting via a flagged pair "
+                              "is a stronger, riskier claim than merely not repelling it, "
+                              "and changes what one-to-one retrieval metrics mean).")
     parser.add_argument("--skip-token-pretrain", action="store_true",
                          help="Skip Phase-1 token-branch pretraining entirely -- "
                               "token_enc/token_dec start from the same random init as "
@@ -487,6 +514,7 @@ if __name__ == "__main__":
         local_neighbor_radius=args.local_neighbor_radius,
         local_anchor_sim_threshold=args.local_anchor_sim_threshold,
         local_anchor_sim_source=args.local_anchor_sim_source,
+        local_positive_mode=args.local_positive_mode,
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
         weight_reconstruction=not args.no_weight_reconstruction,

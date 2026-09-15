@@ -818,7 +818,7 @@ def encode_full_graph_batched(encoder, data, device, num_neighbors=(10, 10), bat
 def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
                    neighbor_radius=None, weight=None, anchor_sim_threshold=None,
                    anchor_sim_source="projected", raw_trans=None, raw_hist=None,
-                   return_stats=False):
+                   positive_mode="exclude", return_stats=False):
     """
     One-to-one InfoNCE between a unit's (cell or bin) transcriptomics and local
     histology projections -- each row is a genuine unit, not a pooled patch (the
@@ -860,14 +860,38 @@ def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
       - `weight`: inverse-frequency weighting per unit. Not passed by
         `train_step`'s own call today (defaults to a plain per-unit mean) --
         left available for a caller that wants it.
+      - `positive_mode`: what to do with pairs flagged by `neighbor_radius`/
+        `anchor_sim_threshold`. "exclude" (default, every run to date):
+        standard InfoNCE with false negatives masked to -inf, removed from
+        the softmax denominator entirely -- the behavior described above.
+        "attract": multi-positive InfoNCE (SupCon-style) instead -- flagged
+        pairs are promoted to ADDITIONAL positives (alongside the true diagonal
+        match) rather than merely excluded, and stay IN the softmax
+        denominator (still valid candidates, just also rewarded when matched).
+        Mechanically stronger and riskier than "exclude": a wrongly-flagged
+        pair now actively corrupts the training signal (pulls a genuinely
+        different pair together) instead of just costing one negative. Not
+        yet validated -- untested combination with anchor_sim_source="raw"
+        vs "projected" carries the same live-projection collapse risk noted
+        above, likely more acutely (actively attracting toward a drifting
+        target is a more direct collapse route than merely not repelling it).
+        Changes what one-to-one retrieval metrics (token_retrieval_accuracy)
+        mean -- a spatial/semantic neighbor becomes a second "correct" answer
+        by design, so held-out exact-cell top-1 may drop even if the
+        underlying representations are more useful; not accounted for in
+        today's eval.
 
-    `return_stats=True` also returns `frac_masked` (fraction of candidate
-    negatives excluded by any mask) -- a collapse early-warning signal, since
-    `anchor_sim_threshold` checks the model's own live projections: if they start
-    collapsing together, more pairs get masked, removing the gradient that would
-    correct it (self-reinforcing). Watch for `frac_masked` climbing toward 1.0
-    early rather than only discovering `contrast_local` stuck at ~0 after a full
-    run.
+    `return_stats=True` also returns `frac_masked` (fraction of off-diagonal
+    candidates excluded from the softmax denominator -- only nonzero in
+    positive_mode="exclude", plus whatever cross-slide exclusion applies in
+    either mode) and `frac_extra_positive` (fraction of off-diagonal
+    candidates treated as additional positives -- only nonzero in
+    positive_mode="attract"). In "exclude" mode, `frac_masked` is a collapse
+    early-warning signal when `anchor_sim_source="projected"`: if the live
+    projections start collapsing together, more pairs get masked, removing
+    the gradient that would correct it (self-reinforcing). Watch for
+    `frac_masked` climbing toward 1.0 early rather than only discovering
+    `contrast_local` stuck at ~0 after a full run.
 
     MULTI-SLIDE NOTE: if a batch mixes slides, pass `slide_ids` -- raw coordinates
     aren't comparable across slides (overlapping ranges can make an unrelated
@@ -878,26 +902,32 @@ def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
     logits = p_trans @ p_hist.T / temperature  # (P, P)
     P = logits.shape[0]
     device = logits.device
+    same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1) if slide_ids is not None else None
 
-    # Hard-exclude cross-slide pairs from the negative set entirely (independent of
-    # neighbor_radius below). With slide-stratified batches (see SlideStratifiedLoader)
+    # Hard-exclude cross-slide pairs from the negative set entirely, in EITHER
+    # positive_mode -- not a "maybe false negative" judgment call like the two
+    # masks below, just a batch-composition fact (independent of neighbor_radius/
+    # anchor_sim_threshold). With slide-stratified batches (see SlideStratifiedLoader)
     # this is normally a no-op, since every batch already shares a slide --
     # it's kept as a defensive backstop so the loss can never exploit slide identity
     # as a shortcut even if batch composition changes elsewhere.
-    if slide_ids is not None:
-        same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
+    if same_slide is not None:
         cross_slide = ~same_slide
         cross_slide.fill_diagonal_(False)  # never mask out the true positive
         logits = logits.masked_fill(cross_slide, float("-inf"))
 
+    # Candidate false negatives -- computed identically regardless of positive_mode,
+    # only what happens to them (excluded below vs. promoted to positives in the
+    # loss) differs.
+    flagged_mask = torch.zeros(P, P, dtype=torch.bool, device=device)
+
     if neighbor_radius is not None:
         dist = torch.cdist(centroids, centroids)
         neighbor_mask = dist < neighbor_radius
-        if slide_ids is not None:
-            same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
+        if same_slide is not None:
             neighbor_mask = neighbor_mask & same_slide
-        neighbor_mask.fill_diagonal_(False)  # never mask out the true positive
-        logits = logits.masked_fill(neighbor_mask, float("-inf"))
+        neighbor_mask.fill_diagonal_(False)  # never flag the true positive
+        flagged_mask = flagged_mask | neighbor_mask
 
     if anchor_sim_threshold is not None:
         if anchor_sim_source == "projected":
@@ -915,25 +945,50 @@ def local_infonce(p_trans, p_hist, centroids, slide_ids=None, temperature=0.07,
             raise ValueError(f"Unsupported anchor_sim_source: {anchor_sim_source!r}. "
                               f"Choose from 'projected', 'raw'.")
         false_neg_mask = (trans_sim > anchor_sim_threshold) | (hist_sim > anchor_sim_threshold)
-        if slide_ids is not None:
-            same_slide = slide_ids.unsqueeze(0) == slide_ids.unsqueeze(1)
+        if same_slide is not None:
             false_neg_mask = false_neg_mask & same_slide
-        false_neg_mask.fill_diagonal_(False)  # never mask out the true positive
-        logits = logits.masked_fill(false_neg_mask, float("-inf"))
+        false_neg_mask.fill_diagonal_(False)  # never flag the true positive
+        flagged_mask = flagged_mask | false_neg_mask
+
+    if positive_mode == "exclude":
+        logits = logits.masked_fill(flagged_mask, float("-inf"))
+    elif positive_mode != "attract":
+        raise ValueError(f"Unsupported positive_mode: {positive_mode!r}. "
+                          f"Choose from 'exclude', 'attract'.")
+    # "attract": flagged_mask deliberately NOT applied to logits here -- flagged
+    # pairs stay in the softmax denominator as valid candidates, and are instead
+    # added to the positive set in the loss below.
 
     if return_stats:
         off_diag = ~torch.eye(P, dtype=torch.bool, device=device)
         frac_masked = (logits[off_diag] == float("-inf")).float().mean().item()
-        stats = {"frac_masked": frac_masked, "n_candidates": P}
+        frac_extra_positive = flagged_mask[off_diag].float().mean().item() if positive_mode == "attract" else 0.0
+        stats = {"frac_masked": frac_masked, "frac_extra_positive": frac_extra_positive, "n_candidates": P}
 
     idx = torch.arange(P, device=device)
 
-    log_prob_t2h = logits - torch.logsumexp(logits, dim=1, keepdim=True)
-    loss_t2h = -log_prob_t2h[idx, idx]
+    if positive_mode == "attract":
+        # Multi-positive InfoNCE (SupCon-style): every flagged pair PLUS the true
+        # diagonal match counts as a positive, averaged inside the log rather than
+        # picking one -- denominator (logsumexp) still runs over all candidates.
+        pos_mask = torch.eye(P, dtype=torch.bool, device=device) | flagged_mask
+        pos_count = pos_mask.sum(dim=1).clamp(min=1)
 
-    logits_h2t = logits.T
-    log_prob_h2t = logits_h2t - torch.logsumexp(logits_h2t, dim=1, keepdim=True)
-    loss_h2t = -log_prob_h2t[idx, idx]
+        log_prob_t2h = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        loss_t2h = -(log_prob_t2h * pos_mask).sum(dim=1) / pos_count
+
+        logits_h2t = logits.T
+        pos_mask_h2t = pos_mask.T  # symmetric by construction (both source masks are symmetric)
+        pos_count_h2t = pos_mask_h2t.sum(dim=1).clamp(min=1)
+        log_prob_h2t = logits_h2t - torch.logsumexp(logits_h2t, dim=1, keepdim=True)
+        loss_h2t = -(log_prob_h2t * pos_mask_h2t).sum(dim=1) / pos_count_h2t
+    else:
+        log_prob_t2h = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+        loss_t2h = -log_prob_t2h[idx, idx]
+
+        logits_h2t = logits.T
+        log_prob_h2t = logits_h2t - torch.logsumexp(logits_h2t, dim=1, keepdim=True)
+        loss_h2t = -log_prob_h2t[idx, idx]
 
     per_unit_loss = 0.5 * (loss_t2h + loss_h2t)
 
@@ -1077,7 +1132,8 @@ def freeze_token_encoder(model, freeze_decoder=True):
 def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_reconstruction=True,
                edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
                token_emb_all=None, cell_meta=None, local_contrast_weight=0.0, freeze_token=False,
-               local_anchor_sim_threshold=None, local_anchor_sim_source="projected"):
+               local_anchor_sim_threshold=None, local_anchor_sim_source="projected",
+               local_positive_mode="exclude"):
     """
     density_weight_all: per-unit inverse-density weight (see
     `compute_local_density_weight`), used by `weight_reconstruction` to weight
@@ -1095,6 +1151,11 @@ def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_r
     docstring). When source=="raw", the clean x[:n_seed]/token_x computed below
     are passed as the fixed comparison vectors -- no extra work needed here,
     they already exist for reconstruction/the token branch.
+
+    local_positive_mode: forwarded to local_infonce -- "exclude" (default)
+    masks flagged (neighbor/semantic) pairs out of the negative set; "attract"
+    promotes them to additional positives instead (multi-positive InfoNCE).
+    See local_infonce's own docstring for the tradeoffs.
 
     edge_dropout_p / gene_dropout_p: denoising-style corruption applied only to
     what trans_enc sees (reconstruction target stays clean). Targets two Slide_ID
@@ -1160,13 +1221,16 @@ def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_r
             anchor_sim_threshold=local_anchor_sim_threshold,
             anchor_sim_source=local_anchor_sim_source,
             raw_trans=x[:n_seed], raw_hist=token_x,
+            positive_mode=local_positive_mode,
             return_stats=True,
         )
         local_frac_masked = local_mask_stats["frac_masked"]
+        local_frac_extra_positive = local_mask_stats["frac_extra_positive"]
     else:
         loss_recon_token = z_cells.new_tensor(0.0)
         loss_contrast_local = z_cells.new_tensor(0.0)
         local_frac_masked = 0.0
+        local_frac_extra_positive = 0.0
 
     loss = loss_recon_trans + loss_recon_token + local_contrast_weight * loss_contrast_local
     loss.backward()
@@ -1178,6 +1242,7 @@ def train_step(model, batch, density_weight_all, opt, temperature=0.07, weight_r
         "recon_token": loss_recon_token.item(),
         "contrast_local": loss_contrast_local.item(),
         "local_frac_masked": local_frac_masked,
+        "local_frac_extra_positive": local_frac_extra_positive,
     }
 
 
@@ -1186,7 +1251,8 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
           weight_decay=0.0, edge_dropout_p=0.0, gene_dropout_p=0.0, device="cuda",
           token_emb_all=None, cell_meta=None, max_local_contrast_weight=0.0,
           local_warmup_epochs=None, freeze_token=False, token_lr_mult=1.0,
-          local_anchor_sim_threshold=None, local_anchor_sim_source="projected"):
+          local_anchor_sim_threshold=None, local_anchor_sim_source="projected",
+          local_positive_mode="exclude"):
     """
     density_weight_all: per-unit inverse-density weight from
       `compute_local_density_weight`, required (not None) when
@@ -1201,6 +1267,10 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
       false-negative protection as `neighbor_radius`, gated on expression
       similarity instead of distance). threshold default None (off); source
       default "projected" (see local_infonce's own docstring for "raw").
+
+    local_positive_mode: forwarded to `local_infonce` -- "exclude" (default,
+      every run to date) or "attract" (multi-positive InfoNCE, see
+      local_infonce's own docstring for the tradeoffs).
 
     max_local_contrast_weight / local_warmup_epochs: ramp schedule for the
       cell<->token contrastive term. local_warmup_epochs defaults to
@@ -1256,8 +1326,9 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
     history = []
     for epoch in range(n_epochs):
         lcw = contrast_weight_schedule(epoch, local_warmup_epochs, max_local_contrast_weight) if use_tokens else 0.0
-        epoch_stats = {"loss": 0.0, "recon_trans": 0.0,
-                        "recon_token": 0.0, "contrast_local": 0.0, "local_frac_masked": 0.0}
+        epoch_stats = {"loss": 0.0, "recon_trans": 0.0, "recon_token": 0.0,
+                        "contrast_local": 0.0, "local_frac_masked": 0.0,
+                        "local_frac_extra_positive": 0.0}
         n_batches = 0
         for batch in loader:
             stats = train_step(model, batch, density_weight_all, opt,
@@ -1269,7 +1340,8 @@ def train(model, loader, density_weight_all, n_epochs=30, lr=1e-3, warmup_epochs
                                 cell_meta=cell_meta if use_tokens else None,
                                 local_contrast_weight=lcw, freeze_token=freeze_token,
                                 local_anchor_sim_threshold=local_anchor_sim_threshold,
-                                local_anchor_sim_source=local_anchor_sim_source)
+                                local_anchor_sim_source=local_anchor_sim_source,
+                                local_positive_mode=local_positive_mode)
             for k in epoch_stats:
                 epoch_stats[k] += stats[k]
             n_batches += 1
@@ -2049,6 +2121,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         freeze_token=freeze_token, token_lr_mult=CONFIG.get("token_lr_mult", 1.0),
         local_anchor_sim_threshold=CONFIG.get("local_anchor_sim_threshold"),
         local_anchor_sim_source=CONFIG.get("local_anchor_sim_source", "projected"),
+        local_positive_mode=CONFIG.get("local_positive_mode", "exclude"),
         edge_dropout_p=CONFIG.get("edge_dropout_p", 0.0),
         gene_dropout_p=CONFIG.get("gene_dropout_p", 0.0),
         weight_decay=CONFIG.get("weight_decay", 0.0),
@@ -2132,6 +2205,7 @@ def run_leave_one_slide_out_token(held_out_slide, f_hist_adata, f_trans_adata, f
         "combined_token_leakage_mean": combined_leak_token["leakage_mean"],
         "combined_token_leakage_chance": combined_leak_token["leakage_chance"],
         "final_local_frac_masked": history[-1]["local_frac_masked"],
+        "final_local_frac_extra_positive": history[-1]["local_frac_extra_positive"],
         "final_contrast_local": history[-1]["contrast_local"],
     }
 
