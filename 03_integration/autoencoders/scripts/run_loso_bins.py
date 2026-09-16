@@ -57,6 +57,7 @@ from functions.dual_autoencoder import *
 
 def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
            local_neighbor_radius=100, local_anchor_sim_threshold=None,
+           local_anchor_sim_source="projected", local_positive_mode="exclude",
            skip_token_pretrain=False, freeze_token=False, weight_reconstruction=True,
            weight_decay=0.0, temperature=0.05, gene_panel=None, gene_selection="svg"):
     """
@@ -105,6 +106,15 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
                                      # see module docstring. Ablatable via CLI.
 
         local_anchor_sim_threshold=local_anchor_sim_threshold,
+        # "raw" not yet tested for bins -- nuclei's own productive threshold range
+        # (0.1-0.3) was calibrated entirely on nuclei's raw SVG-expression/token
+        # feature space; bins' own space may behave differently (different SVG
+        # count, different token aggregation). Probe before trusting a value --
+        # see submit_run_loso_ablation_bins_semantic_probe.sbatch.
+        local_anchor_sim_source=local_anchor_sim_source,
+        # "exclude" (default) vs "attract" (multi-positive InfoNCE) -- see
+        # local_infonce's own docstring. Not yet tested for bins either.
+        local_positive_mode=local_positive_mode,
 
         # Name predates the compute_local_density_weight swap -- gates the per-unit
         # DENSITY weight now, not a patch-frequency one. See run_loso.py's own note.
@@ -250,8 +260,12 @@ def run_it(held_out_slide="CRC_P1", edge_dropout_p=0.0, gene_dropout_p=0.0,
         _tag_parts.append(f"edrop{CONFIG.get('edge_dropout_p', 0.0)}_gdrop{CONFIG.get('gene_dropout_p', 0.0)}")
     if CONFIG.get("local_neighbor_radius") != 100:
         _tag_parts.append(f"localrad{CONFIG.get('local_neighbor_radius')}")
+    if CONFIG.get("local_positive_mode", "exclude") != "exclude":
+        _tag_parts.append(f"posmode_{CONFIG['local_positive_mode']}")
     if CONFIG.get("local_anchor_sim_threshold") is not None:
         _tag_parts.append(f"anchorsim{CONFIG['local_anchor_sim_threshold']}")
+        if CONFIG.get("local_anchor_sim_source", "projected") != "projected":
+            _tag_parts.append(f"simsrc_{CONFIG['local_anchor_sim_source']}")
     if not CONFIG.get("weight_reconstruction_by_patch_freq", True):
         _tag_parts.append("noweight")
     if CONFIG.get("weight_decay", 0.0) > 0.0:
@@ -339,6 +353,13 @@ if __name__ == "__main__":
                               "cell-level value carried over UNCHANGED for bins -- see "
                               "this module's docstring caveat.")
     parser.add_argument("--local-anchor-sim-threshold", type=_float_or_none, default=None)
+    parser.add_argument("--local-anchor-sim-source", choices=["projected", "raw"], default="projected",
+                         help="What --local-anchor-sim-threshold checks similarity on -- "
+                              "see run_loso.py's own flag. Never tested for bins; nuclei's "
+                              "0.1-0.3 productive range is NOT assumed to transfer.")
+    parser.add_argument("--local-positive-mode", choices=["exclude", "attract"], default="exclude",
+                         help="'exclude' (default) or 'attract' (multi-positive InfoNCE) -- "
+                              "see run_loso.py's own flag. Never tested for bins.")
     parser.add_argument("--skip-token-pretrain", action="store_true")
     parser.add_argument("--freeze-token", action="store_true")
     parser.add_argument("--no-weight-reconstruction", action="store_true")
@@ -365,6 +386,8 @@ if __name__ == "__main__":
         gene_dropout_p=args.gene_dropout_p,
         local_neighbor_radius=args.local_neighbor_radius,
         local_anchor_sim_threshold=args.local_anchor_sim_threshold,
+        local_anchor_sim_source=args.local_anchor_sim_source,
+        local_positive_mode=args.local_positive_mode,
         skip_token_pretrain=args.skip_token_pretrain,
         freeze_token=args.freeze_token,
         weight_reconstruction=not args.no_weight_reconstruction,
