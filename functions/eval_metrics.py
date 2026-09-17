@@ -38,7 +38,8 @@ import pandas as pd
 import torch
 from sklearn.metrics import (
     silhouette_score, calinski_harabasz_score, davies_bouldin_score,
-    adjusted_rand_score, f1_score, precision_score, recall_score, accuracy_score,
+    adjusted_rand_score, normalized_mutual_info_score,
+    f1_score, precision_score, recall_score, accuracy_score,
 )
 
 
@@ -96,16 +97,31 @@ def ari_between_labelings(labels_a, labels_b) -> float:
     return float(adjusted_rand_score(a, b))
 
 
-def compare_modalities_ari(cluster_labels: dict, reference_labels) -> pd.DataFrame:
+def nmi_between_labelings(labels_a, labels_b, average_method="arithmetic") -> float:
+    """Thin wrapper around normalized_mutual_info_score, mirroring
+    ari_between_labelings exactly -- ARI and NMI answer a similar question
+    ("do these two partitions agree") via different math (pair-counting vs.
+    information-theoretic), and read differently under unequal cluster-count
+    or unequal cluster-size situations, so it's normal for them to disagree
+    somewhat on the same pair of labelings; that's not a bug in either."""
+    a = _to_numpy(labels_a).astype(str)
+    b = _to_numpy(labels_b).astype(str)
+    return float(normalized_mutual_info_score(a, b, average_method=average_method))
+
+
+def compare_modalities_ari(cluster_labels: dict, reference_labels, include_nmi: bool = False) -> pd.DataFrame:
     """
-    ARI between a reference labeling (e.g. label-transfer predictions, or real
-    ground truth) and EACH of several modality clusterings -- the direct
-    "ARI between label transfer and single modalities plus combined modality"
-    comparison.
+    ARI (and optionally NMI) between a reference labeling (e.g. label-transfer
+    predictions, or real ground truth) and EACH of several modality
+    clusterings -- the direct "ARI between label transfer and single
+    modalities plus combined modality" comparison.
 
     cluster_labels: {name: array-like} -- e.g. {"trans": leiden_trans,
       "hist": leiden_hist, "joint": leiden_joint}.
     reference_labels: array-like to compare each of the above against.
+    include_nmi: also compute nmi_between_labelings per modality (off by
+      default -- ARI alone was this function's original contract; opt in
+      rather than silently changing existing callers' output columns).
 
     Values may be plain arrays/tensors (assumed already row-aligned to
     reference_labels, same order) OR pandas Series -- if BOTH a given entry
@@ -115,8 +131,9 @@ def compare_modalities_ari(cluster_labels: dict, reference_labels) -> pd.DataFra
     common-index pattern new_single_omics.ipynb's own ARI cells already use
     (get_basis/ari_vs_basis).
 
-    Returns a DataFrame indexed by modality name, columns "ari" and "n" (cells
-    actually compared -- relevant whenever index intersection narrows it).
+    Returns a DataFrame indexed by modality name, columns "ari" (+ "nmi" if
+    requested) and "n" (cells actually compared -- relevant whenever index
+    intersection narrows it).
     """
     rows = []
     for name, labels in cluster_labels.items():
@@ -125,7 +142,10 @@ def compare_modalities_ari(cluster_labels: dict, reference_labels) -> pd.DataFra
             a, b = labels.loc[common], reference_labels.loc[common]
         else:
             a, b = labels, reference_labels
-        rows.append({"modality": name, "ari": ari_between_labelings(a, b), "n": len(a)})
+        row = {"modality": name, "ari": ari_between_labelings(a, b), "n": len(a)}
+        if include_nmi:
+            row["nmi"] = nmi_between_labelings(a, b)
+        rows.append(row)
     return pd.DataFrame(rows).set_index("modality")
 
 

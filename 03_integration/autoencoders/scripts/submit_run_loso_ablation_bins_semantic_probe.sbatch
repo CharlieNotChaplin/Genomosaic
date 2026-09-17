@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH -c 20
 #SBATCH --mem=128G
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --array=0-2
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
@@ -29,8 +29,10 @@
 # threshold sweep is needed before this can be added to the final bins run at
 # all, the same way nuclei needed a second, lower-threshold round.
 #
-# --mem/--time match submit_run_loso_final_bins.sbatch (128G/10h, ~453 min
-# mean observed bins fold duration from the original bin-level LOSO run).
+# --mem/--time match submit_run_loso_final_bins.sbatch (128G/24h -- bumped up
+# from an initial 10h once real folds under the current config were observed
+# taking 8-9h, too little margin against a repeat of the time-limit kill
+# already seen on the nuclei low-threshold sweep).
 SLIDES=(CRC_P2 CRC_P4_SMAP Normal_P3)
 HELD_OUT_SLIDE="${SLIDES[$SLURM_ARRAY_TASK_ID]}"
 

@@ -6,7 +6,7 @@
 #SBATCH --gres=gpu:1
 #SBATCH -c 20
 #SBATCH --mem=128G
-#SBATCH --time=10:00:00
+#SBATCH --time=24:00:00
 #SBATCH --array=0-26%3
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
@@ -32,8 +32,13 @@
 # at all. If the probe shows 0.2 is similarly miscalibrated for bins, edit
 # the --local-anchor-sim-threshold value below before submitting this array.
 #
-# --mem/--time unchanged from submit_run_loso_bins_final_array.sbatch (128G/10h,
-# ~453 min mean observed bins fold duration from the original bin-level run).
+# --time=24h (bumped up from an initial 10h): the ~453 min mean fold duration from
+# the original bin-level run was from an OLDER, faster config -- real folds under
+# the current config (LayerNorm everywhere + the new final-config flags) observed
+# running 8-9h, leaving too little margin against a repeat of the time-limit kill
+# already seen on the nuclei low-threshold sweep. 24h leaves real headroom; a job
+# that finishes early frees its allocation immediately regardless of the requested
+# ceiling, so this costs nothing if a fold is actually fast.
 #
 # Intended to run AFTER submit_run_loso_final_nuclei.sbatch fully completes, not
 # concurrently with it -- see submit_all_final_loso.sh, which chains the two via
