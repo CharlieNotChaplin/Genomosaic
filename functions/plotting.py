@@ -317,7 +317,7 @@ def plot_distribution_grid(
     (fig, axes)
     """
     BASE_COLOR = RWTH_BLUE_RAMP[0]     # RWTH blue -- below cutoff (or all bars, if no cutoff)
-    HIGHLIGHT_COLOR = RWTH_ACCENT_COLORS[4]  # orange -- above cutoff (retained)
+    HIGHLIGHT_COLOR = RWTH_BLUE_RAMP[3]  # orange -- above cutoff (retained)
 
     slides = list(values_by_slide.keys())
     n = len(slides)
