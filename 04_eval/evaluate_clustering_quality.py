@@ -116,8 +116,10 @@ def reconstruct_held_out_cells(unit, held_out_slide):
     u = UNITS[unit]
     dir_transcriptomics = BASEDIR / "combined/01_preprocessing" / u["dir_cellseg"] / u["bin_size"] / "custom_binning"
 
-    f_trans_adata = ad.read_h5ad(dir_transcriptomics / "count_area_filtered_adata.h5ad")
-    f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].astype(str) == held_out_slide].copy()
+    # backed="r" + to_memory(): the merged file holds every slide -- only this slide's rows
+    # are materialized into RAM (see evaluate_final_loso.ipynb's reconstruct_held_out_cells).
+    f_trans_adata = ad.read_h5ad(dir_transcriptomics / "count_area_filtered_adata.h5ad", backed="r")
+    f_trans_adata = f_trans_adata[f_trans_adata.obs["Slide_ID"].astype(str) == held_out_slide].to_memory()
     trans_global_id = f_trans_adata.obs["Slide_ID"].astype(str) + "_" + f_trans_adata.obs["id"].astype(str)
     f_trans_adata.obs = f_trans_adata.obs.set_index(trans_global_id)
 
@@ -137,8 +139,8 @@ def reconstruct_held_out_cells(unit, held_out_slide):
 
     if unit == "nuclei":
         dir_histology = BASEDIR / "combined/01_preprocessing/unimodel/metadata"
-        f_hist_adata = sc.read_h5ad(dir_histology / "filtered_WSI_patch_embeddings.h5ad")
-        f_hist_adata = f_hist_adata[f_hist_adata.obs["Slide_ID"] == held_out_slide].copy()
+        f_hist_adata = sc.read_h5ad(dir_histology / "filtered_WSI_patch_embeddings.h5ad", backed="r")
+        f_hist_adata = f_hist_adata[f_hist_adata.obs["Slide_ID"] == held_out_slide].to_memory()
         hist_global_id = f_hist_adata.obs["Slide_ID"].astype(str) + "_" + f_hist_adata.obs["Patch_ID"].astype(str)
         f_hist_adata.obs = f_hist_adata.obs.set_index(hist_global_id)
         keep_mask, _, _ = build_pairing(f_trans_adata, f_hist_adata)
