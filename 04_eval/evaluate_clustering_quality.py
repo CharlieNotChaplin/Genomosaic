@@ -200,9 +200,13 @@ def cluster_embedding(z, resolution=LEIDEN_RESOLUTION, n_neighbors=15, seed=0):
     sc.pp.neighbors/sc.tl.leiden have something to operate on."""
     adata = ad.AnnData(np.asarray(z, dtype=np.float32))
     sc.pp.neighbors(adata, n_neighbors=n_neighbors, use_rep="X", random_state=seed)
-    # flavor="leidenalg" pinned explicitly: scanpy's default is changing to "igraph"
-    # in a future release, which needs the separate python-igraph package.
-    sc.tl.leiden(adata, resolution=resolution, random_state=seed, flavor="leidenalg")
+    # flavor="igraph" -- confirmed python-igraph is installed in this project's own
+    # conda env (both locally and on the cluster). Switched from "leidenalg" after
+    # clustering_quality_62769's own log showed it spending ~25h stuck on a single
+    # ~786k-nuclei slide (CRC_P11mm) alone -- scanpy's own runtime warning that
+    # igraph is "orders of magnitude faster" was not an exaggeration at this scale.
+    # n_iterations=2 per scanpy's migration guidance, for parity with leidenalg.
+    sc.tl.leiden(adata, resolution=resolution, random_state=seed, flavor="igraph", n_iterations=2)
     return adata.obs["leiden"].to_numpy()
 
 
