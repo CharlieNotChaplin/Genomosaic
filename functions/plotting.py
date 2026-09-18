@@ -362,7 +362,7 @@ def plot_distribution_grid(
 
         note_lines = []
         if cutoff is not None:
-            ax.axvline(cutoff, color=HIGHLIGHT_COLOR, linestyle="--", linewidth=1)
+            ax.axvline(cutoff, color="red", linestyle="--", linewidth=1)
             kept_frac = (values > cutoff).mean()
             note_lines.append(f"{kept_frac:.0%} > {cutoff:g}")
         if n_dropped:

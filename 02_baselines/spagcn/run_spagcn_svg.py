@@ -39,6 +39,7 @@ import scanpy as sc
 import scipy.sparse as sp
 import SpaGCN as spg
 import torch
+from sklearn.decomposition import PCA
 
 # SpaGCN (SpaGCN.py, util.py) still uses the old `.A` shorthand for sparse -> dense
 # conversion, which scipy removed in favor of `.toarray()`. Restore it globally
@@ -99,6 +100,90 @@ def _calculate_p_low_mem(adj, l):
 
 spg.util.calculate_p = _calculate_p_low_mem
 spg.calculate_p = _calculate_p_low_mem
+
+
+# Same inefficiency as calculate_p above, one step further down the pipeline:
+# vendored SpaGCN.train's own `adj_exp=np.exp(-1*(adj**2)/(2*(self.l**2)))`
+# builds a second full n x n array via the same chained-expression pattern,
+# on top of the adj matrix already resident. Confirmed directly (2026-09-17,
+# CRC_P3_SMAP, ~350GB matrix, 900G job): after the calculate_p fix above
+# already reduced find_l's own peak to the expected ~1x-per-call, the very
+# next thing to blow the memory budget was this exact line, in a plain
+# MemoryError requesting one more matrix-sized allocation (326GiB) partway
+# through the first n_clusters' resolution search.
+#
+# spg.util.search_res calls clf.train() itself, up to ~10+ times per
+# resolution bisection (a fresh SpaGCN() instance each time) -- patching the
+# class method (rather than a free function, as calculate_p needed) is
+# enough here because util.py does `from .SpaGCN import SpaGCN`, binding the
+# same class object; there's no separate bare-name copy of `train` to miss
+# the way calculate_p's was.
+#
+# adj_exp has to stay resident as self.adj_exp for predict() to use right
+# after, unlike calculate_p's buffer, which is scratch-only -- but every real
+# caller in this pipeline (search_res's internal loop, then run_train)
+# creates one throwaway SpaGCN() instance, calls train() then predict(), then
+# discards it before the next one is created. So handing out a single reused
+# module-level buffer as self.adj_exp is safe: the previous instance's
+# predict() has always already consumed it before the next train() call
+# would overwrite it.
+_train_adj_exp_buf = [None]
+
+
+def _train_low_mem(self, adata, adj,
+                    num_pcs=50,
+                    lr=0.005,
+                    max_epochs=2000,
+                    weight_decay=0,
+                    opt="admin",
+                    init_spa=True,
+                    init="louvain",  # louvain or kmeans
+                    n_neighbors=10,  # for louvain
+                    n_clusters=None,  # for kmeans
+                    res=0.4,  # for louvain
+                    tol=1e-3):
+    self.num_pcs = num_pcs
+    self.res = res
+    self.lr = lr
+    self.max_epochs = max_epochs
+    self.weight_decay = weight_decay
+    self.opt = opt
+    self.init_spa = init_spa
+    self.init = init
+    self.n_neighbors = n_neighbors
+    self.n_clusters = n_clusters
+    self.res = res
+    self.tol = tol
+    assert adata.shape[0] == adj.shape[0] == adj.shape[1]
+    pca = PCA(n_components=self.num_pcs)
+    if sp.issparse(adata.X):
+        pca.fit(adata.X.A)
+        embed = pca.transform(adata.X.A)
+    else:
+        pca.fit(adata.X)
+        embed = pca.transform(adata.X)
+    ###------------------------------------------###
+    if self.l is None:
+        raise ValueError('l should not be set before fitting the model!')
+    buf = _train_adj_exp_buf[0]
+    if buf is None or buf.shape != adj.shape:
+        buf = np.empty(adj.shape, dtype=np.float32)
+        _train_adj_exp_buf[0] = buf
+    np.square(adj, out=buf)
+    buf /= (2 * (self.l ** 2))
+    np.negative(buf, out=buf)
+    np.exp(buf, out=buf)
+    adj_exp = buf
+    # ----------Train model----------
+    self.model = spg.simple_GC_DEC(embed.shape[1], embed.shape[1])
+    self.model.fit(embed, adj_exp, lr=self.lr, max_epochs=self.max_epochs, weight_decay=self.weight_decay,
+                    opt=self.opt, init_spa=self.init_spa, init=self.init, n_neighbors=self.n_neighbors,
+                    n_clusters=self.n_clusters, res=self.res, tol=self.tol)
+    self.embed = embed
+    self.adj_exp = adj_exp
+
+
+spg.SpaGCN.train = _train_low_mem
 
 
 def _calculate_adj_matrix_patched(x, y, x_pixel=None, y_pixel=None, image=None, beta=49, alpha=1, histology=True):
