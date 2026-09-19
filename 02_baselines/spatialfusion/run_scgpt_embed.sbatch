@@ -46,7 +46,10 @@
 #     then move the resulting scGPT_human/ folder here manually on any other
 #     machine (e.g. this cluster) that doesn't already have it.
 
-source /data/wv377102/miniconda3/etc/profile.d/conda.sh
+# conda lives in a different place on each cluster -- use whichever exists
+for c in /beegfs/home/cwolf/miniconda3 /data/wv377102/miniconda3 "$HOME/miniconda3"; do
+    if [ -f "$c/etc/profile.d/conda.sh" ]; then source "$c/etc/profile.d/conda.sh"; break; fi
+done
 conda activate scgpt
 export PYTHONUNBUFFERED=1
 ################################################################

@@ -39,7 +39,10 @@
 # seconds; the Leiden resolution search is the slower part. Expect only
 # cells with BOTH UNI and scGPT embeddings in the output (see the script).
 
-source /data/wv377102/miniconda3/etc/profile.d/conda.sh
+# conda lives in a different place on each cluster -- use whichever exists
+for c in /beegfs/home/cwolf/miniconda3 /data/wv377102/miniconda3 "$HOME/miniconda3"; do
+    if [ -f "$c/etc/profile.d/conda.sh" ]; then source "$c/etc/profile.d/conda.sh"; break; fi
+done
 conda activate spatialfusion
 export PYTHONUNBUFFERED=1
 ################################################################

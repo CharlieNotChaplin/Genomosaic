@@ -47,7 +47,10 @@
 #   (pin numpy<2: TF 2.15 requires it. If pip runs out of RAM unpacking wheels,
 #   set TMPDIR to a disk path -- /tmp can be a RAM-backed tmpfs.)
 
-source /data/wv377102/miniconda3/etc/profile.d/conda.sh
+# conda lives in a different place on each cluster -- use whichever exists
+for c in /beegfs/home/cwolf/miniconda3 /data/wv377102/miniconda3 "$HOME/miniconda3"; do
+    if [ -f "$c/etc/profile.d/conda.sh" ]; then source "$c/etc/profile.d/conda.sh"; break; fi
+done
 conda activate stagate
 export PYTHONUNBUFFERED=1
 export TF_CPP_MIN_LOG_LEVEL=2   # hide TensorFlow's info/warning chatter, keep errors
