@@ -2,11 +2,9 @@
 #SBATCH --job-name=final_loso_7_9
 #SBATCH --output=logs/final_loso_7_9_%j.out
 #SBATCH --error=logs/final_loso_7_9_%j.err
-#SBATCH --partition=gpu_node
-#SBATCH --gres=gpu:1
 #SBATCH -c 16
-#SBATCH --mem=128G
-#SBATCH --time=24:00:00
+#SBATCH --mem=400G
+#SBATCH --time=1-23:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
