@@ -58,8 +58,18 @@ def log_rss(tag):
     # calls specifically (before clf.train() ever runs) -- narrower, direct
     # checkpoints here beat inferring the cause indirectly from which --mem
     # values happened to OOM.
+    #
+    # Also prints CURRENT RSS (from /proc/self/statm, same KB/1e6 convention as
+    # the peak) so the log shows a released buffer actually going back to the
+    # OS -- the peak alone never decreases, so it can't show that.
     gb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1e6
-    print(f"[mem] {tag}: peak RSS so far = {gb:.1f} GB", flush=True)
+    try:
+        with open("/proc/self/statm") as f:
+            cur_gb = int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1024 / 1e6
+        cur = f", current RSS = {cur_gb:.1f} GB"
+    except (OSError, ValueError):
+        cur = ""
+    print(f"[mem] {tag}: peak RSS so far = {gb:.1f} GB{cur}", flush=True)
 
 
 # Same math as the original spg.calculate_p(adj, l), but writing into one
@@ -128,6 +138,23 @@ spg.calculate_p = _calculate_p_low_mem
 # predict() has always already consumed it before the next train() call
 # would overwrite it.
 _train_adj_exp_buf = [None]
+
+
+def release_train_buffer(clf=None):
+    """
+    Drop the reused adj_exp buffer (a full n x n matrix) once nothing needs it.
+    run_train calls this right after clf.predict() and before its spatial
+    refinement step, which builds a SECOND full n x n distance matrix
+    (adj_2d) -- without this, that matrix coexisted with the training
+    buffer, which is where the measured ~4.1-matrix peak came from (adj +
+    find_l's buffer + this buffer + adj_2d). The next find_res/train call
+    simply reallocates it (np.empty is cheap; the exp() fill is a small
+    fraction of one training run).
+    """
+    if clf is not None:
+        clf.adj_exp = None
+    _train_adj_exp_buf[0] = None
+    gc.collect()
 
 
 def _train_low_mem(self, adata, adj,
@@ -471,6 +498,17 @@ def find_l(dir_spagcn_data, adj, p, l_start, l_end, l_tol, l_max_run):
     with open(dir_spagcn_data / "l.txt", "w") as f:
         f.write(str(l))
     print("l =", l, flush=True)
+
+    # calculate_p's scratch buffer is a full n x n matrix (342GB at
+    # CRC_P3_SMAP) and nothing after this point ever calls calculate_p again,
+    # but it lives in a module-level list, so without this it stayed
+    # resident for the entire rest of the run. Measured on the cluster
+    # (sacct MaxRSS, 2026-09-19): that leak made training peak at ~4.1
+    # matrices (P4_SMAP 4.07x, P11mm_2_cut 4.18x) and pushed CRC_P3_SMAP to
+    # 975 of its 990 GiB (3 matrices) before it could finish one pass.
+    _calc_p_buf[0] = None
+    gc.collect()
+    log_rss("find_l: done, calculate_p buffer released")
     return l
 
 
@@ -540,6 +578,8 @@ def run_train(dir_spagcn_data, dir_spagcn_results, n_clusters, seed, svg_genes_o
     clf.train(adata, adj, init_spa=True, init="louvain", res=res, tol=5e-3, lr=0.05, max_epochs=200)
     y_pred, _ = clf.predict()
     adata.obs["pred"] = pd.Categorical(y_pred)
+    release_train_buffer(clf)
+    log_rss("run_train: after predict, training buffer released")
 
     x_array = adata.obs["x_array"].tolist()
     y_array = adata.obs["y_array"].tolist()

@@ -48,8 +48,18 @@ def process_sample(sample, n_clusters_min, n_clusters_max, outputs_dir, args):
     dir_custom_binning = dir_sample / "01_preprocessing" / args.cellseg_dir / args.bin_size / "custom_binning"
     dir_combined_adata = (basedir / "combined" / "01_preprocessing" / args.cellseg_dir / args.bin_size
                            / "custom_binning" / "count_area_filtered_adata.h5ad")
-    dir_spagcn_data = dir_sample / "02_baselines/spagcn/data"
-    dir_spagcn_results = dir_sample / "02_baselines/spagcn/results"
+    # Scratch dirs are keyed by this job's cluster-count range so several jobs
+    # for the SAME sample (e.g. --n-clusters-min 9 --n-clusters-max 9 and
+    # 10 10 submitted side by side) never share files. Without this they
+    # collide: every job writes nuclei_centroids_svg.h5ad (an HDF5 write lock
+    # error if two open it at once) and l.txt (which run_train re-reads from
+    # disk, and which each job truncates on write and unlinks at the end -- so
+    # one job finishing deletes it out from under the others). The final
+    # per-(sample, n_clusters) parquet files in --outputs-dir are already
+    # distinct per count, so those need no change.
+    run_tag = f"_n{n_clusters_min}-{n_clusters_max}"
+    dir_spagcn_data = dir_sample / f"02_baselines/spagcn/data{run_tag}"
+    dir_spagcn_results = dir_sample / f"02_baselines/spagcn/results{run_tag}"
     suffix = "_svggenes" if args.svg_genes_only else ""
 
     print(f"\n{'=' * 70}\nSample: {sample}\n{'=' * 70}", flush=True)
