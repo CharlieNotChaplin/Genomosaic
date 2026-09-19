@@ -93,13 +93,23 @@ def main():
                          help="Also score against '<label-col>_smoothed' (added by "
                               "smooth_label_transfer_reference.py -- run that first). Adds a "
                               "reference_kind column ('raw'/'smoothed').")
-    parser.add_argument("--output", type=Path, default=SPAGCN_OUTPUTS_DIR / "spagcn_clustering_quality.csv")
+    parser.add_argument("--outputs-dir", type=Path, default=SPAGCN_OUTPUTS_DIR,
+                         help="Directory of <sample>_cluster_<k>.parquet files (id/sample/n_clusters/pred[, "
+                              "refined_pred]). Any baseline with that layout works, e.g. "
+                              "02_baselines/stagate/outputs -- the same scoring, so results are comparable.")
+    parser.add_argument("--label-kinds", nargs="+", default=LABEL_KINDS,
+                         help="Label columns to score (STAGATE/SpatialFusion only have 'pred').")
+    parser.add_argument("--output", type=Path, default=None,
+                         help="Default: <outputs-dir>/<baseline>_clustering_quality.csv, baseline = the "
+                              "outputs dir's parent folder name.")
     args = parser.parse_args()
+    if args.output is None:
+        args.output = args.outputs_dir / f"{args.outputs_dir.parent.name}_clustering_quality.csv"
 
     smoothed_col = f"{args.label_col}_smoothed"
     columns_needed = [args.label_col, smoothed_col] if args.smooth_reference else [args.label_col]
 
-    files = sorted(SPAGCN_OUTPUTS_DIR.glob("*_cluster_*.parquet"))
+    files = sorted(args.outputs_dir.glob("*_cluster_*.parquet"))
     if args.samples:
         files = [f for f in files if any(f.name.startswith(f"{s}_cluster_") for s in args.samples)]
     if not files:
@@ -148,7 +158,7 @@ def main():
 
         for reference_kind, ref_col in reference_cols.items():
             reference = lt.assign_nearest_grid_label(coords, grid_ref, label_col=ref_col)
-            for label_kind in LABEL_KINDS:
+            for label_kind in args.label_kinds:
                 labels = spagcn_df[label_kind].to_numpy()
                 rows.append({
                     "sample": sample, "n_clusters": n_clusters, "label_kind": label_kind,

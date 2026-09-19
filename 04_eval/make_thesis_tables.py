@@ -1,0 +1,583 @@
+"""
+Generates the result tables (and a small macro file with the headline numbers) for the thesis'
+evaluation chapter (07_evaluation.tex) from the final-run outputs, so that finishing more runs
+only means re-running this script -- nothing in the chapter has to be edited by hand.
+
+Inputs (all read-only):
+  data/combined/03_integration/autoencoders/{002um,008um}/loso_token_log_*.csv   retrieval, leakage
+  data/combined/03_integration/autoencoders/final_loso_clustering_quality_smoothed.csv
+  data/combined/03_integration/autoencoders/final_loso_disease_signal.csv
+  data/combined/03_integration/autoencoders/final_loso_gene_expression_probe.csv
+  data/combined/03_integration/autoencoders/final_loso_cluster_annotation.csv
+  02_baselines/<baseline>/outputs/<baseline>_clustering_quality.csv              baselines
+
+Outputs, one file per table, in --out-dir (default: the thesis' content/generated/ directory):
+  07_tab_*.tex   \\input-able tables in the thesis' house style (rwthblau rules, striped rows)
+  07_results_macros.tex   \\newcommand{\\Res...} for the numbers quoted in running text
+Coverage is computed, not assumed: every caption states how many of the 9 LOSO folds each
+configuration has, and configurations without any finished folds are printed as "pending".
+
+Adding a baseline: add an entry to BASELINES (name, CSV path). The CSV needs the columns of
+spagcn_clustering_quality.csv: sample, label_kind ("pred" / "refined_pred"), reference_kind,
+ari_vs_label_transfer, nmi_vs_label_transfer; a missing file is rendered as a "pending" row.
+
+Usage (from 04_eval/):
+    python make_thesis_tables.py
+    python make_thesis_tables.py --out-dir /tmp/tables
+"""
+
+import argparse
+import re
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+BASE = REPO_ROOT / "data/combined/03_integration/autoencoders"
+DEFAULT_OUT = Path("/home/charlottewolf/Nextcloud/Arbeit UKA/MA/03_Ausarbeitung/thesis/content/generated")
+
+SLIDES = ["CRC_P1", "CRC_P11mm", "CRC_P11mm_2_cut", "CRC_P2", "CRC_P3_SMAP",
+          "CRC_P4_SMAP", "CRC_P5", "Normal_P3", "Normal_P5"]
+NORMAL_SLIDES = ["Normal_P3", "Normal_P5"]
+NO_REFERENCE = {"CRC_P2"}  # label-transfer reference slide: no independent reference labels to score against
+
+UNIT_DIR = {"nuclei": ("002um", "", "cap300000"), "bins": ("008um", "_bins", "cap610000")}
+VARIANT_TAG = {"svg": "", "colon_xenium_panel": "_panel_colon_xenium",
+               "svg_semantic_excl_raw_0.2": "_anchorsim0.2_simsrc_raw"}
+MAIN_CONFIGS = [("nuclei", "svg"), ("nuclei", "colon_xenium_panel"), ("bins", "svg"), ("bins", "colon_xenium_panel")]
+ARM_CONFIGS = [("nuclei", "svg_semantic_excl_raw_0.2"), ("bins", "svg_semantic_excl_raw_0.2")]
+ALL_CONFIGS = MAIN_CONFIGS + ARM_CONFIGS
+LABEL = {"svg": "SVG", "colon_xenium_panel": "Xenium panel", "svg_semantic_excl_raw_0.2": "SVG + semantic excl."}
+
+BASELINES = {  # name -> outputs CSV; STAGATE / SpatialFusion appear as "pending" until their CSV exists
+    "SpaGCN": REPO_ROOT / "02_baselines/spagcn/outputs/spagcn_clustering_quality.csv",
+    "STAGATE": REPO_ROOT / "02_baselines/stagate/outputs/stagate_clustering_quality.csv",
+    "SpatialFusion": REPO_ROOT / "02_baselines/spatialfusion/outputs/spatialfusion_clustering_quality.csv",
+}
+EMBEDDINGS = ["z_trans", "z_token", "z_joint"]
+EMB_LABEL = {"z_trans": r"$\mathbf{z}^{\mathrm{trans}}$", "z_token": r"$\mathbf{z}^{\mathrm{token}}$",
+             "z_joint": r"$[\mathbf{z}^{\mathrm{trans}};\mathbf{z}^{\mathrm{token}}]$"}
+
+
+# ---- formatting helpers ---------------------------------------------------
+
+def cfg_label(cfg):
+    return f"{cfg[0].capitalize()}, {LABEL[cfg[1]]}"
+
+
+def tex(s):
+    return str(s).replace("_", r"\_").replace("%", r"\%").replace("&", r"\&")
+
+
+def f3(x, digits=3):
+    return "--" if x is None or (isinstance(x, float) and np.isnan(x)) else f"{x:.{digits}f}"
+
+
+def pending():
+    return r"\textcolor{red}{pending}"
+
+
+def head(cells):
+    return " & ".join(rf"\textcolor{{rwthblau100}}{{\textbf{{{c}}}}}" for c in cells) + r" \\"
+
+
+def table(colspec, header_rows, rows, caption_short, caption, label, size=r"\small", resize=False):
+    """rows: list of cell lists; a row may be the string "\\midrule" for a separator."""
+    out = [r"\begin{table}[htbp]", r"    \centering", f"    {size}"]
+    if resize:
+        out.append(r"    \resizebox{\textwidth}{!}{%")
+    out += [rf"    \begin{{tabular}}{{{colspec}}}", r"        \arrayrulecolor{rwthblau100}\toprule"]
+    out += [f"        {h}" for h in header_rows]
+    out.append(r"        \arrayrulecolor{rwthblau100}\midrule")
+    stripe = 0
+    for r in rows:
+        if r == r"\midrule":
+            out.append(r"        \arrayrulecolor{rwthblau100}\midrule")
+            stripe = 0
+            continue
+        prefix = r"\rowcolor{rwthblau10} " if stripe % 2 else ""
+        out.append(f"        {prefix}" + " & ".join(r) + r" \\")
+        stripe += 1
+    out.append(r"        \arrayrulecolor{rwthblau100}\bottomrule")
+    out.append(r"    \end{tabular}" + ("}" if resize else ""))
+    out += [rf"    \caption[{caption_short}]", rf"            {{{caption}}}", rf"    \label{{{label}}}", r"\end{table}"]
+    return "\n".join(out) + "\n"
+
+
+def write(out_dir, name, content):
+    (out_dir / name).write_text(content)
+    print(f"  wrote {name}")
+
+
+MACROS = {}
+
+
+def macro(name, value):
+    MACROS[name] = value
+
+
+def bold_best(vals, higher=True, digits=3):
+    """Format floats and bold the best one(s); None/NaN -> '--'."""
+    ok = [x for x in vals if x is not None and not (isinstance(x, float) and np.isnan(x))]
+    best = (max(ok) if higher else min(ok)) if ok else None
+    return ["--" if x is None or (isinstance(x, float) and np.isnan(x))
+            else (r"\textbf{" + f"{x:.{digits}f}" + "}" if x == best else f"{x:.{digits}f}") for x in vals]
+
+
+# ---- data loading -----------------------------------------------------------
+
+def run_tag(unit, variant):
+    _, prefix, cap = UNIT_DIR[unit]
+    anchor = VARIANT_TAG[variant] if variant == "svg_semantic_excl_raw_0.2" else ""
+    panel = VARIANT_TAG[variant] if variant == "colon_xenium_panel" else ""
+    return f"{prefix}_edrop0.1_gdrop0.1{anchor}_wd1e-05{panel}_{cap}_oversample_normal"
+
+
+def load_retrieval():
+    rows = []
+    for unit, variant in ALL_CONFIGS:
+        for slide in SLIDES:
+            p = BASE / UNIT_DIR[unit][0] / f"loso_token_log_{slide}{run_tag(unit, variant)}.csv"
+            if not p.exists():
+                continue
+            d = pd.read_csv(p).iloc[-1]
+            rows.append(dict(unit=unit, variant=variant, slide=slide,
+                             held_cluster=d["held_out_cell_cluster_top1_retrieval"],
+                             held_top1=d["held_out_cell_top1_retrieval"],
+                             train_cluster=d["train_cell_cluster_top1_retrieval"],
+                             leakage=d["combined_token_leakage_mean"], leak_chance=d["combined_token_leakage_chance"],
+                             frac_masked=d["final_local_frac_masked"]))
+    return pd.DataFrame(rows)
+
+
+def cover(df, cfg, col="slide"):
+    unit, variant = cfg
+    return df[(df.unit == unit) & (df.variant == variant)][col].nunique() if len(df) else 0
+
+
+def coverage_note(dfs):
+    """'Nuclei/SVG 9/9, Bins/SVG 2/9, ...' -- appended to captions so they never go stale."""
+    parts = []
+    for cfg in ALL_CONFIGS:
+        n = cover(dfs, cfg)
+        parts.append(f"{cfg_label(cfg)} {n}/{len(SLIDES)}")
+    return "Finished folds: " + "; ".join(parts) + "."
+
+
+# ---- tables -------------------------------------------------------------------
+
+def tab_retrieval(ret, out):
+    hdr = [head(["Held-out slide"] + [cfg_label(c) for c in MAIN_CONFIGS])]
+    rows = []
+    for s in SLIDES:
+        vals = []
+        for cfg in MAIN_CONFIGS:
+            v = ret[(ret.unit == cfg[0]) & (ret.variant == cfg[1]) & (ret.slide == s)]
+            vals.append(float(v.held_cluster.iloc[0]) if len(v) else None)
+        rows.append([tex(s)] + bold_best(vals))
+    rows.append(r"\midrule")
+    means, n_row = [], ["Folds finished"]
+    for cfg in MAIN_CONFIGS:
+        v = ret[(ret.unit == cfg[0]) & (ret.variant == cfg[1])]
+        means.append(float(v.held_cluster.mean()) if len(v) else None)
+        n_row.append(f"{len(v)}/{len(SLIDES)}")
+    rows += [[r"\textbf{Mean}"] + [m if m != "--" else pending() for m in bold_best(means)], n_row]
+    cap = ("Held-out $\\text{top1}_{\\text{cluster}}$ (cell$\\leftrightarrow$token retrieval on the held-out slide) "
+           "per \\gls{loso} fold for the final configuration; the best value per row is bold. ``--'' marks folds that have not finished; "
+           "the mean is over finished folds only, so means of configurations with different coverage are not "
+           "directly comparable. Values are not comparable across slides, since the number of "
+           "reference clusters differs per slide, and not directly between units, since each unit has its own clustering.")
+    write(out, "07_tab_retrieval_per_slide.tex",
+          table("lrrrr", hdr, rows, "Held-out cluster-level retrieval per LOSO fold.", cap, "tab:07_retrieval_per_slide"))
+
+
+def tab_summary(ret, disease, out):
+    hdr = [head(["Configuration", "Folds", r"Held-out $\text{top1}_{\text{cluster}}$", "Held-out exact top-1",
+                 r"In-sample $\text{top1}_{\text{cluster}}$", "Slide\\_ID leakage"])]
+    stats = {}
+    for cfg in ALL_CONFIGS:
+        v = ret[(ret.unit == cfg[0]) & (ret.variant == cfg[1])]
+        stats[cfg] = None if not len(v) else dict(n=len(v), c=v.held_cluster.mean(), e=v.held_top1.mean(),
+                                                  t=v.train_cluster.mean(), l=v.leakage.mean())
+    have = [c for c in ALL_CONFIGS if stats[c]]
+    fc = dict(zip(have, bold_best([stats[c]["c"] for c in have])))
+    fe = dict(zip(have, bold_best([stats[c]["e"] for c in have], digits=4)))
+    fl = dict(zip(have, bold_best([stats[c]["l"] for c in have], higher=False)))
+    rows = []
+    for cfg in ALL_CONFIGS:
+        st = stats[cfg]
+        if not st:
+            rows.append([cfg_label(cfg), "0", pending(), "", "", ""])
+            continue
+        rows.append([cfg_label(cfg), f"{st['n']}", fc[cfg], fe[cfg], f3(st["t"]), fl[cfg]])
+        key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel",
+                                                          "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+        macro(f"Res{key}ClusterTop", f3(st["c"]))
+        macro(f"Res{key}ExactTop", f3(st["e"], 4))
+        macro(f"Res{key}TrainCluster", f3(st["t"]))
+        macro(f"Res{key}Leak", f3(st["l"]))
+        macro(f"Res{key}Folds", str(st["n"]))
+    chance = ret.leak_chance.dropna().iloc[0] if len(ret) else float("nan")
+    cap = ("Summary of the final \\gls{loso} runs, mean over finished folds; the best value per column is bold (for the retrieval and leakage "
+           "columns; in-sample fit is not a quality measure). $\\text{top1}_{\\text{cluster}}$ is the primary "
+           "retrieval metric; exact top-1 is diagnostic only. Slide\\_ID leakage is the held-out-vs-train "
+           f"linear-probe accuracy on the token embedding (chance $\\approx {chance:.2f}$; lower is better). "
+           "Values are not directly comparable between units, since each has its own clustering. "
+           + coverage_note(ret))
+    write(out, "07_tab_final_summary.tex",
+          table("lrrrrr", hdr, rows, "Summary of the final LOSO runs.", cap, "tab:07_final_summary", size=r"\footnotesize", resize=True))
+
+
+def paired_macros(ret):
+    """SVG vs. Xenium panel on the folds finished for BOTH (means of unequal fold sets aren't comparable)."""
+    for unit, key in [("nuclei", "Nuc"), ("bins", "Bin")]:
+        a = ret[(ret.unit == unit) & (ret.variant == "svg")].set_index("slide")
+        b = ret[(ret.unit == unit) & (ret.variant == "colon_xenium_panel")].set_index("slide")
+        common = a.index.intersection(b.index)
+        if not len(common):
+            continue
+        macro(f"Res{key}PairedN", str(len(common)))
+        macro(f"Res{key}PairedSvg", f3(a.held_cluster[common].mean()))
+        macro(f"Res{key}PairedPanel", f3(b.held_cluster[common].mean()))
+        macro(f"Res{key}PairedSvgWins", str(int((a.held_cluster[common] > b.held_cluster[common]).sum())))
+
+
+def tab_semantic_arm(ret, out):
+    hdr = [head(["Held-out slide", r"Nuclei SVG", r"Nuclei SVG + sem.\ excl.", r"$\Delta$",
+                 "Bins SVG", r"Bins SVG + sem.\ excl.", r"$\Delta$"])]
+    rows = []
+    for s in SLIDES:
+        row = [tex(s)]
+        for unit in ["nuclei", "bins"]:
+            a = ret[(ret.unit == unit) & (ret.variant == "svg") & (ret.slide == s)]
+            b = ret[(ret.unit == unit) & (ret.variant == "svg_semantic_excl_raw_0.2") & (ret.slide == s)]
+            va = a.held_cluster.iloc[0] if len(a) else None
+            vb = b.held_cluster.iloc[0] if len(b) else None
+            row += [f3(va), f3(vb), f"{vb - va:+.3f}" if va is not None and vb is not None else "--"]
+        rows.append(row)
+    rows.append(r"\midrule")
+    mrow = [r"\textbf{Mean (paired folds)}"]
+    for unit in ["nuclei", "bins"]:
+        a = ret[(ret.unit == unit) & (ret.variant == "svg")].set_index("slide").held_cluster
+        b = ret[(ret.unit == unit) & (ret.variant == "svg_semantic_excl_raw_0.2")].set_index("slide").held_cluster
+        common = a.index.intersection(b.index)
+        if len(common):
+            mrow += [f3(a[common].mean()), f3(b[common].mean()), f"{(b[common] - a[common]).mean():+.3f}"]
+            if unit == "nuclei":
+                sub3 = [x for x in ["CRC_P2", "CRC_P4_SMAP", "Normal_P3"] if x in common]
+                macro("ResSemDeltaSubset", f"{(b[sub3] - a[sub3]).mean():+.3f}")
+                macro("ResSemDeltaNuc", f"{(b[common] - a[common]).mean():+.3f}")
+                macro("ResSemPosNuc", str(int(((b[common] - a[common]) > 0).sum())))
+                macro("ResSemNNuc", str(len(common)))
+        else:
+            mrow += [pending(), "", ""]
+    rows.append(mrow)
+    cap = ("Raw-source semantic exclusion (threshold 0.2) versus the plain configuration, held-out "
+           "$\\text{top1}_{\\text{cluster}}$ per fold. The mean is over folds where both runs exist. "
+           + coverage_note(ret))
+    write(out, "07_tab_semantic_arm.tex",
+          table("lrrrrrr", hdr, rows, "Semantic-exclusion comparison arm.", cap, "tab:07_semantic_arm", size=r"\footnotesize", resize=True))
+
+
+def load_quality():
+    d = pd.read_csv(BASE / "final_loso_clustering_quality_smoothed.csv").rename(columns={"held_out_slide": "slide"})
+    # number of Leiden clusters found lives only in the unsmoothed table (same partition as label_kind "raw")
+    n = (pd.read_csv(BASE / "final_loso_clustering_quality.csv").rename(columns={"held_out_slide": "slide"})
+         [["unit", "variant", "slide", "embedding", "n_clusters_found"]].drop_duplicates())
+    return d.merge(n, on=["unit", "variant", "slide", "embedding"], how="left")
+
+
+def agg_slide_mean(d, keys):
+    """Mean over folds of per-fold values (one row per slide+keys already)."""
+    return d.groupby(keys)[["ari_vs_label_transfer", "nmi_vs_label_transfer", "silhouette"]].mean()
+
+
+def tab_clustering(q, out):
+    raw_ref = q[q.reference_kind == "raw"]
+    body = raw_ref[raw_ref.label_kind == "raw"]
+    hdr = [head(["Configuration", "Embedding", "Folds", "Clusters", "\\gls{ari}", "\\gls{nmi}", "Silhouette"])]
+
+    def build(embs):
+        rows = []
+        for cfg in ALL_CONFIGS:
+            first = True
+            for emb in embs:
+                v = body[(body.unit == cfg[0]) & (body.variant == cfg[1]) & (body.embedding == emb)]
+                label = cfg_label(cfg) if first else ""
+                first = False
+                if not len(v):
+                    rows.append([label, EMB_LABEL[emb], "0", pending() if emb == embs[0] else "", "", "", ""])
+                    continue
+                rows.append([label, EMB_LABEL[emb], str(len(v)), f"{v.n_clusters_found.mean():.1f}",
+                             f3(v.ari_vs_label_transfer.mean()), f3(v.nmi_vs_label_transfer.mean()), f3(v.silhouette.mean())])
+            if len(embs) > 1:
+                rows.append(r"\midrule")
+        return rows[:-1] if len(embs) > 1 else rows
+
+    cap = ("Leiden clustering of the held-out embeddings (resolution 0.5) against the bin-level label-transfer "
+           "reference (nearest $8\\,\\mu$m grid cell, raw reference labels, no spatial refinement); mean over folds "
+           "with a reference (\\texttt{CRC\\_P2} is the classifier's own training slide and has none). "
+           "Clusters is the mean number of Leiden clusters found. Silhouette is computed on a 10\\,000-unit subsample.")
+    write(out, "07_tab_clustering_quality_ztrans.tex",
+          table("llrrrrr", hdr, build(["z_trans"]), "Clustering quality of the transcriptomic embedding.",
+                cap + " " + coverage_note(q.assign(slide=q.slide)), "tab:07_clustering_ztrans", size=r"\footnotesize"))
+    write(out, "10_tab_clustering_quality_all_embeddings.tex",
+          table("llrrrrr", hdr, build(EMBEDDINGS), "Clustering quality of all three embeddings.",
+                cap + " " + coverage_note(q), "tab:10_clustering_all", size=r"\footnotesize"))
+    for cfg in ALL_CONFIGS:
+        v = body[(body.unit == cfg[0]) & (body.variant == cfg[1]) & (body.embedding == "z_trans")]
+        if len(v):
+            key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel", "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+            macro(f"Res{key}Ari", f3(v.ari_vs_label_transfer.mean()))
+            macro(f"Res{key}Nmi", f3(v.nmi_vs_label_transfer.mean()))
+            macro(f"Res{key}Sil", f3(v.silhouette.mean()))
+
+
+def tab_smoothing(q, out, ref_kind="raw", name="07_tab_smoothing_effect", label="tab:07_smoothing_effect", embs=("z_trans",)):
+    d = q[(q.reference_kind == ref_kind) & (q.embedding.isin(embs))]
+    modes = ["raw", "hard", "spagcn"]
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Configuration}} & " + " & ".join(
+        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["\\gls{ari}", "\\gls{nmi}", "Silhouette"]) + r" \\",
+           r"\textcolor{rwthblau100}{} & " + " & ".join(
+        rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["none", "maj.", "SpaGCN"] * 3) + r" \\"]
+    rows = []
+    for cfg in ALL_CONFIGS:
+        v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
+        if not len(v):
+            rows.append([cfg_label(cfg), pending()] + [""] * 8)
+            continue
+        row = [cfg_label(cfg)]
+        for metric in ["ari_vs_label_transfer", "nmi_vs_label_transfer", "silhouette"]:
+            for m in modes:
+                row.append(f3(v[v.label_kind == m][metric].mean()))
+        rows.append(row)
+        key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel", "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+        if ref_kind == "raw":
+            for m, mn in zip(modes, ["None", "Hard", "Spagcn"]):
+                macro(f"Res{key}Ari{mn}", f3(v[v.label_kind == m].ari_vs_label_transfer.mean()))
+                macro(f"Res{key}Nmi{mn}", f3(v[v.label_kind == m].nmi_vs_label_transfer.mean()))
+                macro(f"Res{key}Sil{mn}", f3(v[v.label_kind == m].silhouette.mean()))
+    what = "raw" if ref_kind == "raw" else "spatially smoothed (majority vote on the nucleus/bin graph)"
+    cap = (f"Effect of spatial refinement on the Leiden partition of {'the transcriptomic embedding' if len(embs) == 1 else 'the embeddings'} "
+           f"(\\texttt{{refine\\_domains}}: none, majority vote, SpaGCN conditional rule), scored against the {what} "
+           "label-transfer reference. Mean over folds with a reference. " + coverage_note(d.assign(slide=d.slide)))
+    write(out, f"{name}.tex", table("l" + "r" * 9, hdr, rows, "Effect of spatial refinement.", cap, label,
+                                   size=r"\scriptsize", resize=True))
+
+
+def load_baseline(name):
+    p = BASELINES[name]
+    if not p.exists():
+        return None
+    d = pd.read_csv(p).rename(columns={"sample": "slide"})
+    return d[d.reference_kind == "raw"]
+
+
+def tab_baselines(q, out):
+    """Matched-slide comparison: only slides every AVAILABLE baseline has results for (and that have a
+    reference, and are in the LOSO roster), so every row is scored on the same slides."""
+    baselines = {n: load_baseline(n) for n in BASELINES}
+    slide_sets = [set(d.slide.unique()) for d in baselines.values() if d is not None]
+    matched = set(SLIDES) - NO_REFERENCE
+    for s in slide_sets:
+        matched &= s
+    matched = [s for s in SLIDES if s in matched]
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & " + " & ".join(
+        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["\\gls{ari}", "\\gls{nmi}"]) + r" & \textcolor{rwthblau100}{\textbf{Folds}} \\",
+           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["none", "maj.", "refined"] * 2) + r" & \\"]
+    rows = []
+    for name, d in baselines.items():
+        if d is None:
+            rows.append([name, pending()] + [""] * 6)
+            continue
+        d = d[d.slide.isin(matched)]
+        per = d.groupby(["slide", "label_kind"])[["ari_vs_label_transfer", "nmi_vs_label_transfer"]].mean().reset_index()
+        row = [f"{name}"]
+        for metric in ["ari_vs_label_transfer", "nmi_vs_label_transfer"]:
+            row += [f3(per[per.label_kind == "pred"][metric].mean()), "--", f3(per[per.label_kind == "refined_pred"][metric].mean())]
+        row.append(str(per.slide.nunique()))
+        rows.append(row)
+        if name == "STAGATE":
+            macro("ResStagateAriNone", f3(per[per.label_kind == "pred"].ari_vs_label_transfer.mean()))
+            macro("ResStagateNmiNone", f3(per[per.label_kind == "pred"].nmi_vs_label_transfer.mean()))
+            macro("ResStagateFolds", str(per.slide.nunique()))
+        if name == "SpaGCN":
+            for lk, mn in [("pred", "None"), ("refined_pred", "Refined")]:
+                macro(f"ResSpagcnAri{mn}", f3(per[per.label_kind == lk].ari_vs_label_transfer.mean()))
+                macro(f"ResSpagcnNmi{mn}", f3(per[per.label_kind == lk].nmi_vs_label_transfer.mean()))
+            macro("ResSpagcnFolds", str(per.slide.nunique()))
+            macro("ResSpagcnKRange", f"{int(d.n_clusters.min())}--{int(d.n_clusters.max())}")
+    rows.append(r"\midrule")
+    sub = q[(q.reference_kind == "raw") & (q.embedding == "z_trans") & (q.slide.isin(matched))]
+    sp = baselines["SpaGCN"]
+    if sp is not None:  # per-slide: our nuclei/SVG partition vs. SpaGCN (mean over k), same slides
+        sp_s = sp[sp.slide.isin(matched) & (sp.label_kind == "pred")].groupby("slide").ari_vs_label_transfer.mean()
+        ours = sub[(sub.unit == "nuclei") & (sub.variant == "svg") & (sub.label_kind == "raw")].set_index("slide").ari_vs_label_transfer
+        common = sp_s.index.intersection(ours.index)
+        macro("ResOursBeatSpagcnAri", str(int((ours[common] > sp_s[common]).sum())))
+        macro("ResOursVsSpagcnN", str(len(common)))
+    stg = baselines.get("STAGATE")
+    if stg is not None:
+        st_s = stg[stg.slide.isin(matched) & (stg.label_kind == "pred")].groupby("slide").ari_vs_label_transfer.mean()
+        common = st_s.index.intersection(ours.index)
+        macro("ResOursBeatStagateAri", str(int((ours[common] > st_s[common]).sum())))
+        macro("ResOursVsStagateN", str(len(common)))
+    for cfg in ALL_CONFIGS:
+        v = sub[(sub.unit == cfg[0]) & (sub.variant == cfg[1])]
+        if not len(v):
+            rows.append([f"Ours: {cfg_label(cfg)}", pending()] + [""] * 6)
+            continue
+        row = [f"Ours: {cfg_label(cfg)}"]
+        for metric in ["ari_vs_label_transfer", "nmi_vs_label_transfer"]:
+            row += [f3(v[v.label_kind == "raw"][metric].mean()), f3(v[v.label_kind == "hard"][metric].mean()),
+                    f3(v[v.label_kind == "spagcn"][metric].mean())]
+        row.append(str(v.slide.nunique()))
+        rows.append(row)
+        key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel", "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+        for m, mn in [("raw", "None"), ("hard", "Hard"), ("spagcn", "Rule")]:
+            macro(f"ResMatched{key}Ari{mn}", f3(v[v.label_kind == m].ari_vs_label_transfer.mean()))
+            macro(f"ResMatched{key}Nmi{mn}", f3(v[v.label_kind == m].nmi_vs_label_transfer.mean()))
+        macro(f"ResMatched{key}N", str(v.slide.nunique()))
+    matched_txt = ", ".join(tex(s) for s in matched)
+    cap = ("Spatial-domain baselines against our Leiden partition of $\\mathbf{z}^{\\mathrm{trans}}$, all scored against the same "
+           "raw nearest-grid label-transfer reference on the same slides (" + matched_txt + "). "
+           "``none'': raw clustering; ``maj.'': majority-vote refinement (ours only); ``refined'': the method's own SpaGCN-style refinement "
+           "(SpaGCN: \\texttt{spg.refine}; ours: the conditional rule of \\texttt{refine\\_domains}). "
+           "SpaGCN needs the cluster count in advance and was run for $k=7,\\dots,10$; the values are the mean over $k$ "
+           "per slide, then over slides, whereas our Leiden partition chooses its own number of clusters. "
+           "Our default partition (Leiden resolution 0.5) has about 14 clusters, more than the baselines, so this table is not cluster-count matched; "
+           "Table~\\ref{tab:07_baseline_kmatched} is. "
+           "Slides with a missing baseline result are left out for every row.")
+    write(out, "07_tab_baseline_comparison.tex",
+          table("lrrrrrrr", hdr, rows, "Comparison with spatial-domain baselines.", cap, "tab:07_baseline_comparison", size=r"\footnotesize"))
+    macro("ResBaselineMatchedN", str(len(matched)))
+
+
+def tab_expression(out):
+    d = pd.read_csv(BASE / "final_loso_gene_expression_probe.csv")
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Configuration}} & \textcolor{rwthblau100}{\textbf{Folds}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Median Pearson $r$}}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Median $R^2$}}} & "
+           r"\textcolor{rwthblau100}{\textbf{Genes $R^2{>}0$ (MLP)}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{Ridge} & \textcolor{rwthblau100}{MLP} & "
+           r"\textcolor{rwthblau100}{Ridge} & \textcolor{rwthblau100}{MLP} & \textcolor{rwthblau100}{} \\"]
+    rows = []
+    for cfg in ALL_CONFIGS:
+        v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
+        if not len(v):
+            rows.append([cfg_label(cfg), "0", pending(), "", "", "", ""])
+            continue
+        r, m = v[v.probe == "ridge"], v[v.probe == "mlp"]
+        rows.append([cfg_label(cfg), str(r.held_out_slide.nunique()), f3(r.median_pearson_r.mean()), f3(m.median_pearson_r.mean()),
+                     f3(r.median_r2.mean(), 4), f3(m.median_r2.mean(), 4), f3(m.frac_genes_r2_pos.mean())])
+        key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel", "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+        macro(f"Res{key}ProbeRidge", f3(r.median_pearson_r.mean()))
+        macro(f"Res{key}ProbeMlp", f3(m.median_pearson_r.mean()))
+        macro(f"Res{key}ProbeMlpRtwo", f3(m.median_r2.mean(), 4))
+        macro(f"Res{key}ProbeFrac", f3(m.frac_genes_r2_pos.mean()))
+    cov = "; ".join(f"{cfg_label(c)} {d[(d.unit == c[0]) & (d.variant == c[1])].held_out_slide.nunique()}/{len(SLIDES)}" for c in ALL_CONFIGS)
+    cap = ("Gene-expression prediction from the frozen histology-token embedding "
+           "($\\mathbf{z}^{\\mathrm{token}}$), Ridge and MLP probes fit on the training slides and scored on the held-out slide; "
+           "per-fold medians over genes, averaged over folds. The probes use at most 100\\,000 randomly sampled units per slide. "
+           "Expression is standardized with training-slide statistics; $R^2$ near or below 0 means no better than a constant prediction. "
+           "Genes differ between the SVG union and the panel, so rows are not gene-for-gene comparable. Finished folds: " + cov + ".")
+    write(out, "07_tab_expression_probe.tex",
+          table("lrrrrrr", hdr, rows, "Gene-expression prediction from histology.", cap, "tab:07_expression_probe", size=r"\footnotesize"))
+
+
+def tab_disease(out):
+    d = pd.read_csv(BASE / "final_loso_disease_signal.csv")
+    hdr = [head(["Configuration", "Folds", "Train \\gls{loso} acc.", "Train \\gls{loso} F1", "Tumor slides", "Normal\\_P3", "Normal\\_P5"])]
+    rows = []
+    for cfg in ALL_CONFIGS:
+        v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
+        if not len(v):
+            rows.append([cfg_label(cfg), "0", pending(), "", "", "", ""])
+            continue
+        tumor = v[v.held_out_true_label == 1]
+        row = [cfg_label(cfg), str(len(v)), f3(v.train_loso_acc.mean()), f3(v.train_loso_f1.mean()), f3(tumor.held_out_acc.mean())]
+        for s in NORMAL_SLIDES:
+            x = v[v.held_out_slide == s]
+            row.append(f3(x.held_out_acc.iloc[0]) if len(x) else "--")
+        rows.append(row)
+        key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel", "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
+        macro(f"Res{key}DiseaseTumor", f3(tumor.held_out_acc.mean()))
+        macro(f"Res{key}DiseaseTrainLoso", f3(v.train_loso_acc.mean()))
+        for s in NORMAL_SLIDES:
+            x = v[v.held_out_slide == s]
+            if len(x):
+                macro(f"Res{key}Disease{'NormalThree' if s == 'Normal_P3' else 'NormalFive'}", f3(x.held_out_acc.iloc[0]))
+    cap = ("Tumor-versus-normal signal in the frozen $\\mathbf{z}^{\\mathrm{trans}}$ (logistic regression). Train \\gls{loso}: "
+           "leave-one-training-slide-out accuracy and macro F1 (mean over folds). Held-out columns: fraction of the held-out slide's "
+           "units classified as its true class by a classifier fit on the training slides -- mean over the tumor folds, and the "
+           "two normal slides individually (a single slide each, so differences of a few hundredths are within noise). "
+           "Macro F1 is of limited use here: each left-out training slide contains only one class, which caps it near 0.5. "
+           + coverage_note(d.rename(columns={"held_out_slide": "slide"})))
+    write(out, "07_tab_disease_signal.tex",
+          table("lrrrrrr", hdr, rows, "Disease signal in the embeddings.", cap, "tab:07_disease_signal", size=r"\footnotesize", resize=True))
+
+
+def tab_annotation(out):
+    d = pd.read_csv(BASE / "final_loso_cluster_annotation.csv")
+    cfgs = [c for c in ALL_CONFIGS if len(d[(d.unit == c[0]) & (d.variant == c[1])])]
+    types = list(pd.read_csv(BASE / "final_loso_cluster_annotation.csv").assigned_cell_type.unique())
+    shares = {}
+    for cfg in cfgs:
+        v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
+        per_slide = v.groupby(["held_out_slide", "assigned_cell_type"]).n_cells_in_cluster.sum().unstack(fill_value=0)
+        frac = per_slide.div(per_slide.sum(axis=1), axis=0)
+        shares[cfg] = frac.mean(axis=0) * 100
+    order = sorted(types, key=lambda t: -np.mean([shares[c].get(t, 0.0) for c in cfgs]))
+    hdr = [head(["Assigned cell type"] + [cfg_label(c) for c in cfgs])]
+    rows = [[tex(t)] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in order]
+    rows.append(r"\midrule")
+    rows.append(["Folds"] + [str(d[(d.unit == c[0]) & (d.variant == c[1])].held_out_slide.nunique()) for c in cfgs])
+    cap = ("Share (\\%) of units whose Leiden cluster is assigned to each canonical marker-set cell type, first per held-out slide, "
+           "then averaged over slides. The assignment is the arg-max of the mean marker-set score per cluster from a hand-curated "
+           "marker list and is a coarse sanity check, not a validated cell-type call. Configurations without finished annotations are omitted.")
+    write(out, "07_tab_cluster_annotation.tex",
+          table("l" + "r" * len(cfgs), hdr, rows, "Marker-based cluster annotation.", cap, "tab:07_cluster_annotation", size=r"\footnotesize"))
+
+
+def write_macros(out):
+    lines = ["% Generated by 04_eval/make_thesis_tables.py -- do not edit by hand."]
+    for k, v in sorted(MACROS.items()):
+        lines.append(rf"\newcommand{{\{k}}}{{{v}}}")
+    write(out, "07_results_macros.tex", "\n".join(lines) + "\n")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--out-dir", type=Path, default=DEFAULT_OUT)
+    ap.add_argument("--results-dir", type=Path, default=None,
+                    help="where the final_loso_*.csv files are read from (default: data/combined/03_integration/autoencoders)")
+    args = ap.parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    global BASE
+    if args.results_dir is not None:
+        BASE = args.results_dir
+
+    ret = load_retrieval()
+    q = load_quality()
+    disease = pd.read_csv(BASE / "final_loso_disease_signal.csv")
+    paired_macros(ret)
+    tab_retrieval(ret, args.out_dir)
+    tab_summary(ret, disease, args.out_dir)
+    tab_semantic_arm(ret, args.out_dir)
+    tab_clustering(q, args.out_dir)
+    tab_smoothing(q, args.out_dir)
+    tab_smoothing(q, args.out_dir, ref_kind="smoothed", name="10_tab_smoothing_effect_smoothed_reference",
+                  label="tab:10_smoothing_smoothed_ref")
+    tab_baselines(q, args.out_dir)
+    tab_expression(args.out_dir)
+    tab_disease(args.out_dir)
+    tab_annotation(args.out_dir)
+    import sys
+    import make_thesis_tables_extended as ext
+    ext.run(sys.modules[__name__], args.out_dir, BASE)  # tables from submit_evaluate_extended.sbatch's outputs
+    write_macros(args.out_dir)
+
+
+if __name__ == "__main__":
+    main()
