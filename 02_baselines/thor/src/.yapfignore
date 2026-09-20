@@ -1,5 +1,0 @@
-[tool.yapfignore]
-ignore_patterns = [
-  "temp/**/*.py",
-  "old/*.py"
-]

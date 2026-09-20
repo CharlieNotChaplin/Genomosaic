@@ -1,1 +1,0 @@
-from thor.plotting import *
