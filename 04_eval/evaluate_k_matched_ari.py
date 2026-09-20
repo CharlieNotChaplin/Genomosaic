@@ -32,6 +32,9 @@ metrics chaos (mean distance to the nearest unit of the same cluster, lower = mo
 whose label differs from >= 6 of their 10 nearest spatial neighbours, lower = fewer isolated units); both reward
 smoothness, so they favour refined partitions and spatially smooth methods.
 
+Also per row: hom_*/com_*/pur_* -- homogeneity, completeness and purity against each reference (see hom_com_pur), which
+separate "over-split" (low completeness) from "mixed" (low homogeneity) where ARI only gives one number. With --smooth-hops the
+embeddings are additionally averaged over spatial neighbours before clustering (embedding names z_trans_s1, z_joint_s2, ...).
 Outputs (in --output-dir):
   final_loso_kmatched_ari.csv           one row per (unit, variant, slide, embedding, resolution, partition)
   final_loso_partition_agreement.csv    how much the z_trans / z_token / z_joint partitions (k closest to 8) agree with
@@ -59,6 +62,8 @@ import anndata as ad
 import scanpy as sc
 from scipy.spatial import cKDTree
 from sklearn.metrics import homogeneity_completeness_v_measure
+from sklearn.metrics.cluster import contingency_matrix
+import scipy.sparse as sp
 
 warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -68,7 +73,9 @@ from functions import label_transfer as lt
 
 # Leiden resolutions. On these embeddings 7-10 clusters appear at roughly 0.1-0.4 (slide dependent), 0.5 gives ~14 (the
 # default of the earlier analysis) and >= 1 gives dozens -- slow and irrelevant for matching, so the grid stops at 1.0.
-DEFAULT_RESOLUTIONS = [0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 1.0]
+DEFAULT_RESOLUTIONS = [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25, 0.3, 0.35, 0.4, 0.5, 1.0]
+# grid for the spatially smoothed embeddings: smoothing removes variance, so fewer clusters appear at a given resolution
+DEFAULT_SMOOTH_RESOLUTIONS = [0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
 # nuclei per slide (after QC), used only to balance --shard assignments
 SLIDE_SIZE = {"CRC_P11mm": 785828, "CRC_P3_SMAP": 295977, "CRC_P2": 224825, "CRC_P5": 176903, "CRC_P4_SMAP": 151437,
               "Normal_P5": 127584, "CRC_P1": 120451, "CRC_P11mm_2_cut": 89110, "Normal_P3": 57187}
@@ -158,14 +165,26 @@ def chaos_pas(xy, labels):
     return float(d.mean()), float(((labels[nn[:, 1:]] != labels[:, None]).sum(1) >= 6).mean())
 
 
+def hom_com_pur(lab, ref):
+    """Homogeneity (is every cluster inside ONE reference class -- a clean sub-cluster scores high), completeness (is every
+    reference class kept inside ONE cluster -- splitting a class scores low) and purity (share of units in the majority
+    reference class of their cluster; the trivial value is the share of the biggest reference class). ARI mixes all of this:
+    it penalises splitting a class exactly like merging two."""
+    h, c, _ = homogeneity_completeness_v_measure(ref, lab)
+    cm = contingency_matrix(ref, lab, sparse=True)
+    return float(h), float(c), float(cm.max(axis=0).toarray().sum() / len(lab))
+
+
 def ref_scores(lab, refs, srk):
-    """ari_*/nmi_* for every reference; srk (K-matched SpaceRanger k-means) chosen by the number of clusters."""
-    out = {f"{p}_{r}": np.nan for r in REFS for p in ("ari", "nmi")}
+    """ari_/nmi_/hom_/com_/pur_ for every reference; srk (K-matched SpaceRanger k-means) chosen by the number of clusters."""
+    out = {f"{p}_{r}": np.nan for r in REFS for p in ("ari", "nmi", "hom", "com", "pur")}
     for r, v in refs.items():
         out[f"ari_{r}"], out[f"nmi_{r}"] = em.ari_between_labelings(lab, v), em.nmi_between_labelings(lab, v)
+        out[f"hom_{r}"], out[f"com_{r}"], out[f"pur_{r}"] = hom_com_pur(lab, v)
     k = len(np.unique(lab))
     if k in srk:
         out["ari_srk"], out["nmi_srk"] = em.ari_between_labelings(lab, srk[k]), em.nmi_between_labelings(lab, srk[k])
+        out["hom_srk"], out["com_srk"], out["pur_srk"] = hom_com_pur(lab, srk[k])
     return out
 
 
@@ -247,16 +266,31 @@ def main():
     ap.add_argument("--embeddings", nargs="+", choices=ecq.EMBEDDINGS, default=["z_trans", "z_token", "z_joint"])
     ap.add_argument("--pca-baseline", action="store_true", help="also cluster PCA(50) of the 2000 HVGs (no encoder)")
     ap.add_argument("--baselines", action="store_true", help="also re-score SpaGCN/STAGATE/SpatialFusion on our units")
+    ap.add_argument("--baselines-only", action="store_true",
+                    help="ONLY re-score the baselines on our units (implies --baselines): no embeddings are clustered. Use it "
+                         "after adding a baseline's outputs, or when the baseline parquet files were not available in the first run.")
     ap.add_argument("--output-dir", type=Path, default=ecq.BASEDIR / "combined/03_integration/autoencoders")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--resolutions", nargs="+", type=float, default=DEFAULT_RESOLUTIONS,
                     help="Leiden resolutions; keep 0.5 for the default-resolution comparison. Runs whose raw partition has "
                          "7-10 clusters are the cluster-count-matched result, so make sure the grid hits that range.")
+    ap.add_argument("--smooth-hops", nargs="*", type=int, default=[1, 2, 3],
+                    help="ALSO cluster spatially smoothed embeddings: each unit's embedding is averaged with its Delaunay/grid "
+                         "neighbours, this many rounds (all listed depths are reported; none is picked with a reference). Rows "
+                         "get embedding names like z_joint_s2. Pass no values to switch it off. 2 hops = the receptive field of the "
+                         "two-layer graph encoder and is the depth to quote as the main one, decided in advance.")
+    ap.add_argument("--smooth-embeddings", nargs="+", choices=ecq.EMBEDDINGS, default=["z_trans", "z_joint"])
+    ap.add_argument("--smooth-variants", nargs="+", choices=list(ecq.VARIANTS), default=["svg"])
+    ap.add_argument("--smooth-resolutions", nargs="+", type=float, default=DEFAULT_SMOOTH_RESOLUTIONS)
+    ap.add_argument("--smooth-only", action="store_true",
+                    help="run ONLY the smoothed-embedding sweeps (writes final_loso_kmatched_ari_smoothed*.csv), e.g. to add "
+                         "them to folds that were already clustered without them")
     ap.add_argument("--shard", default=None, metavar="I/N",
                     help="run only the I-th of N size-balanced groups of slides (0-based) and write shard-suffixed CSVs, so "
                          "N processes/array tasks can run in parallel without touching the same file; make_thesis_tables.py "
                          "reads all shards")
     args = ap.parse_args()
+    args.baselines = args.baselines or args.baselines_only
     args.output_dir.mkdir(parents=True, exist_ok=True)
     suffix = ""
     if args.shard:
@@ -270,7 +304,8 @@ def main():
         args.slides = [sl for sl in args.slides if assign[sl] == i]
         suffix = f".shard{i}of{n}"
         print(f"shard {i}/{n}: slides {args.slides}", flush=True)
-    out = args.output_dir / OUT_NAME.replace(".csv", f"{suffix}.csv")
+    stem = "final_loso_kmatched_ari" + ("_smoothed" if args.smooth_only else "")
+    out = args.output_dir / f"{stem}{suffix}.csv"
     out_agree = args.output_dir / f"final_loso_partition_agreement{suffix}.csv"
     out_base = args.output_dir / f"final_loso_baselines_ours_units{suffix}.csv"
     if args.overwrite:
@@ -284,7 +319,8 @@ def main():
 
     for unit in args.units:
         for slide in args.slides:
-            todo = [v for v in args.variants if (unit, v, slide) not in done and
+            todo = [v for v in (args.smooth_variants if args.smooth_only else args.variants)
+                    if not args.baselines_only and (unit, v, slide) not in done and
                     (ecq.checkpoint_dir(unit) / f"loso_token_{slide}{ecq.run_tag(unit, v)}_embeddings.npz").exists()]
             need_base = args.baselines and slide not in base_done
             if not todo and not need_base:
@@ -320,7 +356,7 @@ def main():
                     continue
                 embs = {"z_trans": zt, "z_token": zk, "z_joint": np.concatenate([zt, zk], 1)}
                 rows, chosen = [], {}
-                for e in args.embeddings:
+                for e in ([] if args.smooth_only else args.embeddings):
                     kept = {}
                     rows += sweep(embs[e], refs, srk, xy, conn, dict(unit=unit, variant=v, held_out_slide=slide,
                                                                       embedding=e, sr_source=sr_source), kept, args.resolutions)
@@ -330,11 +366,26 @@ def main():
                     if kept:
                         r_best = min(kept, key=lambda r: (abs(len(np.unique(kept[r])) - 8), r))
                         chosen[e] = (r_best, len(np.unique(kept[r_best])), kept[r_best])
+                if args.smooth_hops and v in args.smooth_variants:
+                    A = conn.tocsr() + sp.eye(conn.shape[0])
+                    A = sp.diags(1.0 / np.asarray(A.sum(1)).ravel()) @ A  # mean over the unit itself and its neighbours
+                    for e in args.smooth_embeddings:
+                        X = embs[e]
+                        for hop in range(1, max(args.smooth_hops) + 1):
+                            X = A @ X
+                            if hop not in args.smooth_hops:
+                                continue
+                            kept = {}
+                            rows += sweep(X, refs, srk, xy, conn, dict(unit=unit, variant=v, held_out_slide=slide,
+                                                                        embedding=f"{e}_s{hop}", sr_source=sr_source),
+                                          kept, args.smooth_resolutions)
+                            if len(kept) < 2:
+                                print(f"  WARNING {unit}/{v}/{slide}/{e}_s{hop}: only {len(kept)} Leiden run(s) with 7-10 clusters", flush=True)
                 if pca is not None and v == todo[0]:
                     rows += sweep(pca, refs, srk, xy, conn, dict(unit=unit, variant="pca_baseline", held_out_slide=slide,
                                                                   embedding="pca50_hvg", sr_source=sr_source), {}, args.resolutions)
                 append(rows, out)
-                if len(chosen) >= 2:
+                if len(chosen) >= 2 and not args.smooth_only:
                     append(agreement_rows(chosen, dict(unit=unit, variant=v, held_out_slide=slide)), out_agree)
                 print(f"  {unit}/{v}/{slide}: {len(rows)} rows ({time.time() - t0:.0f}s)", flush=True)
 

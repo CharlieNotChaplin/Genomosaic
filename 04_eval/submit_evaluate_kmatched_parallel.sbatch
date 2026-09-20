@@ -5,7 +5,7 @@
 #SBATCH --array=0-4
 #SBATCH -c 4
 #SBATCH --mem=200G
-#SBATCH --time=1-12:00:00
+#SBATCH --time=2-00:00:00
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
@@ -14,6 +14,18 @@
 # the remaining four. Each shard writes its own *.shardIofN.csv files, so no two tasks touch the same file;
 # make_thesis_tables.py reads all shards. The work is single-threaded Leiden/kNN, so 4 cores per task is plenty;
 # --mem is for the biggest slide (CRC_P11mm) -- the four smaller shards could run with far less (--mem=80G).
+#
+# What one run now contains (see evaluate_k_matched_ari.py's docstring): matched-k ARI/NMI plus homogeneity/completeness/purity against
+# label transfer, SpaceRanger and (CRC_P2) the annotation; cluster partitions of the raw embeddings AND of spatially smoothed embeddings
+# (--smooth-hops 1 2 3 for z_trans and z_joint, SVG variant); SpaGCN/STAGATE/SpatialFusion re-scored on the same nuclei. That is roughly
+# twice the work of the first version: expect ~4 h for the CRC_P11mm task and <= 2 h for the others.
+#
+# BEFORE a full rerun (all of it is read from data/ or 02_baselines/ ON THE CLUSTER):
+#   - data/<slide>/output/binned_outputs/square_008um/{analysis,spatial}/ for CRC_P5, Normal_P3, Normal_P5 (SpaceRanger clusters; without them
+#     those slides get no SpaceRanger columns)
+#   - 02_baselines/{spagcn,stagate,spatialfusion}/outputs/*.parquet (otherwise no baseline is re-scored on our nuclei)
+# To replace the finished results (new columns) use:   sbatch submit_evaluate_kmatched_parallel.sbatch --overwrite
+# Cheaper partial alternatives:   ... --smooth-only   (only the smoothed-embedding sweeps, own files)   or   ... --baselines-only
 #
 # If a task times out or fails, resubmit only it:   sbatch --array=2 submit_evaluate_kmatched_parallel.sbatch
 # (finished folds inside a shard are skipped).

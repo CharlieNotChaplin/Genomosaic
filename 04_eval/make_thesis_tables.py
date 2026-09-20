@@ -540,6 +540,71 @@ def tab_annotation(out):
           table("l" + "r" * len(cfgs), hdr, rows, "Marker-based cluster annotation.", cap, "tab:07_cluster_annotation", size=r"\footnotesize"))
 
 
+def tab_umi_cutoff(out):
+    """UMI-cutoff sensitivity for every slide and unit (umi_cutoff_sensitivity.py)."""
+    path = BASE / "umi_cutoff_sensitivity.csv"
+    if not path.exists():
+        print("  umi_cutoff_sensitivity.csv not found -- UMI table skipped")
+        return
+    d = pd.read_csv(path)
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Unit}} & \textcolor{rwthblau100}{\textbf{Slide}} & \textcolor{rwthblau100}{\textbf{Units}} & "
+           r"\textcolor{rwthblau100}{\textbf{Median}} & \textcolor{rwthblau100}{\textbf{Fixed}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Knee}}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{MAD}}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{$\geq1$ UMI} & \textcolor{rwthblau100}{UMI} & "
+           r"\textcolor{rwthblau100}{kept} & \textcolor{rwthblau100}{cutoff} & \textcolor{rwthblau100}{kept} & "
+           r"\textcolor{rwthblau100}{cutoff} & \textcolor{rwthblau100}{kept} \\"]
+    pct = lambda x: f"{100 * x:.1f}\\%"
+    rows = []
+    for unit in ["nuclei", "bins"]:
+        order = ["CRC_P1", "CRC_P2", "CRC_P3_SMAP", "CRC_P4_SMAP", "CRC_P5", "Normal_P3", "Normal_P5", "CRC_P6_5mm", "CRC_P11mm", "CRC_P11mm_2_cut"]
+        for slide in order:
+            r = d[(d.unit == unit) & (d.slide == slide)]
+            if not len(r):
+                rows.append([unit if slide == order[0] else "", tex(slide), r"\multicolumn{7}{c}{not available$^{\mathrm{a}}$}"])
+                continue
+            r = r.iloc[0]
+            rows.append([unit if slide == order[0] else "", tex(slide), f"{int(r.n_units):,}".replace(",", r"\,"), f"{r.median_umi:.0f}",
+                         pct(r.frac_kept_fixed), f"{r.knee_cutoff:.0f}", pct(r.frac_kept_knee),
+                         f"{r.mad_cutoff:.1f}", pct(r.frac_kept_mad)])
+        sub = d[d.unit == unit]
+        rows.append(["", "Median over slides", "", f"{sub.median_umi.median():.0f}", pct(sub.frac_kept_fixed.median()),
+                     f"{sub.knee_cutoff.median():.0f}", pct(sub.frac_kept_knee.median()), f"{sub.mad_cutoff.median():.1f}", pct(sub.frac_kept_mad.median())])
+        rows.append(r"\midrule")
+    rows = rows[:-1]
+    cap = ("UMI-cutoff sensitivity per slide and unit. Units are the nuclei (resp.\\ $8\\,\\mu$m bins) with at least one \\gls{umi} before any quality filter, "
+           "so the counts differ from the segmentation totals of Table~\\ref{tab:07_trans_preprocessing}. Fixed: the cutoff used throughout "
+           "(total counts $>80$); knee: elbow of the sorted-count curve; MAD: median $-3\\times$MAD of log counts. ``kept'': share of units above the cutoff. "
+           "$^{\\mathrm{a}}$The raw aggregated bin counts of \\texttt{CRC\\_P11mm\\_2\\_cut} are incomplete in the merged file and are omitted.")
+    write(out, "07_tab_umi_cutoff_sensitivity.tex",
+          table("llrrrrrrr", hdr, rows, "UMI-cutoff sensitivity per slide and unit.", cap, "tab:07_umi_cutoff_sensitivity", size=r"\footnotesize", resize=True))
+
+
+def tab_reference_agreement(out):
+    path = BASE / "reference_agreement_sr_vs_lt.csv"
+    if not path.exists():
+        print("  reference_agreement_sr_vs_lt.csv not found -- reference-agreement table skipped")
+        return
+    d = pd.read_csv(path)
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Slide}} & \textcolor{rwthblau100}{\textbf{SR clusters}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{ari}}}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{nmi}}}} & "
+           r"\textcolor{rwthblau100}{\textbf{\gls{ari}, $K{=}8$}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{LT} & \textcolor{rwthblau100}{LTs} & "
+           r"\textcolor{rwthblau100}{LT} & \textcolor{rwthblau100}{LTs} & \textcolor{rwthblau100}{LT} \\"]
+    rows = [[tex(r.slide), str(int(r.k_graph)), f3(r.ari_graph_lt), f3(r.ari_graph_lts), f3(r.nmi_graph_lt), f3(r.nmi_graph_lts), f3(r.ari_km8_lt)]
+            for r in d.itertuples()]
+    rows.append(r"\midrule")
+    rows.append([r"\textbf{Mean}", f"{d.k_graph.mean():.1f}"] + [r"\textbf{" + f3(d[c].mean()) + "}" for c in
+                 ("ari_graph_lt", "ari_graph_lts", "nmi_graph_lt", "nmi_graph_lts", "ari_km8_lt")])
+    macro("ResRefAgreeAriLt", f3(d.ari_graph_lt.mean())); macro("ResRefAgreeNmiLt", f3(d.nmi_graph_lt.mean()))
+    macro("ResRefAgreeAriLts", f3(d.ari_graph_lts.mean())); macro("ResRefAgreeNmiLts", f3(d.nmi_graph_lts.mean()))
+    macro("ResRefAgreeAriMin", f3(d.ari_graph_lt.min())); macro("ResRefAgreeAriMax", f3(d.ari_graph_lt.max()))
+    cap = ("Agreement between the image-based label transfer (LT), its majority-vote-smoothed version (LTs) and SpaceRanger's transcriptomics-only "
+           "clusters (SR), on the native $8\\,\\mu$m bins joined by barcode. SR: graph-based clusters (number per slide given) and, in the last column, "
+           "k-means with $K=8$. \\texttt{CRC\\_P2} (no LT predictions) and the two SMAP slides (no native SpaceRanger output) are absent.")
+    write(out, "07_tab_reference_agreement.tex",
+          table("lrrrrrr", hdr, rows, "Agreement between label transfer and SpaceRanger clusters.", cap, "tab:07_reference_agreement", size=r"\footnotesize"))
+
+
 def write_macros(out):
     lines = ["% Generated by 04_eval/make_thesis_tables.py -- do not edit by hand."]
     for k, v in sorted(MACROS.items()):
@@ -573,6 +638,8 @@ def main():
     tab_expression(args.out_dir)
     tab_disease(args.out_dir)
     tab_annotation(args.out_dir)
+    tab_umi_cutoff(args.out_dir)
+    tab_reference_agreement(args.out_dir)
     import sys
     import make_thesis_tables_extended as ext
     ext.run(sys.modules[__name__], args.out_dir, BASE)  # tables from submit_evaluate_extended.sbatch's outputs

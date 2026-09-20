@@ -41,7 +41,7 @@ def matched_means(km):
     """Mean over the runs with 7 <= k_raw <= 10, per (unit, variant, slide, embedding, partition)."""
     k = km["k_raw"] if "k_raw" in km.columns else km["k"]
     m = km[k.between(7, 10)]
-    num = [c for c in m.columns if c.startswith(("ari_", "nmi_")) or c in ("silhouette", "chaos", "pas")]
+    num = [c for c in m.columns if c.startswith(("ari_", "nmi_", "hom_", "com_", "pur_")) or c in ("silhouette", "chaos", "pas")]
     return m.groupby(["unit", "variant", "held_out_slide", "embedding", "partition"])[num].mean().reset_index()
 
 
@@ -68,6 +68,8 @@ def baseline_per_slide(bo, method, kind, col):
 
 def tab_ari_per_sample(km_m, bo, out, unit="nuclei", variant="svg", appendix=False):
     cfg = (unit, variant)
+    if appendix and not len(ours(km_m, unit, variant, "z_trans", "raw", "ari_lt")) and not len(ours(km_m, unit, variant, "z_trans", "raw", "ari_sr")):
+        return  # no finished folds for this configuration yet -- no empty table
     cols = [("ari_lt", "LT"), ("ari_sr", "SR"), ("ari_gt", "annotation")]
     hdr = [r"\textcolor{rwthblau100}{\textbf{Slide}} & " + " & ".join(
         rf"\multicolumn{{2}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{ARI vs.\ {n}}}}}}}" for _, n in cols) +
@@ -385,6 +387,69 @@ def tab_long_summary(km_m, bo, out):
                                                      "tab:10_long_summary", size=r"\scriptsize", resize=True))
 
 
+def tab_smoothed_embedding(km_m, out, unit="nuclei", variant="svg"):
+    """Clustering the embedding after averaging it over spatial neighbours (0 = no smoothing); all depths reported."""
+    embs = [e for e in ("z_trans", "z_joint") if len(ours(km_m, unit, variant, e, "raw", "ari_lt")) or len(ours(km_m, unit, variant, e, "raw", "ari_gt"))]
+    if not any(len(ours(km_m, unit, variant, f"{e}_s1", "raw", "ari_lt")) or len(ours(km_m, unit, variant, f"{e}_s1", "raw", "ari_gt")) for e in embs):
+        return
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Embedding}} & \textcolor{rwthblau100}{\textbf{Hops}} & \multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{vs.\ LT}}} & "
+           r"\textcolor{rwthblau100}{\textbf{vs.\ SR}} & \textcolor{rwthblau100}{\textbf{vs.\ annotation}} & \textcolor{rwthblau100}{\textbf{PAS}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{\gls{ari}} & \textcolor{rwthblau100}{Hom.} & \textcolor{rwthblau100}{Compl.} & "
+           r"\textcolor{rwthblau100}{\gls{ari}} & \textcolor{rwthblau100}{\gls{ari}, \texttt{CRC\_P2}} & \\"]
+    rows = []
+    for e in embs:
+        for hop in (0, 1, 2, 3):
+            name = e if hop == 0 else f"{e}_s{hop}"
+            vals = [mean_or_nan(ours(km_m, unit, variant, name, "raw", c)) for c in ("ari_lt", "hom_lt", "com_lt", "ari_sr", "ari_gt", "pas")]
+            if all(np.isnan(v) for v in vals):
+                continue
+            rows.append([mt.EMB_LABEL[e] if hop == 0 else "", str(hop)] + [mt.f3(v) for v in vals])
+            if e == "z_joint" and hop in (0, 2):
+                mt.macro(f"ResSmoothJointHop{['Zero','One','Two'][hop]}AriLt", mt.f3(vals[0]))
+        rows.append(r"\midrule")
+    rows = rows[:-1]
+    cap = ("Clustering the embedding after averaging it over the unit's spatial neighbours (hops = rounds of averaging; 0: no smoothing), "
+           f"{mt.cfg_label((unit, variant))}, mean over Leiden runs with 7--10 clusters and over the slides with the reference. LT: label transfer; "
+           "SR: SpaceRanger clusters; Hom./Compl.: homogeneity and completeness against LT. All depths are shown, none was chosen with a reference; "
+           "2 hops is the receptive field of the two-layer encoder. With more hops the number of clusters falls quickly, so the rows rest on few runs "
+           "(the evaluation script warns when fewer than two runs have 7--10 clusters).")
+    mt.write(out, "07_tab_smoothed_embedding.tex", mt.table("llrrrrrr", hdr, rows, "Clustering after spatial smoothing of the embedding.", cap,
+                                                            "tab:07_smoothed_embedding", size=r"\footnotesize"))
+
+
+def tab_homcomp(km_m, bo, out):
+    """ARI next to homogeneity / completeness / purity: separates over-splitting from mixing of annotation classes."""
+    if bo is None:
+        return
+    slides = matched_slides(bo, km_m)
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{4}{c}{\textcolor{rwthblau100}{\textbf{vs.\ label transfer}}} & "
+           r"\multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{vs.\ annotation (\texttt{CRC\_P2})}}} \\",
+           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["\\gls{ari}", "Hom.", "Compl.", "Purity", "\\gls{ari}", "Hom.", "Compl."]) + r" \\"]
+    rows = []
+    for name in BASELINE_NAMES:
+        if not (bo.method == name).any() or "hom_lt" not in bo.columns:
+            rows.append([name, mt.pending()] + [""] * 6)
+            continue
+        vals = []
+        for col, sl in (("ari_lt", slides), ("hom_lt", slides), ("com_lt", slides), ("pur_lt", slides), ("ari_gt", ["CRC_P2"]), ("hom_gt", ["CRC_P2"]), ("com_gt", ["CRC_P2"])):
+            s_ = baseline_per_slide(bo, name, "pred", col)
+            vals.append(mean_or_nan(s_[s_.index.isin(sl)]))
+        rows.append([name] + [mt.f3(v) for v in vals])
+    rows.append(r"\midrule")
+    for emb in ("z_trans", "z_joint"):
+        vals = []
+        for col, sl in (("ari_lt", slides), ("hom_lt", slides), ("com_lt", slides), ("pur_lt", slides), ("ari_gt", ["CRC_P2"]), ("hom_gt", ["CRC_P2"]), ("com_gt", ["CRC_P2"])):
+            s_ = ours(km_m, "nuclei", "svg", emb, "raw", col)
+            vals.append(mean_or_nan(s_[s_.index.isin(sl)]))
+        rows.append([f"Ours, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals])
+    cap = ("\\gls{ari} together with homogeneity (does a cluster stay inside one reference class; nested sub-clusters score high), completeness (is a reference "
+           "class kept in one cluster; splitting a class scores low) and purity (share of units in the majority reference class of their cluster). "
+           "\\gls{ari} penalises splitting a class like merging two classes; the pair shows which of the two happens. Label-transfer columns: mean over the slides "
+           "shared by all methods (" + ", ".join(mt.tex(s) for s in slides) + "); annotation columns: \\texttt{CRC\\_P2} only, a single slide.")
+    mt.write(out, "07_tab_homogeneity_completeness.tex", mt.table("lrrrrrrr", hdr, rows, "ARI with homogeneity and completeness.", cap,
+                                                                 "tab:07_hom_comp", size=r"\footnotesize"))
+
+
 def run(mt_module, out, base):
     global mt
     mt = mt_module
@@ -405,6 +470,8 @@ def run(mt_module, out, base):
                  lambda: tab_partition_agreement(agree, out),
                  lambda: tab_disease_weighted(dw, out),
                  lambda: tab_celltypist(ct, out),
+                 lambda: tab_smoothed_embedding(km_m, out),
+                 lambda: tab_homcomp(km_m, bo, out),
                  lambda: tab_long_summary(km_m, bo, out)):
         try:
             step()
