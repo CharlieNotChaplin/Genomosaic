@@ -402,6 +402,10 @@ def tab_baselines(q, out):
             macro("ResStagateAriNone", f3(per[per.label_kind == "pred"].ari_vs_label_transfer.mean()))
             macro("ResStagateNmiNone", f3(per[per.label_kind == "pred"].nmi_vs_label_transfer.mean()))
             macro("ResStagateFolds", str(per.slide.nunique()))
+        if name == "SpatialFusion":
+            macro("ResSpatialFusionAriNone", f3(per[per.label_kind == "pred"].ari_vs_label_transfer.mean()))
+            macro("ResSpatialFusionNmiNone", f3(per[per.label_kind == "pred"].nmi_vs_label_transfer.mean()))
+            macro("ResSpatialFusionFolds", str(per.slide.nunique()))
         if name == "SpaGCN":
             for lk, mn in [("pred", "None"), ("refined_pred", "Refined")]:
                 macro(f"ResSpagcnAri{mn}", f3(per[per.label_kind == lk].ari_vs_label_transfer.mean()))
@@ -423,6 +427,12 @@ def tab_baselines(q, out):
         common = st_s.index.intersection(ours.index)
         macro("ResOursBeatStagateAri", str(int((ours[common] > st_s[common]).sum())))
         macro("ResOursVsStagateN", str(len(common)))
+    sf = baselines.get("SpatialFusion")
+    if sf is not None:
+        sf_s = sf[sf.slide.isin(matched) & (sf.label_kind == "pred")].groupby("slide").ari_vs_label_transfer.mean()
+        common = sf_s.index.intersection(ours.index)
+        macro("ResOursBeatSpatialFusionAri", str(int((ours[common] > sf_s[common]).sum())))
+        macro("ResOursVsSpatialFusionN", str(len(common)))
     for cfg in ALL_CONFIGS:
         v = sub[(sub.unit == cfg[0]) & (sub.variant == cfg[1])]
         if not len(v):

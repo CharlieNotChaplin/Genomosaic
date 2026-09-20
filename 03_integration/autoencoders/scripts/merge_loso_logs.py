@@ -1,10 +1,9 @@
 """
 Combines the per-held-out-slide LOSO-token logs (loso_token_log_{slide}.csv, one per
-array task from submit_run_loso_array.sbatch) into a single table for analysis.
+array task of the final LOSO sbatch scripts) into a single table for analysis.
 
-Kept separate from run_loso.py itself: each array task writes only its own file
-(see run_loso.py's docstring for why a shared log would race under concurrent
-writers), so merging is a distinct, run-agnostic step done once after every fold
+Kept separate from run_loso.py itself: each array task writes only its own file, so
+concurrent tasks never write to one shared log, and merging is a distinct, run-agnostic step done once after every fold
 you care about has finished -- rerun it any time as more folds complete, it
 doesn't need all N to be done.
 """

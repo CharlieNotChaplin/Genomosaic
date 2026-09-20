@@ -110,7 +110,7 @@ def reconstruct_held_out_cells(unit, held_out_slide):
     None-safe priority order).
 
     Returns (cell_xy, trans_sub) or None if this slide has no token data for
-    this unit (skipped, matching run_loso.py's/_bins.py's own token-
+    this unit (skipped, matching run_loso.py's token-
     availability restriction).
     """
     u = UNITS[unit]
@@ -146,7 +146,7 @@ def reconstruct_held_out_cells(unit, held_out_slide):
         keep_mask, _, _ = build_pairing(f_trans_adata, f_hist_adata)
     else:
         # bins have no histology-patch pairing step in the bin-level pipeline
-        # (see run_loso_bins.py) -- every bin with token data is kept.
+        # (see run_loso.py --unit bins) -- every bin with token data is kept.
         keep_mask = np.ones(f_trans_adata.n_obs, dtype=bool)
 
     has_token = f_trans_adata.obs_names.isin(f_token_adata.obs_names)

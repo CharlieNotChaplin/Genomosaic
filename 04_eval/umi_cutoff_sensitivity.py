@@ -44,8 +44,11 @@ FILES = {
 FIXED_CUTOFF = 80
 SLIDES = ["CRC_P1", "CRC_P2", "CRC_P3_SMAP", "CRC_P4_SMAP", "CRC_P5", "Normal_P3", "Normal_P5",
           "CRC_P6_5mm", "CRC_P11mm", "CRC_P11mm_2_cut"]
-# raw aggregated bin counts of this slide are incomplete in the merged file (27,705 rows, while its bin table reports 1,290,617)
-INCOMPLETE = {("bins", "CRC_P11mm_2_cut"): "grid_bin nuclei_grouped_UMI_count.h5ad holds only 27,705 rows for this slide"}
+# The 11 mm frame of this slide holds three tissue samples; only the colorectal region is analysed (bin_preprocessing.py keeps
+# 438,578 of the 1,290,617 native 8um bins, 283,676 after the UMI filter). The raw aggregated file was built from the cropped
+# 2um data instead and holds 27,705 grid bins only -- far fewer than the region's bins, so it is not usable here.
+# Fix: re-run 01_preprocessing/transcriptomics/aggregate_grid_bin_UMI_count.py --samples CRC_P11mm_2_cut --force
+INCOMPLETE = {("bins", "CRC_P11mm_2_cut"): "grid_bin nuclei_grouped_UMI_count.h5ad holds only 27,705 rows for this slide (region: 438,578 bins)"}
 DEFAULT_FIG = Path("/home/charlottewolf/Nextcloud/Arbeit UKA/MA/03_Ausarbeitung/thesis/figures/07_umi_cutoff_all_slides.png")
 
 
