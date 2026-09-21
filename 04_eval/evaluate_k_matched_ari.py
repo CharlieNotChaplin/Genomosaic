@@ -36,11 +36,14 @@ Also per row: hom_*/com_*/pur_* -- homogeneity, completeness and purity against 
 separate "over-split" (low completeness) from "mixed" (low homogeneity) where ARI only gives one number. With --smooth-hops the
 embeddings are additionally averaged over spatial neighbours before clustering (embedding names z_trans_s1, z_joint_s2, ...).
 Outputs (in --output-dir):
-  final_loso_kmatched_ari.csv           one row per (unit, variant, slide, embedding, resolution, partition)
+  final_loso_kmatched_ari.csv           one row per (unit, variant, slide, embedding, resolution, partition); runs with
+                                        --units other than nuclei alone add the units to the file names (..._ari_bins.csv),
+                                        so nuclei and bin runs never overwrite each other
   final_loso_partition_agreement.csv    how much the z_trans / z_token / z_joint partitions (k closest to 8) agree with
                                         each other (ARI, NMI, homogeneity, completeness): does the joint embedding find
                                         structure the single modalities do not? Needs >= 2 embeddings.
-  final_loso_baselines_ours_units.csv   (--baselines) SpaGCN / STAGATE / SpatialFusion re-scored on exactly our units
+  final_loso_baselines_ours_units.csv   (--baselines) SpaGCN / STAGATE / SpatialFusion re-scored on exactly our nuclei
+                                        (the baselines have no bin-level output, so this is skipped for bins)
 Folds already in a file are skipped (--overwrite to redo), so a job that hits its time limit can simply be resubmitted.
 
 Usage (from 04_eval/; CPU only. Roughly 1 ms per nucleus per embedding: ~1 min for a 50k slide, ~10-15 min for the
@@ -48,6 +51,7 @@ Usage (from 04_eval/; CPU only. Roughly 1 ms per nucleus per embedding: ~1 min f
     python -u evaluate_k_matched_ari.py --embeddings z_trans z_token z_joint --baselines
     python -u evaluate_k_matched_ari.py --shard 0/5 ...   # ... --shard 4/5: five parallel processes (see submit_evaluate_kmatched_parallel.sbatch)
     python -u evaluate_k_matched_ari.py --slides Normal_P3 --variants svg --embeddings z_trans
+    python -u evaluate_k_matched_ari.py --units bins --shard 0/5 ...   # bin level: about twice the units per slide
 """
 
 import argparse
@@ -75,10 +79,15 @@ from functions import label_transfer as lt
 # default of the earlier analysis) and >= 1 gives dozens -- slow and irrelevant for matching, so the grid stops at 1.0.
 DEFAULT_RESOLUTIONS = [0.05, 0.075, 0.1, 0.125, 0.15, 0.175, 0.2, 0.225, 0.25, 0.3, 0.35, 0.4, 0.5, 1.0]
 # grid for the spatially smoothed embeddings: smoothing removes variance, so fewer clusters appear at a given resolution
-DEFAULT_SMOOTH_RESOLUTIONS = [0.02, 0.03, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.5, 1.0]
+DEFAULT_SMOOTH_RESOLUTIONS = [0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.04, 0.05, 0.06, 0.075, 0.09, 0.1, 0.125, 0.15, 0.175,
+                              0.2, 0.25, 0.3, 0.4, 0.5, 1.0]  # smoothing lowers the cluster count, and more so with more hops
 # nuclei per slide (after QC), used only to balance --shard assignments
-SLIDE_SIZE = {"CRC_P11mm": 785828, "CRC_P3_SMAP": 295977, "CRC_P2": 224825, "CRC_P5": 176903, "CRC_P4_SMAP": 151437,
-              "Normal_P5": 127584, "CRC_P1": 120451, "CRC_P11mm_2_cut": 89110, "Normal_P3": 57187}
+SLIDE_SIZE = {
+    "nuclei": {"CRC_P11mm": 785828, "CRC_P3_SMAP": 295977, "CRC_P2": 224825, "CRC_P5": 176903, "CRC_P4_SMAP": 151437,
+               "Normal_P5": 127584, "CRC_P1": 120451, "CRC_P11mm_2_cut": 89110, "Normal_P3": 57187},
+    "bins": {"CRC_P11mm": 1538238, "CRC_P3_SMAP": 602274, "CRC_P2": 444991, "CRC_P4_SMAP": 440676, "CRC_P5": 412811,
+             "Normal_P5": 285345, "CRC_P11mm_2_cut": 283676, "CRC_P1": 332795, "Normal_P3": 156510},
+}
 K_MIN, K_MAX = 7, 10
 REFS = ["lt", "lts", "sr", "srk", "gt"]
 OUT_NAME = "final_loso_kmatched_ari.csv"
@@ -297,19 +306,21 @@ def main():
         i, n = map(int, args.shard.split("/"))
         load = [0] * n
         assign = {}
-        for sl in sorted(args.slides, key=lambda x: -SLIDE_SIZE.get(x, 0)):  # greedy: biggest slide to least-loaded shard
+        size = {sl: sum(SLIDE_SIZE[u].get(sl, 1) for u in args.units) for sl in args.slides}
+        for sl in sorted(args.slides, key=lambda x: -size[x]):  # greedy: biggest slide to least-loaded shard
             j = load.index(min(load))
             assign[sl] = j
-            load[j] += SLIDE_SIZE.get(sl, 1)
+            load[j] += size[sl]
         args.slides = [sl for sl in args.slides if assign[sl] == i]
         suffix = f".shard{i}of{n}"
         print(f"shard {i}/{n}: slides {args.slides}", flush=True)
     stem = "final_loso_kmatched_ari" + ("_smoothed" if args.smooth_only else "")
-    out = args.output_dir / f"{stem}{suffix}.csv"
-    out_agree = args.output_dir / f"final_loso_partition_agreement{suffix}.csv"
+    unit_tag = "" if args.units == ["nuclei"] else "_" + "_".join(args.units)
+    out = args.output_dir / f"{stem}{unit_tag}{suffix}.csv"
+    out_agree = args.output_dir / f"final_loso_partition_agreement{unit_tag}{suffix}.csv"
     out_base = args.output_dir / f"final_loso_baselines_ours_units{suffix}.csv"
     if args.overwrite:
-        for p in (out, out_agree, out_base):
+        for p in (out, out_agree, *([out_base] if "nuclei" in args.units else [])):
             p.unlink(missing_ok=True)
     done = set()
     if out.exists():
@@ -322,7 +333,7 @@ def main():
             todo = [v for v in (args.smooth_variants if args.smooth_only else args.variants)
                     if not args.baselines_only and (unit, v, slide) not in done and
                     (ecq.checkpoint_dir(unit) / f"loso_token_{slide}{ecq.run_tag(unit, v)}_embeddings.npz").exists()]
-            need_base = args.baselines and slide not in base_done
+            need_base = args.baselines and unit == "nuclei" and slide not in base_done
             if not todo and not need_base:
                 continue
             recon = ecq.reconstruct_held_out_cells(unit, slide)

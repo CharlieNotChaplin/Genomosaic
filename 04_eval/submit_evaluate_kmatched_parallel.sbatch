@@ -32,7 +32,9 @@
 #
 # USAGE (from 04_eval/):
 #   sbatch submit_evaluate_kmatched_parallel.sbatch
-#   sbatch submit_evaluate_kmatched_parallel.sbatch --units nuclei bins --variants svg      # extra args go to the script
+#   sbatch submit_evaluate_kmatched_parallel.sbatch --units bins                            # bin level: own files (..._ari_bins.shard*.csv),
+#                                                                                          # no baselines; ~2x the units, allow ~12 h for CRC_P11mm
+#   Extra arguments go to the script. Submit nuclei and bins as separate jobs; --overwrite only removes the files of the units it runs.
 #   Then run submit_evaluate_extended.sbatch (steps 2-4) separately, or at the same time.
 
 source /beegfs/home/cwolf/miniconda3/etc/profile.d/conda.sh
