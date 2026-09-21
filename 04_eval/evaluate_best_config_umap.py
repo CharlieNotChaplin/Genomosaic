@@ -164,7 +164,7 @@ def plot_slide(rows, config, criterion, slide, args, output_dir):
     fig, axes = plt.subplots(1, 3, figsize=(16, 5))
     n_train = len(train_idx)
     scatter(axes[0], slide_coords[:n_train], slide_names[:n_train], f"{base_name}, slide identity", legend=True)
-    axes[0].scatter(slide_coords[n_train:, 0], slide_coords[n_train:, 1], c="black", s=2, linewidths=0,
+    axes[0].scatter(slide_coords[n_train:, 0], slide_coords[n_train:, 1], c="black", s=0.7, linewidths=0,
                     rasterized=True, label=f"{slide} (held out)")
     handles, names = axes[0].get_legend_handles_labels()
     axes[0].legend(handles, names, fontsize=6, loc="best", frameon=False, markerscale=1.2)

@@ -449,8 +449,14 @@ def run_section_8(args):
 
 # ---- section 9: spatial cluster maps ------------------------------------------
 
+def dot_size(n_units):
+    """Marker area that shrinks with the number of plotted units, so dense slides do not merge into blobs."""
+    return float(np.clip(60_000 / n_units, 0.05, 1.0))
+
+
 def plot_cluster_panel(ax, cell_xy, labels, title):
-    ax.scatter(cell_xy[:, 0], cell_xy[:, 1], c=pd.factorize(labels)[0], cmap="tab20", s=2, rasterized=True)
+    ax.scatter(cell_xy[:, 0], cell_xy[:, 1], c=pd.factorize(labels)[0], cmap="tab20",
+               s=dot_size(len(cell_xy)), linewidths=0, rasterized=True)
     ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.set_xticks([])

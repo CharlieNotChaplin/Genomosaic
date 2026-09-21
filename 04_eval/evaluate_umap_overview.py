@@ -43,7 +43,7 @@ def umap_coords(X, seed=0):
     return umap.UMAP(n_neighbors=15, min_dist=0.3, random_state=seed, low_memory=True).fit_transform(np.asarray(X, dtype=np.float32))
 
 
-def scatter(ax, xy, labels, title, legend=False, s=2):
+def scatter(ax, xy, labels, title, legend=False, s=0.7):
     codes, uniques = pd.factorize(pd.Series(np.asarray(labels).astype(str)))
     cmap = plt.get_cmap("tab20")
     fixed = {"tumor": "#c0392b", "normal": "#2e86c1"}  # high-contrast pair for the tumor/normal panels
