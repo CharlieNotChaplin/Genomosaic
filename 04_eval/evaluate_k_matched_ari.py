@@ -326,7 +326,9 @@ def main():
     if out.exists():
         d = pd.read_csv(out, usecols=["unit", "variant", "held_out_slide"])
         done = set(map(tuple, d.drop_duplicates().to_numpy()))
-    base_done = set(pd.read_csv(out_base, usecols=["held_out_slide"]).held_out_slide) if out_base.exists() else set()
+    base_done = set()
+    if "nuclei" in args.units and out_base.exists():
+        base_done = set(pd.read_csv(out_base, usecols=["held_out_slide"]).held_out_slide)
 
     for unit in args.units:
         for slide in args.slides:

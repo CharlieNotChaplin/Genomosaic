@@ -8,6 +8,11 @@ by ``refine_domains`` (``hard``, ``spagcn``). Each configuration is scored by it
 are compared. The best configuration is chosen once per criterion:
     sr   ARI against the SpaceRanger clusters
     lt   ARI against the label-transfer reference (CRC_P2 has none and is shown with its pathologist annotation)
+    sr_hom, lt_hom   homogeneity instead of ARI (optional, --criteria). ARI punishes a cluster that is split into
+                     two sub-clusters inside one reference class exactly like a merge of two classes; homogeneity only
+                     asks whether every cluster lies inside one reference class. At a fixed number of clusters it cannot
+                     be won by splitting more, so it is the fairer score for a coarse reference.
+The ranking also lists NMI, homogeneity and completeness of every configuration next to the ARI.
 
 Per criterion and slide, ``final_loso_best_<criterion>_umap_<slide>.png`` has three panels:
     1. UMAP of the unsmoothed embedding of a sample of the training slides and the held-out slide, coloured by slide
@@ -50,7 +55,13 @@ import evaluate_k_matched_ari as km
 from evaluate_umap_overview import scatter, umap_coords
 
 K_MIN, K_MAX, K_TARGET = 7, 10, 8
-CRITERIA = {"sr": ("ari_sr", "SpaceRanger clusters"), "lt": ("ari_lt", "label transfer")}
+CRITERIA = {
+    "sr": ("ari_sr", "SpaceRanger clusters"),
+    "lt": ("ari_lt", "label transfer"),
+    "sr_hom": ("hom_sr", "SpaceRanger clusters, homogeneity"),
+    "lt_hom": ("hom_lt", "label transfer, homogeneity"),
+}
+DEFAULT_CRITERIA = ["sr", "lt"]
 CONFIG_COLUMNS = ["unit", "variant", "embedding", "partition"]
 
 
@@ -69,8 +80,11 @@ def rank_configurations(rows, metric, smoothed_only=False):
     Mean of ``metric`` over the matched-k runs per slide, then over slides, for every configuration that has a
     value on all slides that have the reference. Returns a DataFrame sorted by score, best first.
     """
-    per_slide = rows.dropna(subset=[metric]).groupby(CONFIG_COLUMNS + ["slide"])[metric].mean().reset_index()
-    ranking = per_slide.groupby(CONFIG_COLUMNS)[metric].agg(score="mean", n_slides="count").reset_index()
+    reference = metric.split("_")[1]
+    columns = [metric] + [f"{m}_{reference}" for m in ("ari", "nmi", "hom", "com") if f"{m}_{reference}" != metric]
+    per_slide = rows.dropna(subset=[metric]).groupby(CONFIG_COLUMNS + ["slide"])[columns].mean().reset_index()
+    ranking = per_slide.groupby(CONFIG_COLUMNS).agg(
+        score=(metric, "mean"), n_slides=(metric, "count"), **{c: (c, "mean") for c in columns[1:]}).reset_index()
     ranking = ranking[ranking["n_slides"] == ranking["n_slides"].max()]
     if smoothed_only:
         smoothed = ranking["embedding"].str.contains("_s[0-9]$") | (ranking["partition"] != "raw")
@@ -120,7 +134,8 @@ def plot_slide(rows, config, criterion, slide, args, output_dir):
     xy, _ = reconstruction
     conn = ecq.build_slide_graph(unit, xy)
     references, _ = km.build_references(slide, xy, conn)
-    reference_key = "gt" if criterion == "lt" and slide == "CRC_P2" else criterion
+    reference_name = criterion.split("_")[0]
+    reference_key = "gt" if reference_name == "lt" and slide == "CRC_P2" else reference_name
     if reference_key not in references:
         return False
 
@@ -173,7 +188,7 @@ def draw_task(task):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--criteria", nargs="+", choices=list(CRITERIA), default=list(CRITERIA))
+    ap.add_argument("--criteria", nargs="+", choices=list(CRITERIA), default=DEFAULT_CRITERIA)
     ap.add_argument("--slides", nargs="+", choices=ecq.SLIDES, default=ecq.SLIDES)
     ap.add_argument("--units", nargs="+", choices=list(ecq.UNITS), default=list(ecq.UNITS),
                     help="units whose configurations are compared")
@@ -198,7 +213,8 @@ def main():
         top = ranking.head(args.top).assign(criterion=criterion, rank=lambda d: d.index + 1)
         ranked.append(top)
         print(f"\nTop {args.top} by {metric} ({description}), over {int(ranking['n_slides'].max())} slides:")
-        print(top[["rank"] + CONFIG_COLUMNS + ["score"]].to_string(index=False, float_format="%.3f"))
+        extra = [c for c in top.columns if c[:4] in ("ari_", "nmi_", "hom_", "com_")]
+        print(top[["rank"] + CONFIG_COLUMNS + ["score"] + extra].to_string(index=False, float_format="%.3f"))
     pd.concat(ranked).to_csv(args.output_dir / "final_loso_best_configs.csv", index=False)
     if args.rank_only:
         return
@@ -208,7 +224,7 @@ def main():
         criterion = top["criterion"].iloc[0]
         config = top.iloc[0][CONFIG_COLUMNS].to_dict()
         slides_with_reference = set(rows.loc[rows[CRITERIA[criterion][0]].notna(), "slide"])
-        if criterion == "lt":
+        if criterion.startswith("lt"):
             slides_with_reference |= {"CRC_P2"}
         tasks += [(rows, config, criterion, slide, args) for slide in args.slides if slide in slides_with_reference]
     tasks.sort(key=lambda t: -km.SLIDE_SIZE[t[1]["unit"]].get(t[3], 0))

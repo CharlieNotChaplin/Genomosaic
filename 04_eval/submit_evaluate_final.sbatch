@@ -22,4 +22,6 @@ mkdir -p logs
 
 echo "Job started at: $(date)   node: $(hostname)   args: $*"
 python -u run_final_evaluation.py "$@"
-echo "Job finished at: $(date)"
+status=$?
+echo "Job finished at: $(date)   exit status: $status"
+exit $status

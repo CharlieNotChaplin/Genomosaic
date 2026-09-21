@@ -37,6 +37,7 @@ from functions.dual_autoencoder import evaluate_disease_signal
 
 BASE = ecq.BASEDIR / "combined/03_integration/autoencoders"
 STEPS = ["quality", "disease", "weighted", "sections", "umap"]
+FAILED = []
 DISEASE_FILE = BASE / "final_loso_disease_signal.csv"
 DISEASE_KEY = ["unit", "variant", "held_out_slide"]
 
@@ -48,6 +49,7 @@ def run(script, *arguments):
     code = subprocess.run(command, cwd=HERE).returncode
     if code:
         print(f"!!!!! {script} failed with exit code {code}", flush=True)
+        FAILED.append(script)
     return code == 0
 
 
@@ -131,6 +133,9 @@ def main():
         run("evaluate_final_loso_7_9.py", "--sections", 9, *overwrite)
     if "umap" in args.steps:
         run("evaluate_best_config_umap.py", "--jobs", args.umap_jobs)
+    if FAILED:
+        print(f"Failed steps: {FAILED}", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

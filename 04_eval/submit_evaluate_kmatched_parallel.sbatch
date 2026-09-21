@@ -49,7 +49,9 @@ echo "=================================================="
 
 python -u evaluate_k_matched_ari.py --embeddings z_trans z_token z_joint --baselines \
     --shard "${SLURM_ARRAY_TASK_ID}/5" "$@"
+status=$?
 
 echo "=================================================="
 echo "Job finished at: $(date)"
 echo "=================================================="
+exit $status
