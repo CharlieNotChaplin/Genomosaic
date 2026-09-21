@@ -22,11 +22,15 @@ Usage (from 04_eval/; CPU, about one minute per UMAP):
     python -u evaluate_best_config_umap.py
     python -u evaluate_best_config_umap.py --criteria lt --slides CRC_P2 Normal_P3
     python -u evaluate_best_config_umap.py --rank-only
+    python -u evaluate_best_config_umap.py --jobs 4              four figures at a time
 """
 
 import argparse
+import multiprocessing
+import os
 import sys
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import anndata as ad
@@ -161,6 +165,12 @@ def plot_slide(rows, config, criterion, slide, args, output_dir):
     return True
 
 
+def draw_task(task):
+    """Worker entry point: ``task`` is (rows, config, criterion, slide, args); returns (criterion, slide, drawn)."""
+    rows, config, criterion, slide, args = task
+    return criterion, slide, plot_slide(rows, config, criterion, slide, args, args.output_dir)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--criteria", nargs="+", choices=list(CRITERIA), default=list(CRITERIA))
@@ -173,6 +183,8 @@ def main():
     ap.add_argument("--rank-only", action="store_true", help="print the ranking and skip the figures")
     ap.add_argument("--n-held", type=int, default=15000, help="held-out units shown per UMAP")
     ap.add_argument("--n-per-train-slide", type=int, default=3000, help="units shown per training slide")
+    ap.add_argument("--jobs", type=int, default=1,
+                    help="figures drawn in parallel (one process each; the largest slides need several GB of memory)")
     ap.add_argument("--output-dir", type=Path, default=ecq.BASEDIR / "combined/03_integration/autoencoders")
     args = ap.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -191,15 +203,24 @@ def main():
     if args.rank_only:
         return
 
+    tasks = []
     for top in ranked:
         criterion = top["criterion"].iloc[0]
         config = top.iloc[0][CONFIG_COLUMNS].to_dict()
         slides_with_reference = set(rows.loc[rows[CRITERIA[criterion][0]].notna(), "slide"])
         if criterion == "lt":
             slides_with_reference |= {"CRC_P2"}
-        for slide in [s for s in args.slides if s in slides_with_reference]:
-            drawn = plot_slide(rows, config, criterion, slide, args, args.output_dir)
-            print(f"{criterion}/{slide}: {'figure written' if drawn else 'skipped'}", flush=True)
+        tasks += [(rows, config, criterion, slide, args) for slide in args.slides if slide in slides_with_reference]
+    tasks.sort(key=lambda t: -km.SLIDE_SIZE[t[1]["unit"]].get(t[3], 0))
+
+    if args.jobs <= 1:
+        results = map(draw_task, tasks)
+    else:
+        os.environ.setdefault("NUMBA_NUM_THREADS", str(max(1, (os.cpu_count() or args.jobs) // args.jobs)))
+        pool = ProcessPoolExecutor(max_workers=args.jobs, mp_context=multiprocessing.get_context("spawn"))
+        results = pool.map(draw_task, tasks)
+    for criterion, slide, drawn in results:
+        print(f"{criterion}/{slide}: {'figure written' if drawn else 'skipped'}", flush=True)
 
 
 if __name__ == "__main__":

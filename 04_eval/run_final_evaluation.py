@@ -113,6 +113,7 @@ def main():
     ap.add_argument("--variants", nargs="+", choices=list(ecq.VARIANTS), default=list(ecq.VARIANTS))
     ap.add_argument("--steps", nargs="+", choices=STEPS, default=STEPS)
     ap.add_argument("--overwrite", action="store_true", help="recompute folds that are already in the result files")
+    ap.add_argument("--umap-jobs", type=int, default=4, help="UMAP figures drawn in parallel")
     ap.add_argument("--disease-max-per-slide", type=int, default=20_000,
                     help="units per slide used by the disease probe of the new folds; 0 uses all units")
     args = ap.parse_args()
@@ -129,7 +130,7 @@ def main():
         run("evaluate_final_loso_7_9.py", "--sections", 8, 7, "--units", *args.units, "--variants", *args.variants, *overwrite)
         run("evaluate_final_loso_7_9.py", "--sections", 9, *overwrite)
     if "umap" in args.steps:
-        run("evaluate_best_config_umap.py")
+        run("evaluate_best_config_umap.py", "--jobs", args.umap_jobs)
 
 
 if __name__ == "__main__":
