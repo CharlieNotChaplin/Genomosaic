@@ -49,7 +49,9 @@ echo "CUDA Available Devices: $CUDA_VISIBLE_DEVICES"
 echo "=================================================="
 
 python run_loso.py --held_out_slide "$HELD_OUT_SLIDE" --unit bins $VARIANT_FLAGS
+status=$?
 
 echo "=================================================="
 echo "Job finished at: $(date)"
 echo "=================================================="
+exit $status
