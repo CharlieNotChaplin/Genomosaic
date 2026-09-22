@@ -82,7 +82,7 @@ def head(cells):
     return " & ".join(rf"\textcolor{{rwthblau100}}{{\textbf{{{c}}}}}" for c in cells) + r" \\"
 
 
-def table(colspec, header_rows, rows, caption_short, caption, label, size=r"\small", resize=False):
+def table(colspec, header_rows, rows, caption_short, caption, label, size=r"\scriptsize", resize=False):
     """rows: list of cell lists; a row may be the string "\\midrule" for a separator."""
     out = [r"\begin{table}[htbp]", r"    \centering", f"    {size}"]
     if resize:
@@ -183,11 +183,8 @@ def tab_retrieval(ret, out):
         means.append(float(v.held_cluster.mean()) if len(v) else None)
         n_row.append(f"{len(v)}/{len(SLIDES)}")
     rows += [[r"\textbf{Mean}"] + [m if m != "--" else pending() for m in bold_best(means)], n_row]
-    cap = ("Held-out $\\text{top1}_{\\text{cluster}}$ (cell$\\leftrightarrow$token retrieval on the held-out slide) "
-           "per \\gls{loso} fold for the final configuration; the best value per row is bold. ``--'' marks folds that have not finished; "
-           "the mean is over finished folds only, so means of configurations with different coverage are not "
-           "directly comparable. Values are not comparable across slides, since the number of "
-           "reference clusters differs per slide, and not directly between units, since each unit has its own clustering.")
+    cap = ("Held-out $\\text{top1}_{\\text{cluster}}$ per \\gls{loso} fold; the best value per row is bold. ``--'': fold not finished, "
+           "excluded from the mean. Not comparable across slides (reference cluster counts differ) or between units.")
     write(out, "07_tab_retrieval_per_slide.tex",
           table("lrrrr", hdr, rows, "Held-out cluster-level retrieval per LOSO fold.", cap, "tab:07_retrieval_per_slide"))
 
@@ -219,14 +216,12 @@ def tab_summary(ret, disease, out):
         macro(f"Res{key}Leak", f3(st["l"]))
         macro(f"Res{key}Folds", str(st["n"]))
     chance = ret.leak_chance.dropna().iloc[0] if len(ret) else float("nan")
-    cap = ("Summary of the final \\gls{loso} runs, mean over finished folds; the best value per column is bold (for the retrieval and leakage "
-           "columns; in-sample fit is not a quality measure). $\\text{top1}_{\\text{cluster}}$ is the primary "
-           "retrieval metric; exact top-1 is diagnostic only. Slide\\_ID leakage is the held-out-vs-train "
-           f"linear-probe accuracy on the token embedding (chance $\\approx {chance:.2f}$; lower is better). "
-           "Values are not directly comparable between units, since each has its own clustering. "
-           + coverage_note(ret))
+    cap = ("Summary of the final \\gls{loso} runs, mean over finished folds; the best value per column is bold (retrieval and leakage "
+           "only; in-sample fit is not a quality measure). $\\text{top1}_{\\text{cluster}}$ is the primary retrieval metric. Slide\\_ID "
+           f"leakage is held-out-vs-train linear-probe accuracy on the token embedding (chance $\\approx {chance:.2f}$, lower is better). "
+           "Not directly comparable between units. " + coverage_note(ret))
     write(out, "07_tab_final_summary.tex",
-          table("lrrrrr", hdr, rows, "Summary of the final LOSO runs.", cap, "tab:07_final_summary", size=r"\footnotesize", resize=True))
+          table("lrrrrr", hdr, rows, "Summary of the final LOSO runs.", cap, "tab:07_final_summary", resize=True))
 
 
 def paired_macros(ret):
@@ -277,12 +272,16 @@ def tab_semantic_arm(ret, out):
            "$\\text{top1}_{\\text{cluster}}$ per fold. The mean is over folds where both runs exist. "
            + coverage_note(ret))
     write(out, "07_tab_semantic_arm.tex",
-          table("lrrrrrr", hdr, rows, "Semantic-exclusion comparison arm.", cap, "tab:07_semantic_arm", size=r"\footnotesize", resize=True))
+          table("lrrrrrr", hdr, rows, "Semantic-exclusion comparison arm.", cap, "tab:07_semantic_arm", resize=True))
 
 
 def load_quality():
     d = pd.read_csv(BASE / "final_loso_clustering_quality_smoothed.csv").rename(columns={"held_out_slide": "slide"})
-    # number of Leiden clusters found lives only in the unsmoothed table (same partition as label_kind "raw")
+    # number of Leiden clusters found lives only in the unsmoothed table (same partition as label_kind "raw").
+    # Some rows (e.g. CRC_P2's ground-truth fold, merged in directly with all of evaluate_clustering_quality.py's
+    # columns) may already carry their own n_clusters_found -- drop it here so the merge below is the one and only
+    # source, instead of a silent pandas _x/_y suffix once both sides have the column.
+    d = d.drop(columns="n_clusters_found", errors="ignore")
     n = (pd.read_csv(BASE / "final_loso_clustering_quality.csv").rename(columns={"held_out_slide": "slide"})
          [["unit", "variant", "slide", "embedding", "n_clusters_found"]].drop_duplicates())
     return d.merge(n, on=["unit", "variant", "slide", "embedding"], how="left")
@@ -296,7 +295,7 @@ def agg_slide_mean(d, keys):
 def tab_clustering(q, out):
     raw_ref = q[q.reference_kind == "raw"]
     body = raw_ref[raw_ref.label_kind == "raw"]
-    hdr = [head(["Configuration", "Embedding", "Folds", "Clusters", "\\gls{ari}", "\\gls{nmi}", "Silhouette"])]
+    hdr = [head(["Configuration", "Embedding", "Folds", "Clusters", "ARI", "NMI", "Silhouette"])]
 
     def build(embs):
         rows = []
@@ -315,16 +314,21 @@ def tab_clustering(q, out):
                 rows.append(r"\midrule")
         return rows[:-1] if len(embs) > 1 else rows
 
-    cap = ("Leiden clustering of the held-out embeddings (resolution 0.5) against the bin-level label-transfer "
-           "reference (nearest $8\\,\\mu$m grid cell, raw reference labels, no spatial refinement); mean over folds "
-           "with a reference (\\texttt{CRC\\_P2} is the classifier's own training slide and has none). "
-           "Clusters is the mean number of Leiden clusters found. Silhouette is computed on a 10\\,000-unit subsample.")
+    gt_row = q[(q.unit == "nuclei") & (q.variant == "svg") & (q.embedding == "z_trans") &
+               (q.label_kind == "raw") & (q.reference_kind == "gt")]
+    if len(gt_row):
+        macro("ResGtFixedPTwoAri", f3(gt_row.ari_vs_label_transfer.mean()))
+        macro("ResGtFixedPTwoNmi", f3(gt_row.nmi_vs_label_transfer.mean()))
+    cap = ("Leiden clustering (resolution 0.5) against the bin-level label-transfer reference (nearest $8\\,\\mu$m grid cell, raw, "
+           "unrefined); mean over folds with a label-transfer reference. \\texttt{CRC\\_P2}, the classifier's own training slide, has "
+           "none; its agreement with the pathologist annotation at this same resolution is reported in the text instead, and at "
+           "matched cluster counts in Table~\\ref{tab:07_ground_truth_p2}. Clusters: mean Leiden count. Silhouette: 10\\,000-unit subsample.")
     write(out, "07_tab_clustering_quality_ztrans.tex",
           table("llrrrrr", hdr, build(["z_trans"]), "Clustering quality of the transcriptomic embedding.",
-                cap + " " + coverage_note(q.assign(slide=q.slide)), "tab:07_clustering_ztrans", size=r"\footnotesize"))
+                cap + " " + coverage_note(raw_ref.assign(slide=raw_ref.slide)), "tab:07_clustering_ztrans"))
     write(out, "10_tab_clustering_quality_all_embeddings.tex",
           table("llrrrrr", hdr, build(EMBEDDINGS), "Clustering quality of all three embeddings.",
-                cap + " " + coverage_note(q), "tab:10_clustering_all", size=r"\footnotesize"))
+                cap + " " + coverage_note(raw_ref), "tab:10_clustering_all"))
     for cfg in ALL_CONFIGS:
         v = body[(body.unit == cfg[0]) & (body.variant == cfg[1]) & (body.embedding == "z_trans")]
         if len(v):
@@ -338,7 +342,7 @@ def tab_smoothing(q, out, ref_kind="raw", name="07_tab_smoothing_effect", label=
     d = q[(q.reference_kind == ref_kind) & (q.embedding.isin(embs))]
     modes = ["raw", "hard", "spagcn"]
     hdr = [r"\textcolor{rwthblau100}{\textbf{Configuration}} & " + " & ".join(
-        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["\\gls{ari}", "\\gls{nmi}", "Silhouette"]) + r" \\",
+        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["ARI", "NMI", "Silhouette"]) + r" \\",
            r"\textcolor{rwthblau100}{} & " + " & ".join(
         rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["none", "maj.", "SpaGCN"] * 3) + r" \\"]
     rows = []
@@ -359,9 +363,9 @@ def tab_smoothing(q, out, ref_kind="raw", name="07_tab_smoothing_effect", label=
                 macro(f"Res{key}Nmi{mn}", f3(v[v.label_kind == m].nmi_vs_label_transfer.mean()))
                 macro(f"Res{key}Sil{mn}", f3(v[v.label_kind == m].silhouette.mean()))
     what = "raw" if ref_kind == "raw" else "spatially smoothed (majority vote on the nucleus/bin graph)"
-    cap = (f"Effect of spatial refinement on the Leiden partition of {'the transcriptomic embedding' if len(embs) == 1 else 'the embeddings'} "
-           f"(\\texttt{{refine\\_domains}}: none, majority vote, SpaGCN conditional rule), scored against the {what} "
-           "label-transfer reference. Mean over folds with a reference. " + coverage_note(d.assign(slide=d.slide)))
+    cap = (f"Effect of spatial refinement (\\texttt{{refine\\_domains}}: none, majority vote, SpaGCN rule) on the Leiden partition of "
+           f"{'the transcriptomic embedding' if len(embs) == 1 else 'the embeddings'}, against the {what} label-transfer reference. "
+           "Mean over folds with a reference. " + coverage_note(d.assign(slide=d.slide)))
     write(out, f"{name}.tex", table("l" + "r" * 9, hdr, rows, "Effect of spatial refinement.", cap, label,
                                    size=r"\scriptsize", resize=True))
 
@@ -384,7 +388,7 @@ def tab_baselines(q, out):
         matched &= s
     matched = [s for s in SLIDES if s in matched]
     hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & " + " & ".join(
-        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["\\gls{ari}", "\\gls{nmi}"]) + r" & \textcolor{rwthblau100}{\textbf{Folds}} \\",
+        rf"\multicolumn{{3}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{m}}}}}}}" for m in ["ARI", "NMI"]) + r" & \textcolor{rwthblau100}{\textbf{Folds}} \\",
            r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["none", "maj.", "refined"] * 2) + r" & \\"]
     rows = []
     for name, d in baselines.items():
@@ -450,17 +454,13 @@ def tab_baselines(q, out):
             macro(f"ResMatched{key}Nmi{mn}", f3(v[v.label_kind == m].nmi_vs_label_transfer.mean()))
         macro(f"ResMatched{key}N", str(v.slide.nunique()))
     matched_txt = ", ".join(tex(s) for s in matched)
-    cap = ("Spatial-domain baselines against our Leiden partition of $\\mathbf{z}^{\\mathrm{trans}}$, all scored against the same "
-           "raw nearest-grid label-transfer reference on the same slides (" + matched_txt + "). "
-           "``none'': raw clustering; ``maj.'': majority-vote refinement (ours only); ``refined'': the method's own SpaGCN-style refinement "
-           "(SpaGCN: \\texttt{spg.refine}; ours: the conditional rule of \\texttt{refine\\_domains}). "
-           "SpaGCN needs the cluster count in advance and was run for $k=7,\\dots,10$; the values are the mean over $k$ "
-           "per slide, then over slides, whereas our Leiden partition chooses its own number of clusters. "
-           "Our default partition (Leiden resolution 0.5) has about 14 clusters, more than the baselines, so this table is not cluster-count matched; "
-           "Table~\\ref{tab:07_baseline_kmatched} is. "
-           "Slides with a missing baseline result are left out for every row.")
+    cap = ("Spatial-domain baselines against our Leiden partition of $\\mathbf{z}^{\\mathrm{trans}}$, scored against the raw nearest-grid "
+           "label-transfer reference on the same slides (" + matched_txt + "). ``maj.'': majority-vote refinement (ours only); "
+           "``refined'': each method's own refinement (SpaGCN: \\texttt{spg.refine}). SpaGCN needs $k$ in advance ($k=7,\\dots,10$, "
+           "averaged), whereas our partition (about 14 clusters at the default resolution) chooses its own $k$, so this table is not "
+           "cluster-count matched -- Table~\\ref{tab:07_baseline_kmatched} is.")
     write(out, "07_tab_baseline_comparison.tex",
-          table("lrrrrrrr", hdr, rows, "Comparison with spatial-domain baselines.", cap, "tab:07_baseline_comparison", size=r"\footnotesize"))
+          table("lrrrrrrr", hdr, rows, "Comparison with spatial-domain baselines.", cap, "tab:07_baseline_comparison"))
     macro("ResBaselineMatchedN", str(len(matched)))
 
 
@@ -487,18 +487,17 @@ def tab_expression(out):
         macro(f"Res{key}ProbeMlpRtwo", f3(m.median_r2.mean(), 4))
         macro(f"Res{key}ProbeFrac", f3(m.frac_genes_r2_pos.mean()))
     cov = "; ".join(f"{cfg_label(c)} {d[(d.unit == c[0]) & (d.variant == c[1])].held_out_slide.nunique()}/{len(SLIDES)}" for c in ALL_CONFIGS)
-    cap = ("Gene-expression prediction from the frozen histology-token embedding "
-           "($\\mathbf{z}^{\\mathrm{token}}$), Ridge and MLP probes fit on the training slides and scored on the held-out slide; "
-           "per-fold medians over genes, averaged over folds. The probes use at most 100\\,000 randomly sampled units per slide. "
-           "Expression is standardized with training-slide statistics; $R^2$ near or below 0 means no better than a constant prediction. "
-           "Genes differ between the SVG union and the panel, so rows are not gene-for-gene comparable. Finished folds: " + cov + ".")
+    cap = ("Gene-expression prediction from the frozen histology-token embedding ($\\mathbf{z}^{\\mathrm{token}}$): Ridge and MLP probes "
+           "fit on the training slides, scored on the held-out slide (per-fold gene medians, averaged over folds, at most 100\\,000 "
+           "units/slide). $R^2$ near or below 0: no better than a constant prediction. Genes differ between gene sets, so rows are not "
+           "gene-for-gene comparable. Finished folds: " + cov + ".")
     write(out, "07_tab_expression_probe.tex",
-          table("lrrrrrr", hdr, rows, "Gene-expression prediction from histology.", cap, "tab:07_expression_probe", size=r"\footnotesize"))
+          table("lrrrrrr", hdr, rows, "Gene-expression prediction from histology.", cap, "tab:07_expression_probe"))
 
 
 def tab_disease(out):
     d = pd.read_csv(BASE / "final_loso_disease_signal.csv")
-    hdr = [head(["Configuration", "Folds", "Train \\gls{loso} acc.", "Train \\gls{loso} F1", "Tumor slides", "Normal\\_P3", "Normal\\_P5"])]
+    hdr = [head(["Configuration", "Folds", "Train LOSO acc.", "Train LOSO F1", "Tumor slides", "Normal\\_P3", "Normal\\_P5"])]
     rows = []
     for cfg in ALL_CONFIGS:
         v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
@@ -519,13 +518,12 @@ def tab_disease(out):
             if len(x):
                 macro(f"Res{key}Disease{'NormalThree' if s == 'Normal_P3' else 'NormalFive'}", f3(x.held_out_acc.iloc[0]))
     cap = ("Tumor-versus-normal signal in the frozen $\\mathbf{z}^{\\mathrm{trans}}$ (logistic regression). Train \\gls{loso}: "
-           "leave-one-training-slide-out accuracy and macro F1 (mean over folds). Held-out columns: fraction of the held-out slide's "
-           "units classified as its true class by a classifier fit on the training slides -- mean over the tumor folds, and the "
-           "two normal slides individually (a single slide each, so differences of a few hundredths are within noise). "
-           "Macro F1 is of limited use here: each left-out training slide contains only one class, which caps it near 0.5. "
+           "leave-one-training-slide-out accuracy and macro F1. Held-out columns: fraction of the held-out slide's units classified as "
+           "its true class -- mean over tumor folds, and the two normal slides individually (single slides, so read differences of a "
+           "few hundredths as noise; macro F1 is capped near 0.5 here since each left-out training slide has only one class). "
            + coverage_note(d.rename(columns={"held_out_slide": "slide"})))
     write(out, "07_tab_disease_signal.tex",
-          table("lrrrrrr", hdr, rows, "Disease signal in the embeddings.", cap, "tab:07_disease_signal", size=r"\footnotesize", resize=True))
+          table("lrrrrrr", hdr, rows, "Disease signal in the embeddings.", cap, "tab:07_disease_signal", resize=True))
 
 
 def tab_annotation(out):
@@ -539,15 +537,19 @@ def tab_annotation(out):
         frac = per_slide.div(per_slide.sum(axis=1), axis=0)
         shares[cfg] = frac.mean(axis=0) * 100
     order = sorted(types, key=lambda t: -np.mean([shares[c].get(t, 0.0) for c in cfgs]))
-    hdr = [head(["Assigned cell type"] + [cfg_label(c) for c in cfgs])]
+    # two header rows (unit, then variant) instead of one wide "Nuclei, SVG + semantic excl."-style column
+    # header per config -- with up to 6 config columns and only 1-2-digit percentages in the body, a single
+    # combined header row was what pushed this table off the page width.
+    hdr = [head(["Assigned cell type"] + [c[0].capitalize() for c in cfgs]),
+           head([""] + [LABEL[c[1]] for c in cfgs])]
     rows = [[tex(t)] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in order]
     rows.append(r"\midrule")
     rows.append(["Folds"] + [str(d[(d.unit == c[0]) & (d.variant == c[1])].held_out_slide.nunique()) for c in cfgs])
-    cap = ("Share (\\%) of units whose Leiden cluster is assigned to each canonical marker-set cell type, first per held-out slide, "
-           "then averaged over slides. The assignment is the arg-max of the mean marker-set score per cluster from a hand-curated "
-           "marker list and is a coarse sanity check, not a validated cell-type call. Configurations without finished annotations are omitted.")
+    cap = ("Share (\\%) of units whose Leiden cluster is assigned to each canonical marker-set cell type, per held-out slide then "
+           "averaged. Assignment is the arg-max of the mean marker-set score per cluster (hand-curated marker list) -- a coarse sanity "
+           "check, not a validated cell-type call.")
     write(out, "07_tab_cluster_annotation.tex",
-          table("l" + "r" * len(cfgs), hdr, rows, "Marker-based cluster annotation.", cap, "tab:07_cluster_annotation", size=r"\footnotesize"))
+          table("l" + "r" * len(cfgs), hdr, rows, "Marker-based cluster annotation.", cap, "tab:07_cluster_annotation"))
 
 
 def tab_umi_cutoff(out):
@@ -581,12 +583,13 @@ def tab_umi_cutoff(out):
                      f"{sub.knee_cutoff.median():.0f}", pct(sub.frac_kept_knee.median()), f"{sub.mad_cutoff.median():.1f}", pct(sub.frac_kept_mad.median())])
         rows.append(r"\midrule")
     rows = rows[:-1]
-    cap = ("UMI-cutoff sensitivity per slide and unit. Units are the nuclei (resp.\\ $8\\,\\mu$m bins) with at least one \\gls{umi} before any quality filter, "
-           "so the counts differ from the segmentation totals of Table~\\ref{tab:07_trans_preprocessing}. Fixed: the cutoff used throughout "
-           "(total counts $>80$); knee: elbow of the sorted-count curve; MAD: median $-3\\times$MAD of log counts. ``kept'': share of units above the cutoff. "
-           "$^{\\mathrm{a}}$The raw aggregated bin counts of \\texttt{CRC\\_P11mm\\_2\\_cut} are incomplete in the merged file and are omitted.")
+    cap = ("UMI-cutoff sensitivity per slide and unit (nuclei, $8\\,\\mu$m bins) with at least one \\gls{umi}, before any quality filter "
+           "(so counts differ from Table~\\ref{tab:07_trans_preprocessing}). Fixed: the cutoff used throughout (total counts $>80$); "
+           "knee: elbow of the sorted-count curve; MAD: median $-3\\times$MAD of log counts; ``kept'': share of units above the cutoff. "
+           "$^{\\mathrm{a}}$Its pre-filter bin count covers a smaller region than the trained model uses (Section~\\ref{sect:07_exp_umi}), "
+           "so \\texttt{CRC\\_P11mm\\_2\\_cut} is omitted here.")
     write(out, "07_tab_umi_cutoff_sensitivity.tex",
-          table("llrrrrrrr", hdr, rows, "UMI-cutoff sensitivity per slide and unit.", cap, "tab:07_umi_cutoff_sensitivity", size=r"\footnotesize", resize=True))
+          table("llrrrrrrr", hdr, rows, "UMI-cutoff sensitivity per slide and unit.", cap, "tab:07_umi_cutoff_sensitivity", resize=True))
 
 
 def tab_reference_agreement(out):
@@ -596,8 +599,8 @@ def tab_reference_agreement(out):
         return
     d = pd.read_csv(path)
     hdr = [r"\textcolor{rwthblau100}{\textbf{Slide}} & \textcolor{rwthblau100}{\textbf{SR clusters}} & "
-           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{ari}}}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{nmi}}}} & "
-           r"\textcolor{rwthblau100}{\textbf{\gls{ari}, $K{=}8$}} \\",
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{ARI}}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{NMI}}} & "
+           r"\textcolor{rwthblau100}{\textbf{ARI, $K{=}8$}} \\",
            r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{LT} & \textcolor{rwthblau100}{LTs} & "
            r"\textcolor{rwthblau100}{LT} & \textcolor{rwthblau100}{LTs} & \textcolor{rwthblau100}{LT} \\"]
     rows = [[tex(r.slide), str(int(r.k_graph)), f3(r.ari_graph_lt), f3(r.ari_graph_lts), f3(r.nmi_graph_lt), f3(r.nmi_graph_lts), f3(r.ari_km8_lt)]
@@ -608,11 +611,11 @@ def tab_reference_agreement(out):
     macro("ResRefAgreeAriLt", f3(d.ari_graph_lt.mean())); macro("ResRefAgreeNmiLt", f3(d.nmi_graph_lt.mean()))
     macro("ResRefAgreeAriLts", f3(d.ari_graph_lts.mean())); macro("ResRefAgreeNmiLts", f3(d.nmi_graph_lts.mean()))
     macro("ResRefAgreeAriMin", f3(d.ari_graph_lt.min())); macro("ResRefAgreeAriMax", f3(d.ari_graph_lt.max()))
-    cap = ("Agreement between the image-based label transfer (LT), its majority-vote-smoothed version (LTs) and SpaceRanger's transcriptomics-only "
-           "clusters (SR), on the native $8\\,\\mu$m bins joined by barcode. SR: graph-based clusters (number per slide given) and, in the last column, "
-           "k-means with $K=8$. \\texttt{CRC\\_P2} (no LT predictions) and the two SMAP slides (no native SpaceRanger output) are absent.")
+    cap = ("Agreement between label transfer (LT), its majority-vote-smoothed version (LTs) and SpaceRanger's expression-only clusters "
+           "(SR: graph-based, number per slide given; last column: k-means at $K=8$), on the native $8\\,\\mu$m bins. \\texttt{CRC\\_P2} "
+           "(no LT) and the two SMAP slides (no native SpaceRanger output) are absent.")
     write(out, "07_tab_reference_agreement.tex",
-          table("lrrrrrr", hdr, rows, "Agreement between label transfer and SpaceRanger clusters.", cap, "tab:07_reference_agreement", size=r"\footnotesize"))
+          table("lrrrrrr", hdr, rows, "Agreement between label transfer and SpaceRanger clusters.", cap, "tab:07_reference_agreement"))
 
 
 def write_macros(out):

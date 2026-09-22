@@ -93,10 +93,9 @@ def tab_ari_per_sample(km_m, bo, out, unit="nuclei", variant="svg", appendix=Fal
     rows.append([r"\textbf{Mean}"] + [r"\textbf{" + mt.f3(mean_or_nan(allvals[i])) + "}" if not np.isnan(mean_or_nan(allvals[i])) else "--" for i in range(8)])
     rows.append(["Median"] + [mt.f3(float(np.nanmedian(allvals[i])) if np.isfinite(allvals[i]).any() else np.nan) for i in range(8)])
     cap = (f"Per-slide agreement of the Leiden partition of $\\mathbf{{z}}^{{\\mathrm{{trans}}}}$ ({mt.cfg_label(cfg)}, mean over runs with 7--10 "
-           "clusters) with the image-based label transfer (LT), SpaceRanger's graph clusters (SR) and, for CRC\\_P2 only, the pathologist "
-           "annotation, before (raw) and after majority-vote refinement (ref.). The last two columns give the baselines' \\gls{ari} against LT on the "
-           "same nuclei (mean over $k=7,\\dots,10$). ``--'': no reference or no result for that slide (CRC\\_P2 has no LT reference; SR does not exist for "
-           "the two SMAP slides). Slides with low values for the baselines as well point to the reference, not the embedding.")
+           "clusters) with label transfer (LT), SpaceRanger (SR) and, for \\texttt{CRC\\_P2} only, the pathologist annotation, before (raw) and "
+           "after majority-vote refinement (ref.). Last two columns: baselines' \\gls{ari} against LT on the same nuclei (mean over $k=7,\\dots,10$). "
+           "``--'': no reference for that slide. Low baseline values too point to the reference, not the embedding.")
     name = f"10_tab_ari_per_sample_{unit}_{variant}" if appendix else "07_tab_ari_per_sample"
     mt.write(out, name + ".tex", mt.table("l" + "r" * 8, hdr, rows, "Per-slide ARI.", cap,
                                          "tab:" + name[:2] + "_ari_per_sample" + (f"_{unit}_{variant}" if appendix else ""),
@@ -116,11 +115,11 @@ def tab_ari_per_sample_embeddings(km_m, out, unit="nuclei", variant="svg"):
                 x = ours(km_m, unit, variant, e, "raw", col)
                 vals.append(float(x[s]) if s in x.index else np.nan)
         rows.append([mt.tex(s)] + [mt.f3(v) for v in vals])
-    cap = ("\\gls{ari} of the raw Leiden partition (mean over runs with 7--10 clusters) of the transcriptomic, the histology and the "
-           f"concatenated embedding ({mt.cfg_label((unit, variant))}) against label transfer (LT) and SpaceRanger (SR). The label-transfer "
-           "reference is derived from histology tokens, which favours $\\mathbf{z}^{\\mathrm{token}}$ on LT; SR is derived from expression.")
+    cap = ("\\gls{ari} of the raw Leiden partition (mean over runs with 7--10 clusters) of the transcriptomic, histology and concatenated "
+           f"embeddings ({mt.cfg_label((unit, variant))}) against label transfer (LT, derived from histology tokens, favouring "
+           "$\\mathbf{z}^{\\mathrm{token}}$) and SpaceRanger (SR, derived from expression).")
     mt.write(out, "10_tab_ari_per_sample_embeddings.tex", mt.table("l" + "r" * 6, hdr, rows, "Per-slide ARI for the three embeddings.", cap,
-                                                                 "tab:10_ari_per_sample_embeddings", size=r"\footnotesize"))
+                                                                 "tab:10_ari_per_sample_embeddings"))
 
 
 # ---- baseline comparison on our nuclei -------------------------------------------------------------
@@ -170,11 +169,13 @@ def tab_baseline_kmatched(km_m, bo, out):
         return
     slides = matched_slides(bo, km_m)
     hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & " + " & ".join(
-        rf"\multicolumn{{2}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{n}}}}}}}" for n in ["\\gls{ari} vs.\\ LT", "\\gls{ari} vs.\\ SR", "\\gls{nmi} vs.\\ SR"]) +
+        rf"\multicolumn{{2}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{n}}}}}}}" for n in ["ARI vs.\\ LT", "ARI vs.\\ SR", "NMI vs.\\ SR"]) +
         r" & \textcolor{rwthblau100}{\textbf{Folds}} \\",
            r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["raw", "ref."] * 3) + r" & \\"]
     rows = []
     for label, r in method_rows(km_m, bo, CFGS_ALL, slides):
+        if r is None and label not in BASELINE_NAMES:
+            continue
         if r is None:
             rows.append([mt.tex(label), mt.pending()] + [""] * 6)
         else:
@@ -186,35 +187,39 @@ def tab_baseline_kmatched(km_m, bo, out):
             if label in BASELINE_NAMES:
                 for c, nm in (("ari_lt", "AriLt"), ("ari_sr", "AriSr")):
                     mt.macro(f"ResKm{label}{nm}", mt.f3(r[(c, "raw")]))
-    cap = ("Cluster-count-matched comparison with the spatial-domain baselines, all on the same nuclei and the same slides ("
-           + ", ".join(mt.tex(s) for s in slides) + "). Our rows are the mean over the Leiden runs with 7--10 clusters, the baselines the mean over "
-           "$k=7,\\dots,10$; ``ref.'' is majority-vote refinement for ours and the method's own refinement (SpaGCN only) for the baselines. "
-           "LT: image-based label transfer (derived from histology); SR: SpaceRanger graph clusters (derived from expression). "
-           "Neither is ground truth, the two agree with each other only at \\gls{ari} $\\approx0.17$ on average. Folds: slides averaged.")
+    cap = ("Cluster-count-matched comparison with the spatial-domain baselines on the same slides ("
+           + ", ".join(mt.tex(s) for s in slides) + "). Baselines and nucleus rows share the same nuclei; bin rows are scored on the bins of "
+           "these slides and shown for orientation (the semantic-exclusion arm was only evaluated at the fixed resolution, "
+           "Table~\\ref{tab:07_clustering_ztrans}). Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$; "
+           "``ref.'': majority-vote refinement for ours, each method's own refinement (SpaGCN only) for baselines. LT: label transfer "
+           "(histology-derived); SR: SpaceRanger clusters (expression-derived); neither is ground truth, and the two agree with each other "
+           "only at \\gls{ari} $\\approx0.14$ (Table~\\ref{tab:07_reference_agreement}).")
     mt.write(out, "07_tab_baseline_comparison_kmatched.tex",
-             mt.table("lrrrrrrr", hdr, rows, "Cluster-count-matched baseline comparison.", cap, "tab:07_baseline_kmatched", size=r"\footnotesize"))
+             mt.table("lrrrrrrr", hdr, rows, "Cluster-count-matched baseline comparison.", cap, "tab:07_baseline_kmatched"))
     # label-free metrics
     hdr2 = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{PAS} $\downarrow$}} & "
             r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{CHAOS} $\downarrow$}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Silhouette}}} \\",
             r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["raw", "ref."] * 3) + r" \\"]
     rows2 = []
     for label, r in method_rows(km_m, bo, CFGS_ALL, slides):
+        if r is None and label not in BASELINE_NAMES:
+            continue
         if r is None:
             rows2.append([mt.tex(label), mt.pending()] + [""] * 5)
             continue
         sil = [mt.f3(r.get(("silhouette", k), np.nan)) if label not in BASELINE_NAMES else "--" for k in ("raw", "ref")]
         rows2.append([mt.tex(label)] + [mt.f3(r[(c, k)]) for c in ("pas", "chaos") for k in ("raw", "ref")] + sil)
-    cap2 = ("Label-free spatial metrics on the same nuclei and slides as Table~\\ref{tab:07_baseline_kmatched}. PAS: share of units whose label differs "
-            "from at least 6 of their 10 nearest spatial neighbours; CHAOS: mean distance to the nearest unit of the same cluster (pixels). Both reward "
-            "spatial smoothness and do not need a reference, but they cannot tell a correct smooth partition from a wrong one. Silhouette is computed in "
-            "the embedding that was clustered and does not exist for the baselines.")
-    mt.write(out, "07_tab_label_free.tex", mt.table("lrrrrrr", hdr2, rows2, "Label-free spatial metrics.", cap2, "tab:07_label_free", size=r"\footnotesize"))
+    cap2 = ("Label-free spatial metrics on the same slides as Table~\\ref{tab:07_baseline_kmatched} (bin rows on bins, others on nuclei). "
+            "PAS: share of units whose label differs from at least 6 of their 10 nearest spatial neighbours; CHAOS: mean distance to the "
+            "nearest unit of the same cluster (pixels). Both reward spatial smoothness without needing a reference, but cannot tell a correct "
+            "smooth partition from a wrong one. Silhouette is computed in the clustered embedding and does not exist for the baselines.")
+    mt.write(out, "07_tab_label_free.tex", mt.table("lrrrrrr", hdr2, rows2, "Label-free spatial metrics.", cap2, "tab:07_label_free"))
 
 
 def tab_ground_truth(km_m, bo, out):
     slide = "CRC_P2"
-    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{ari}}}} & "
-           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{nmi}}}} \\",
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{ARI}}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{NMI}}} \\",
            r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["raw", "ref."] * 2) + r" \\"]
     rows = []
     for name in BASELINE_NAMES:
@@ -243,11 +248,11 @@ def tab_ground_truth(km_m, bo, out):
                     mt.macro("ResGtNucSvgAri", row[1]); mt.macro("ResGtNucSvgAriRef", row[2])
     if len(rows) <= 4:
         return
-    cap = ("The one slide with real ground truth: agreement with the pathologist annotation of \\texttt{CRC\\_P2} (six base tissue classes, dominant "
-           "component per $8\\,\\mu$m grid cell), for the held-out embedding of that \\gls{loso} fold and for the baselines, on the same nuclei. "
-           "Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so differences of a few hundredths are noise.")
+    cap = ("The one slide with real ground truth: agreement with the pathologist annotation of \\texttt{CRC\\_P2} (six base tissue classes, "
+           "dominant component per $8\\,\\mu$m grid cell), for the held-out embedding and for the baselines, on the same nuclei. Ours: mean "
+           "over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so read small differences as noise.")
     mt.write(out, "07_tab_ground_truth_p2.tex", mt.table("lrrrr", hdr, rows, "Agreement with the pathologist annotation on CRC\\_P2.", cap,
-                                                         "tab:07_ground_truth_p2", size=r"\footnotesize"))
+                                                         "tab:07_ground_truth_p2"))
 
 
 # ---- sensitivity, agreement, appendix ---------------------------------------------------------------
@@ -265,16 +270,16 @@ def tab_ari_vs_k(km, out, unit="nuclei", variant="svg"):
             x = d[(d.embedding == e) & d.k.between(lo, hi)]
             row.append(mt.f3(x.groupby("held_out_slide").ari_lt.mean().mean()) if len(x) else "--")
         rows.append(row)
-    cap = ("Mean \\gls{ari} against label transfer as a function of the number of Leiden clusters (each slide's runs averaged first, then slides), "
-           f"{mt.cfg_label((unit, variant))}. The agreement falls steeply with $k$ because the reference has few dominant classes, which is why "
-           "methods are only compared at the same cluster counts. No resolution is chosen with the reference.")
+    cap = ("Mean \\gls{ari} against label transfer as a function of the Leiden cluster count (slides averaged first, then bins), "
+           f"{mt.cfg_label((unit, variant))}. Agreement falls steeply with $k$ since the reference has few dominant classes, which is why "
+           "methods are only compared at matched cluster counts; no resolution is chosen with the reference.")
     mt.write(out, "10_tab_ari_vs_k.tex", mt.table("lrrr", hdr, rows, "ARI as a function of the number of clusters.", cap, "tab:10_ari_vs_k"))
 
 
 def tab_partition_agreement(agree, out):
     if agree is None or not len(agree):
         return
-    hdr = [mt.head(["Configuration", "Pair", "\\gls{ari}", "\\gls{nmi}", "Homogeneity", "Completeness"])]
+    hdr = [mt.head(["Configuration", "Pair", "ARI", "NMI", "Homogeneity", "Completeness"])]
     rows = []
     for cfg in CFGS_ALL:
         d = agree[(agree.unit == cfg[0]) & (agree.variant == cfg[1])]
@@ -283,12 +288,12 @@ def tab_partition_agreement(agree, out):
                          mt.f3(g.homogeneity_of_b_given_a.mean()), mt.f3(g.completeness_of_b_given_a.mean())])
     if not rows:
         return
-    cap = ("Agreement between the Leiden partitions (about 8 clusters) of the different embeddings on the same held-out nuclei, mean over slides. "
-           "Homogeneity: are the clusters of the second embedding pure with respect to the first; completeness: does the second keep the "
-           "clusters of the first together. A joint partition that is complete and pure with respect to $\\mathbf{z}^{\\mathrm{trans}}$ finds no new "
-           "structure; low homogeneity means it splits the transcriptomic clusters, i.e.\\ histology adds a distinction.")
+    cap = ("Agreement between the Leiden partitions (about 8 clusters) of the different embeddings on the same held-out nuclei, mean over "
+           "slides. Homogeneity: is the second embedding's clusters pure with respect to the first; completeness: does it keep the first's "
+           "clusters together. Complete and pure with respect to $\\mathbf{z}^{\\mathrm{trans}}$ means no new structure; low homogeneity means "
+           "histology splits the transcriptomic clusters.")
     mt.write(out, "07_tab_partition_agreement.tex", mt.table("llrrrr", hdr, rows, "Agreement between embedding partitions.", cap,
-                                                            "tab:07_partition_agreement", size=r"\footnotesize"))
+                                                            "tab:07_partition_agreement"))
 
 
 def tab_disease_weighted(dw, out):
@@ -315,11 +320,11 @@ def tab_disease_weighted(dw, out):
                 mt.macro("ResWeightedNormalFivePlain", row[6]); mt.macro("ResWeightedNormalFiveBal", row[7])
     if not rows:
         return
-    cap = ("Tumor-versus-normal probe on frozen embeddings, without and with balanced class weights (the training pool holds one normal slide against eight tumor "
-           "slides when a normal slide is held out). Values: fraction of the held-out slide's units classified as its true class (tumor slides: mean over folds). "
-           "Units are subsampled per slide. With two normal slides in the cohort, the normal columns are single-slide observations.")
+    cap = ("Tumor-versus-normal probe on frozen embeddings, without and with balanced class weights (the training pool holds one normal "
+           "slide against eight tumor slides when a normal slide is held out). Values: fraction of the held-out slide's units classified as "
+           "its true class (tumor: mean over folds); units are subsampled per slide, and the normal columns are single-slide observations.")
     mt.write(out, "07_tab_disease_signal_weighted.tex", mt.table("llrrrrrr", hdr, rows, "Disease signal with and without class weighting.", cap,
-                                                                "tab:07_disease_weighted", size=r"\footnotesize"))
+                                                                "tab:07_disease_weighted", resize=True))
 
 
 def tab_celltypist(ct, out):
@@ -337,14 +342,14 @@ def tab_celltypist(ct, out):
     cap = ("Share (\\%) of units in clusters that CellTypist (majority vote over our Leiden clusters) assigns to each cell type, per slide, then averaged "
            "over slides; the 15 most frequent types. Predictions on sparse nucleus-level counts are noisy; this complements, and does not replace, the marker-based annotation.")
     mt.write(out, "07_tab_cluster_annotation_celltypist.tex", mt.table("l" + "r" * len(cfgs), hdr, rows, "CellTypist annotation.", cap,
-                                                                      "tab:07_celltypist", size=r"\footnotesize"))
+                                                                      "tab:07_celltypist"))
 
 
 def tab_long_summary(km_m, bo, out):
     """Appendix: one long table. Columns: ARI vs smoothed LT (raw|ref) and vs SR (raw|ref), NMI vs smoothed LT and vs SR
     (refined partitions only), silhouette (ours, z_trans). Blocks: all slides with SR; slides shared with each baseline."""
-    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{4}{c}{\textcolor{rwthblau100}{\textbf{\gls{ari}}}} & "
-           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{\gls{nmi}} (ref.)}} & \textcolor{rwthblau100}{\textbf{Sil.}} & \textcolor{rwthblau100}{\textbf{Folds}} \\",
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{4}{c}{\textcolor{rwthblau100}{\textbf{ARI}}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{NMI}} (ref.)} & \textcolor{rwthblau100}{\textbf{Sil.}} & \textcolor{rwthblau100}{\textbf{Folds}} \\",
            r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{LTs raw} & \textcolor{rwthblau100}{LTs ref.} & \textcolor{rwthblau100}{SR raw} & "
            r"\textcolor{rwthblau100}{SR ref.} & \textcolor{rwthblau100}{LTs} & \textcolor{rwthblau100}{SR} & \textcolor{rwthblau100}{} & \\"]
     blocks = [("All slides with a SpaceRanger reference", None)] + [(f"Slides shared with {n}", n) for n in BASELINE_NAMES]
@@ -378,11 +383,11 @@ def tab_long_summary(km_m, bo, out):
             rows.append([bname] + [mt.f3(v) for v in vals] + ["--", str(len(slides_with(bo, bname, slides)))])
         rows.append(r"\midrule")
     rows = rows[:-1] if rows and rows[-1] == r"\midrule" else rows
-    cap = ("Long summary. \\gls{ari} against the smoothed label-transfer reference (LTs) and SpaceRanger (SR) for the raw and the majority-vote-refined partitions, "
-           "\\gls{nmi} for the refined partitions, silhouette of the refined partition in the embedding that was clustered. Ours: mean over Leiden runs with 7--10 "
-           "clusters; baselines: mean over $k=7,\\dots,10$ (their own refinement for SpaGCN, none for STAGATE), on the same nuclei. Each block averages only the "
-           "slides that the named baseline has, so rows within a block are comparable and blocks are not. The smoothed reference and refined partitions are both "
-           "spatially smooth, which inflates their agreement.")
+    cap = ("Long summary: \\gls{ari} against the smoothed label-transfer reference (LTs) and SpaceRanger (SR) for the raw and majority-vote-"
+           "refined partitions, \\gls{nmi} for the refined ones, and silhouette in the clustered embedding. Ours: mean over Leiden runs with "
+           "7--10 clusters; baselines: mean over $k=7,\\dots,10$ (own refinement for SpaGCN, none for STAGATE), same nuclei. Each block averages "
+           "only the slides the named baseline has, so rows are comparable within a block, not across blocks. The smoothed reference and "
+           "refined partitions are both spatially smooth, which inflates their agreement.")
     mt.write(out, "10_tab_long_summary.tex", mt.table("lrrrrrrrr", hdr, rows, "Long summary of all evaluations.", cap,
                                                      "tab:10_long_summary", size=r"\scriptsize", resize=True))
 
@@ -394,8 +399,8 @@ def tab_smoothed_embedding(km_m, out, unit="nuclei", variant="svg"):
         return
     hdr = [r"\textcolor{rwthblau100}{\textbf{Embedding}} & \textcolor{rwthblau100}{\textbf{Hops}} & \multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{vs.\ LT}}} & "
            r"\textcolor{rwthblau100}{\textbf{vs.\ SR}} & \textcolor{rwthblau100}{\textbf{vs.\ annotation}} & \textcolor{rwthblau100}{\textbf{PAS}} \\",
-           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{\gls{ari}} & \textcolor{rwthblau100}{Hom.} & \textcolor{rwthblau100}{Compl.} & "
-           r"\textcolor{rwthblau100}{\gls{ari}} & \textcolor{rwthblau100}{\gls{ari}, \texttt{CRC\_P2}} & \\"]
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{ARI} & \textcolor{rwthblau100}{Hom.} & \textcolor{rwthblau100}{Compl.} & "
+           r"\textcolor{rwthblau100}{ARI} & \textcolor{rwthblau100}{ARI, \texttt{CRC\_P2}} & \\"]
     rows = []
     for e in embs:
         for hop in (0, 1, 2, 3):
@@ -408,13 +413,12 @@ def tab_smoothed_embedding(km_m, out, unit="nuclei", variant="svg"):
                 mt.macro(f"ResSmoothJointHop{['Zero','One','Two'][hop]}AriLt", mt.f3(vals[0]))
         rows.append(r"\midrule")
     rows = rows[:-1]
-    cap = ("Clustering the embedding after averaging it over the unit's spatial neighbours (hops = rounds of averaging; 0: no smoothing), "
-           f"{mt.cfg_label((unit, variant))}, mean over Leiden runs with 7--10 clusters and over the slides with the reference. LT: label transfer; "
-           "SR: SpaceRanger clusters; Hom./Compl.: homogeneity and completeness against LT. All depths are shown, none was chosen with a reference; "
-           "2 hops is the receptive field of the two-layer encoder. With more hops the number of clusters falls quickly, so the rows rest on few runs "
-           "(the evaluation script warns when fewer than two runs have 7--10 clusters).")
+    cap = ("Clustering the embedding after averaging it over spatial neighbours (hops = rounds of averaging; 0: none), "
+           f"{mt.cfg_label((unit, variant))}, mean over Leiden runs with 7--10 clusters and slides with the reference. LT: label transfer; "
+           "SR: SpaceRanger; Hom./Compl.: homogeneity and completeness against LT. All depths are shown, none chosen with a reference; 2 hops "
+           "is the receptive field of the two-layer encoder. More hops shrink the cluster count quickly, so later rows rest on fewer runs.")
     mt.write(out, "07_tab_smoothed_embedding.tex", mt.table("llrrrrrr", hdr, rows, "Clustering after spatial smoothing of the embedding.", cap,
-                                                            "tab:07_smoothed_embedding", size=r"\footnotesize"))
+                                                            "tab:07_smoothed_embedding"))
 
 
 def tab_homcomp(km_m, bo, out):
@@ -424,7 +428,7 @@ def tab_homcomp(km_m, bo, out):
     slides = matched_slides(bo, km_m)
     hdr = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{4}{c}{\textcolor{rwthblau100}{\textbf{vs.\ label transfer}}} & "
            r"\multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{vs.\ annotation (\texttt{CRC\_P2})}}} \\",
-           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["\\gls{ari}", "Hom.", "Compl.", "Purity", "\\gls{ari}", "Hom.", "Compl."]) + r" \\"]
+           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["ARI", "Hom.", "Compl.", "Purity", "ARI", "Hom.", "Compl."]) + r" \\"]
     rows = []
     for name in BASELINE_NAMES:
         if not (bo.method == name).any() or "hom_lt" not in bo.columns:
@@ -442,12 +446,12 @@ def tab_homcomp(km_m, bo, out):
             s_ = ours(km_m, "nuclei", "svg", emb, "raw", col)
             vals.append(mean_or_nan(s_[s_.index.isin(sl)]))
         rows.append([f"Ours, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals])
-    cap = ("\\gls{ari} together with homogeneity (does a cluster stay inside one reference class; nested sub-clusters score high), completeness (is a reference "
-           "class kept in one cluster; splitting a class scores low) and purity (share of units in the majority reference class of their cluster). "
-           "\\gls{ari} penalises splitting a class like merging two classes; the pair shows which of the two happens. Label-transfer columns: mean over the slides "
-           "shared by all methods (" + ", ".join(mt.tex(s) for s in slides) + "); annotation columns: \\texttt{CRC\\_P2} only, a single slide.")
+    cap = ("\\gls{ari} with homogeneity (cluster stays inside one reference class; nested sub-clusters score high), completeness (reference "
+           "class kept in one cluster; splitting scores low) and purity (share of units in a cluster's majority reference class). \\gls{ari} "
+           "penalises splitting a class like merging two; the pair shows which happens. Label-transfer columns: mean over the slides shared by "
+           "all methods (" + ", ".join(mt.tex(s) for s in slides) + "); annotation columns: \\texttt{CRC\\_P2} only.")
     mt.write(out, "07_tab_homogeneity_completeness.tex", mt.table("lrrrrrrr", hdr, rows, "ARI with homogeneity and completeness.", cap,
-                                                                 "tab:07_hom_comp", size=r"\footnotesize"))
+                                                                 "tab:07_hom_comp"))
 
 
 def run(mt_module, out, base):

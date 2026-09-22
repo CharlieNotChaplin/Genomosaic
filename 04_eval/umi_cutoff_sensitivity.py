@@ -45,10 +45,12 @@ FIXED_CUTOFF = 80
 SLIDES = ["CRC_P1", "CRC_P2", "CRC_P3_SMAP", "CRC_P4_SMAP", "CRC_P5", "Normal_P3", "Normal_P5",
           "CRC_P6_5mm", "CRC_P11mm", "CRC_P11mm_2_cut"]
 # The 11 mm frame of this slide holds three tissue samples; only the colorectal region is analysed (bin_preprocessing.py keeps
-# 438,578 of the 1,290,617 native 8um bins, 283,676 after the UMI filter). The raw aggregated file was built from the cropped
-# 2um data instead and holds 27,705 grid bins only -- far fewer than the region's bins, so it is not usable here.
-# Fix: re-run 01_preprocessing/transcriptomics/aggregate_grid_bin_UMI_count.py --samples CRC_P11mm_2_cut --force
-INCOMPLETE = {("bins", "CRC_P11mm_2_cut"): "grid_bin nuclei_grouped_UMI_count.h5ad holds only 27,705 rows for this slide (region: 438,578 bins)"}
+# 438,578 of the 1,290,617 native 8um bins, 283,676 after the UMI filter). This script's own raw-count loader instead falls
+# back to aggregating the cropped 2um matrix (aggregate_expression_to_grid, via native_grid_is_consistent's region check in
+# aggregate_grid_bin_UMI_count.py), which covers a genuinely smaller, already-cropped area and gives only 27,705 grid bins --
+# NOT a stale/incomplete file: re-running the aggregation reproduces the same 27,705, since both loaders are correct for the
+# region they cover. The two loaders would need to be reconciled to use the same region before this slide can be included.
+INCOMPLETE = {("bins", "CRC_P11mm_2_cut"): "grid_bin nuclei_grouped_UMI_count.h5ad covers a smaller region than the trained model uses (27,705 vs. 438,578 in-scope bins)"}
 DEFAULT_FIG = Path("/home/charlottewolf/Nextcloud/Arbeit UKA/MA/03_Ausarbeitung/thesis/figures/07_umi_cutoff_all_slides.png")
 
 

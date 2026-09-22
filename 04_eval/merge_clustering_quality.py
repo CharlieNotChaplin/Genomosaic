@@ -28,8 +28,9 @@ KEY = ["unit", "variant", "held_out_slide"]
 
 
 def replace_rows(old, new):
-    """`old` without the (unit, variant, slide) combinations present in `new`, plus `new`; columns follow `old`."""
-    new = new[[c for c in old.columns if c in new.columns]]
+    """`old` without the (unit, variant, slide) combinations present in `new`, plus `new`. Columns are the
+    union of both (not just `old`'s), so a `new` run that adds a column -- e.g. clustering_quality.csv
+    growing a "gt" reference_kind for CRC_P2 -- doesn't get that column silently dropped on merge."""
     hit = old.set_index(KEY).index.isin(new.set_index(KEY).index)
     return pd.concat([old[~hit], new], ignore_index=True), int(hit.sum())
 

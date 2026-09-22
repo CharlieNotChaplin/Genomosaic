@@ -195,6 +195,17 @@ def load_grid_reference(slide, label_col=LABEL_COL):
     return pd.read_parquet(path, columns=["pxl_col", "pxl_row", label_col])
 
 
+def ground_truth_reference(slide, xy):
+    """Pathologist annotation (dominant component per 8um grid cell) -- CRC_P2 only. Mirrors
+    evaluate_k_matched_ari.py's function of the same name (not imported from there: that module
+    imports this one, so importing back would be circular)."""
+    if slide != lt.REFERENCE_SAMPLE:
+        return None
+    g = lt.aggregate_bin_annotation_to_grid(slide, group_size=4)
+    g = g.assign(gt=lt.primary_tissuetype(g["annotation"]))
+    return lt.assign_nearest_grid_label(xy, g[["pxl_col", "pxl_row", "gt"]], label_col="gt")
+
+
 def cluster_embedding(z, resolution=LEIDEN_RESOLUTION, n_neighbors=15, seed=0):
     """Leiden community detection on a kNN graph built directly in embedding
     space (replaces a fixed-k method like KMeans -- Leiden finds its own
@@ -246,20 +257,31 @@ def evaluate_fold(unit, variant, slide, smoothing_modes=SMOOTHING_MODES, label_c
     Returns a list of row dicts (label_kind "raw" plus one per smoothing
     mode, x1 or x2 for reference_kind), or [] if this fold's embeddings or
     reference aren't available yet.
+
+    CRC_P2 has no label-transfer prediction (it is the classifier's own training slide), so for it
+    the reference falls back to the pathologist annotation instead (reference_kind "gt"; no "smoothed"
+    variant, since the annotation is not run through label-transfer smoothing). The row schema is
+    unchanged -- ari_vs_label_transfer/nmi_vs_label_transfer hold agreement with whatever
+    reference_kind names, so for "gt" rows they hold agreement with the annotation, not label transfer.
     """
     data = load_embeddings(unit, variant, slide)
     if data is None:
         return []
     grid_ref = load_grid_reference(slide, label_col)
-    if grid_ref is None:
-        return []
-
-    reference = lt.assign_nearest_grid_label(data["cell_xy"], grid_ref, label_col=label_col)
     conn = build_slide_graph(unit, data["cell_xy"])
 
-    reference_variants = {"raw": reference}
-    if smooth_reference:
-        reference_variants["smoothed"] = refine_domains(reference, conn, mode="hard")
+    reference_variants = {}
+    if grid_ref is not None:
+        reference = lt.assign_nearest_grid_label(data["cell_xy"], grid_ref, label_col=label_col)
+        reference_variants["raw"] = reference
+        if smooth_reference:
+            reference_variants["smoothed"] = refine_domains(reference, conn, mode="hard")
+    else:
+        gt = ground_truth_reference(slide, data["cell_xy"])
+        if gt is not None:
+            reference_variants["gt"] = gt
+    if not reference_variants:
+        return []
 
     rows = []
     for emb_name in EMBEDDINGS:
