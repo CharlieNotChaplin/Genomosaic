@@ -190,7 +190,7 @@ def tab_baseline_kmatched(km_m, bo, out):
     cap = ("Cluster-count-matched comparison with the spatial-domain baselines on the same slides ("
            + ", ".join(mt.tex(s) for s in slides) + "). Baselines and nucleus rows share the same nuclei; bin rows are scored on the bins of "
            "these slides and shown for orientation (the semantic-exclusion arm was only evaluated at the fixed resolution, "
-           "Table~\\ref{tab:07_clustering_ztrans}). Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$; "
+           "Table~\\ref{tab:10_clustering_all}, appendix). Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$; "
            "``ref.'': majority-vote refinement for ours, each method's own refinement (SpaGCN only) for baselines. LT: label transfer "
            "(histology-derived); SR: SpaceRanger clusters (expression-derived); neither is ground truth, and the two agree with each other "
            "only at \\gls{ari} $\\approx0.14$ (Table~\\ref{tab:07_reference_agreement}).")
@@ -233,7 +233,7 @@ def tab_ground_truth(km_m, bo, out):
                 row.append(mt.f3(float(s[slide])) if slide in s.index else "--")
         rows.append(row)
     rows.append(r"\midrule")
-    for cfg in CFGS_MAIN[:2] + CFGS_ALL[4:5]:
+    for cfg in CFGS_ALL:
         for emb in ("z_trans", "z_token", "z_joint"):
             row = [f"Ours: {mt.cfg_label(cfg)}, {mt.EMB_LABEL[emb]}"]
             got = False
@@ -249,8 +249,8 @@ def tab_ground_truth(km_m, bo, out):
     if len(rows) <= 4:
         return
     cap = ("The one slide with real ground truth: agreement with the pathologist annotation of \\texttt{CRC\\_P2} (six base tissue classes, "
-           "dominant component per $8\\,\\mu$m grid cell), for the held-out embedding and for the baselines, on the same nuclei. Ours: mean "
-           "over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so read small differences as noise.")
+           "dominant component per $8\\,\\mu$m grid cell), for the held-out embedding (nuclei and bins) and for the baselines (nuclei only). "
+           "Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so read small differences as noise.")
     mt.write(out, "07_tab_ground_truth_p2.tex", mt.table("lrrrr", hdr, rows, "Agreement with the pathologist annotation on CRC\\_P2.", cap,
                                                          "tab:07_ground_truth_p2"))
 
