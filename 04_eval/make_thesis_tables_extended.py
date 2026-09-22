@@ -98,28 +98,7 @@ def tab_ari_per_sample(km_m, bo, out, unit="nuclei", variant="svg", appendix=Fal
            "``--'': no reference for that slide. Low baseline values too point to the reference, not the embedding.")
     name = f"10_tab_ari_per_sample_{unit}_{variant}" if appendix else "07_tab_ari_per_sample"
     mt.write(out, name + ".tex", mt.table("l" + "r" * 8, hdr, rows, "Per-slide ARI.", cap,
-                                         "tab:" + name[:2] + "_ari_per_sample" + (f"_{unit}_{variant}" if appendix else ""),
-                                         size=r"\scriptsize", resize=True))
-
-
-def tab_ari_per_sample_embeddings(km_m, out, unit="nuclei", variant="svg"):
-    embs = ["z_trans", "z_token", "z_joint"]
-    hdr = [r"\textcolor{rwthblau100}{\textbf{Slide}} & " + " & ".join(
-        rf"\multicolumn{{2}}{{c}}{{\textcolor{{rwthblau100}}{{\textbf{{{mt.EMB_LABEL[e]}}}}}}}" for e in embs) + r" \\",
-           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["LT", "SR"] * 3) + r" \\"]
-    rows = []
-    for s in mt.SLIDES:
-        vals = []
-        for e in embs:
-            for col in ("ari_lt", "ari_sr"):
-                x = ours(km_m, unit, variant, e, "raw", col)
-                vals.append(float(x[s]) if s in x.index else np.nan)
-        rows.append([mt.tex(s)] + [mt.f3(v) for v in vals])
-    cap = ("\\gls{ari} of the raw Leiden partition (mean over runs with 7--10 clusters) of the transcriptomic, histology and concatenated "
-           f"embeddings ({mt.cfg_label((unit, variant))}) against label transfer (LT, derived from histology tokens, favouring "
-           "$\\mathbf{z}^{\\mathrm{token}}$) and SpaceRanger (SR, derived from expression).")
-    mt.write(out, "10_tab_ari_per_sample_embeddings.tex", mt.table("l" + "r" * 6, hdr, rows, "Per-slide ARI for the three embeddings.", cap,
-                                                                 "tab:10_ari_per_sample_embeddings"))
+                                         "tab:" + name[:2] + "_ari_per_sample" + (f"_{unit}_{variant}" if appendix else "")))
 
 
 # ---- baseline comparison on our nuclei -------------------------------------------------------------
@@ -146,7 +125,7 @@ def method_rows(km_m, bo, unit_cfgs, slides, emb="z_trans"):
             r[(col, "raw")] = m(ours(km_m, *cfg, emb, "raw", col))
             r[(col, "ref")] = m(ours(km_m, *cfg, emb, REFINED, col))
         r["n"] = len([s for s in slides if s in ours(km_m, *cfg, emb, "raw", "ari_lt").index])
-        rows.append((f"Ours: {mt.cfg_label(cfg)}", r if r["n"] else None))
+        rows.append((f"Genomosaic: {mt.cfg_label(cfg)}", r if r["n"] else None))
     return rows
 
 
@@ -180,7 +159,7 @@ def tab_baseline_kmatched(km_m, bo, out):
             rows.append([mt.tex(label), mt.pending()] + [""] * 6)
         else:
             rows.append([mt.tex(label)] + [mt.f3(r[(c, k)]) for c in ("ari_lt", "ari_sr", "nmi_sr") for k in ("raw", "ref")] + [str(r["n"])])
-            if label == "Ours: Nuclei, SVG":
+            if label == "Genomosaic: Nuclei, SVG":
                 for c, nm in (("ari_lt", "ResKmNucSvgAriLt"), ("ari_sr", "ResKmNucSvgAriSr"), ("nmi_sr", "ResKmNucSvgNmiSr")):
                     mt.macro(nm, mt.f3(r[(c, "raw")]))
                     mt.macro(nm + "Ref", mt.f3(r[(c, "ref")]))
@@ -196,24 +175,6 @@ def tab_baseline_kmatched(km_m, bo, out):
            "only at \\gls{ari} $\\approx0.14$ (Table~\\ref{tab:07_reference_agreement}).")
     mt.write(out, "07_tab_baseline_comparison_kmatched.tex",
              mt.table("lrrrrrrr", hdr, rows, "Cluster-count-matched baseline comparison.", cap, "tab:07_baseline_kmatched"))
-    # label-free metrics
-    hdr2 = [r"\textcolor{rwthblau100}{\textbf{Method}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{PAS} $\downarrow$}} & "
-            r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{CHAOS} $\downarrow$}} & \multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Silhouette}}} \\",
-            r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in ["raw", "ref."] * 3) + r" \\"]
-    rows2 = []
-    for label, r in method_rows(km_m, bo, CFGS_ALL, slides):
-        if r is None and label not in BASELINE_NAMES:
-            continue
-        if r is None:
-            rows2.append([mt.tex(label), mt.pending()] + [""] * 5)
-            continue
-        sil = [mt.f3(r.get(("silhouette", k), np.nan)) if label not in BASELINE_NAMES else "--" for k in ("raw", "ref")]
-        rows2.append([mt.tex(label)] + [mt.f3(r[(c, k)]) for c in ("pas", "chaos") for k in ("raw", "ref")] + sil)
-    cap2 = ("Label-free spatial metrics on the same slides as Table~\\ref{tab:07_baseline_kmatched} (bin rows on bins, others on nuclei). "
-            "PAS: share of units whose label differs from at least 6 of their 10 nearest spatial neighbours; CHAOS: mean distance to the "
-            "nearest unit of the same cluster (pixels). Both reward spatial smoothness without needing a reference, but cannot tell a correct "
-            "smooth partition from a wrong one. Silhouette is computed in the clustered embedding and does not exist for the baselines.")
-    mt.write(out, "07_tab_label_free.tex", mt.table("lrrrrrr", hdr2, rows2, "Label-free spatial metrics.", cap2, "tab:07_label_free"))
 
 
 def tab_ground_truth(km_m, bo, out):
@@ -235,7 +196,7 @@ def tab_ground_truth(km_m, bo, out):
     rows.append(r"\midrule")
     for cfg in CFGS_ALL:
         for emb in ("z_trans", "z_token", "z_joint"):
-            row = [f"Ours: {mt.cfg_label(cfg)}, {mt.EMB_LABEL[emb]}"]
+            row = [f"Genomosaic: {mt.cfg_label(cfg)}, {mt.EMB_LABEL[emb]}"]
             got = False
             for col in ("ari_gt", "nmi_gt"):
                 for part in ("raw", REFINED):
@@ -250,7 +211,7 @@ def tab_ground_truth(km_m, bo, out):
         return
     cap = ("The one slide with real ground truth: agreement with the pathologist annotation of \\texttt{CRC\\_P2} (six base tissue classes, "
            "dominant component per $8\\,\\mu$m grid cell), for the held-out embedding (nuclei and bins) and for the baselines (nuclei only). "
-           "Ours: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so read small differences as noise.")
+           "Genomosaic: mean over Leiden runs with 7--10 clusters; baselines: mean over $k=7,\\dots,10$. A single slide, so read small differences as noise.")
     mt.write(out, "07_tab_ground_truth_p2.tex", mt.table("lrrrr", hdr, rows, "Agreement with the pathologist annotation on CRC\\_P2.", cap,
                                                          "tab:07_ground_truth_p2"))
 
@@ -324,7 +285,7 @@ def tab_disease_weighted(dw, out):
            "slide against eight tumor slides when a normal slide is held out). Values: fraction of the held-out slide's units classified as "
            "its true class (tumor: mean over folds); units are subsampled per slide, and the normal columns are single-slide observations.")
     mt.write(out, "07_tab_disease_signal_weighted.tex", mt.table("llrrrrrr", hdr, rows, "Disease signal with and without class weighting.", cap,
-                                                                "tab:07_disease_weighted", resize=True))
+                                                                "tab:07_disease_weighted"))
 
 
 def tab_celltypist(ct, out):
@@ -374,7 +335,7 @@ def tab_long_summary(km_m, bo, out):
                 n = len([s for s in slides if s in ours(km_m, *cfg, emb, "raw", "ari_sr").index])
                 if not n:
                     continue
-                rows.append([f"Ours: {mt.cfg_label(cfg)}, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals] + [mt.f3(mean_or_nan(sil[sil.index.isin(slides)])), str(n)])
+                rows.append([f"Genomosaic: {mt.cfg_label(cfg)}, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals] + [mt.f3(mean_or_nan(sil[sil.index.isin(slides)])), str(n)])
         if bname is not None and bo is not None:
             vals = []
             for col, kind in (("ari_lts", "pred"), ("ari_lts", "refined_pred"), ("ari_sr", "pred"), ("ari_sr", "refined_pred"), ("nmi_lts", "refined_pred"), ("nmi_sr", "refined_pred")):
@@ -389,7 +350,7 @@ def tab_long_summary(km_m, bo, out):
            "only the slides the named baseline has, so rows are comparable within a block, not across blocks. The smoothed reference and "
            "refined partitions are both spatially smooth, which inflates their agreement.")
     mt.write(out, "10_tab_long_summary.tex", mt.table("lrrrrrrrr", hdr, rows, "Long summary of all evaluations.", cap,
-                                                     "tab:10_long_summary", size=r"\scriptsize", resize=True))
+                                                     "tab:10_long_summary"))
 
 
 def tab_smoothed_embedding(km_m, out, unit="nuclei", variant="svg"):
@@ -445,7 +406,7 @@ def tab_homcomp(km_m, bo, out):
         for col, sl in (("ari_lt", slides), ("hom_lt", slides), ("com_lt", slides), ("pur_lt", slides), ("ari_gt", ["CRC_P2"]), ("hom_gt", ["CRC_P2"]), ("com_gt", ["CRC_P2"])):
             s_ = ours(km_m, "nuclei", "svg", emb, "raw", col)
             vals.append(mean_or_nan(s_[s_.index.isin(sl)]))
-        rows.append([f"Ours, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals])
+        rows.append([f"Genomosaic, {mt.EMB_LABEL[emb]}"] + [mt.f3(v) for v in vals])
     cap = ("\\gls{ari} with homogeneity (cluster stays inside one reference class; nested sub-clusters score high), completeness (reference "
            "class kept in one cluster; splitting scores low) and purity (share of units in a cluster's majority reference class). \\gls{ari} "
            "penalises splitting a class like merging two; the pair shows which happens. Label-transfer columns: mean over the slides shared by "
@@ -467,7 +428,6 @@ def run(mt_module, out, base):
     ct = load(base, "final_loso_cluster_annotation_celltypist.csv")
     for step in (lambda: tab_ari_per_sample(km_m, bo, out),
                  lambda: [tab_ari_per_sample(km_m, bo, out, u, v, appendix=True) for u, v in CFGS_MAIN[1:]],
-                 lambda: tab_ari_per_sample_embeddings(km_m, out),
                  lambda: tab_baseline_kmatched(km_m, bo, out),
                  lambda: tab_ground_truth(km_m, bo, out),
                  lambda: tab_ari_vs_k(km, out),

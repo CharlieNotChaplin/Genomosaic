@@ -1,0 +1,11 @@
+/beegfs/home/cwolf/miniconda3/envs/autoencoder/share/bash-completion/completions/gdalinfo: line 52: syntax error near unexpected token `<'
+/beegfs/home/cwolf/miniconda3/envs/autoencoder/share/bash-completion/completions/gdalinfo: line 52: `      mapfile -t COMPREPLY < <(compgen -W "$choices" --)'
+[34mINFO    [0m Creating graph using `[3;35mNone[0m` transform and `[1;36m1[0m` libraries.               
+  no label-transfer grid predictions for CRC_P2 (/beegfs/home/cwolf/Projects/Genomosaic/data/CRC_P2/02_baselines/label_transfer/CRC_P2_grid_predictions.parquet)
+CRC_P2: n=444991, references ['gt', 'sr'], sr_source=native, k-means K=[7, 8, 9, 10]
+  WARNING bins/svg/CRC_P2/z_trans_s2: only 1 Leiden run(s) with 7-10 clusters
+  WARNING bins/svg/CRC_P2/z_trans_s3: only 0 Leiden run(s) with 7-10 clusters
+  WARNING bins/svg/CRC_P2/z_joint_s3: only 0 Leiden run(s) with 7-10 clusters
+  bins/svg/CRC_P2: 248 rows (8481s)
+  bins/colon_xenium_panel/CRC_P2: 84 rows (3255s)
+  bins/svg_semantic_excl_raw_0.2/CRC_P2: 84 rows (3584s)

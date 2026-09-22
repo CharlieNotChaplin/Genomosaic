@@ -49,6 +49,18 @@ MAIN_CONFIGS = [("nuclei", "svg"), ("nuclei", "colon_xenium_panel"), ("bins", "s
 ARM_CONFIGS = [("nuclei", "svg_semantic_excl_raw_0.2"), ("bins", "svg_semantic_excl_raw_0.2")]
 ALL_CONFIGS = MAIN_CONFIGS + ARM_CONFIGS
 LABEL = {"svg": "SVG", "colon_xenium_panel": "Xenium panel", "svg_semantic_excl_raw_0.2": "SVG + semantic excl."}
+# short forms for tables where cfg_label()'s full text (up to "Bins, SVG + semantic excl.") is what pushes the
+# table past \textwidth; the caption/prose elsewhere always uses the long form, only these dense tables abbreviate.
+UNIT_SHORT = {"nuclei": "Nuc", "bins": "Bin"}
+LABEL_SHORT = {"svg": "SVG", "colon_xenium_panel": "Xenium", "svg_semantic_excl_raw_0.2": "SVG+excl."}
+CELLTYPE_SHORT = {  # display-only abbreviations for the widest assigned_cell_type strings; data itself is untouched
+    "Epithelial (general)": "Epithelial (gen.)", "Myeloid / Macrophage": "Myeloid/Macro.",
+    "Fibroblast / Stromal": "Fibroblast/Stromal", "Colonocyte / Enterocyte": "Colonocyte/Entero.",
+}
+
+
+def cfg_label_short(cfg):
+    return f"{UNIT_SHORT[cfg[0]]}, {LABEL_SHORT[cfg[1]]}"
 
 BASELINES = {  # name -> outputs CSV; STAGATE / SpatialFusion appear as "pending" until their CSV exists
     "SpaGCN": REPO_ROOT / "02_baselines/spagcn/outputs/spagcn_clustering_quality.csv",
@@ -82,7 +94,7 @@ def head(cells):
     return " & ".join(rf"\textcolor{{rwthblau100}}{{\textbf{{{c}}}}}" for c in cells) + r" \\"
 
 
-def table(colspec, header_rows, rows, caption_short, caption, label, size=r"\scriptsize", resize=False):
+def table(colspec, header_rows, rows, caption_short, caption, label, size=r"\footnotesize", resize=False):
     """rows: list of cell lists; a row may be the string "\\midrule" for a separator."""
     out = [r"\begin{table}[htbp]", r"    \centering", f"    {size}"]
     if resize:
@@ -190,8 +202,12 @@ def tab_retrieval(ret, out):
 
 
 def tab_summary(ret, disease, out):
-    hdr = [head(["Configuration", "Folds", r"Held-out $\text{top1}_{\text{cluster}}$", "Held-out exact top-1",
-                 r"In-sample $\text{top1}_{\text{cluster}}$", "Slide\\_ID leakage"])]
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Configuration}} & \textcolor{rwthblau100}{\textbf{Folds}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Held-out}}} & \textcolor{rwthblau100}{\textbf{In-sample}} & "
+           r"\textcolor{rwthblau100}{\textbf{Slide\_ID}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & "
+           r"\textcolor{rwthblau100}{$\text{top1}_{\text{cl}}$} & \textcolor{rwthblau100}{exact top-1} & "
+           r"\textcolor{rwthblau100}{$\text{top1}_{\text{cl}}$} & \textcolor{rwthblau100}{leakage} \\"]
     stats = {}
     for cfg in ALL_CONFIGS:
         v = ret[(ret.unit == cfg[0]) & (ret.variant == cfg[1])]
@@ -205,9 +221,9 @@ def tab_summary(ret, disease, out):
     for cfg in ALL_CONFIGS:
         st = stats[cfg]
         if not st:
-            rows.append([cfg_label(cfg), "0", pending(), "", "", ""])
+            rows.append([cfg_label_short(cfg), "0", pending(), "", "", ""])
             continue
-        rows.append([cfg_label(cfg), f"{st['n']}", fc[cfg], fe[cfg], f3(st["t"]), fl[cfg]])
+        rows.append([cfg_label_short(cfg), f"{st['n']}", fc[cfg], fe[cfg], f3(st["t"]), fl[cfg]])
         key = {"nuclei": "Nuc", "bins": "Bin"}[cfg[0]] + {"svg": "Svg", "colon_xenium_panel": "Panel",
                                                           "svg_semantic_excl_raw_0.2": "Sem"}[cfg[1]]
         macro(f"Res{key}ClusterTop", f3(st["c"]))
@@ -217,11 +233,12 @@ def tab_summary(ret, disease, out):
         macro(f"Res{key}Folds", str(st["n"]))
     chance = ret.leak_chance.dropna().iloc[0] if len(ret) else float("nan")
     cap = ("Summary of the final \\gls{loso} runs, mean over finished folds; the best value per column is bold (retrieval and leakage "
-           "only; in-sample fit is not a quality measure). $\\text{top1}_{\\text{cluster}}$ is the primary retrieval metric. Slide\\_ID "
+           "only; in-sample fit is not a quality measure). Nuc/Bin: nuclei/bins; excl.: semantic exclusion. "
+           "$\\text{top1}_{\\text{cl}}$ is the primary retrieval metric. Slide\\_ID "
            f"leakage is held-out-vs-train linear-probe accuracy on the token embedding (chance $\\approx {chance:.2f}$, lower is better). "
            "Not directly comparable between units. " + coverage_note(ret))
     write(out, "07_tab_final_summary.tex",
-          table("lrrrrr", hdr, rows, "Summary of the final LOSO runs.", cap, "tab:07_final_summary", resize=True))
+          table("lrrrrr", hdr, rows, "Summary of the final LOSO runs.", cap, "tab:07_final_summary"))
 
 
 def paired_macros(ret):
@@ -239,8 +256,10 @@ def paired_macros(ret):
 
 
 def tab_semantic_arm(ret, out):
-    hdr = [head(["Held-out slide", r"Nuclei SVG", r"Nuclei SVG + sem.\ excl.", r"$\Delta$",
-                 "Bins SVG", r"Bins SVG + sem.\ excl.", r"$\Delta$"])]
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Held-out slide}} & \multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{Nuclei}}} & "
+           r"\multicolumn{3}{c}{\textcolor{rwthblau100}{\textbf{Bins}}} \\",
+           r"\textcolor{rwthblau100}{} & " + " & ".join(rf"\textcolor{{rwthblau100}}{{{m}}}" for m in
+                                                        [r"SVG", r"+ sem.\ excl.", r"$\Delta$"] * 2) + r" \\"]
     rows = []
     for s in SLIDES:
         row = [tex(s)]
@@ -272,7 +291,7 @@ def tab_semantic_arm(ret, out):
            "$\\text{top1}_{\\text{cluster}}$ per fold. The mean is over folds where both runs exist. "
            + coverage_note(ret))
     write(out, "07_tab_semantic_arm.tex",
-          table("lrrrrrr", hdr, rows, "Semantic-exclusion comparison arm.", cap, "tab:07_semantic_arm", resize=True))
+          table("lrrrrrr", hdr, rows, "Semantic-exclusion comparison arm.", cap, "tab:07_semantic_arm"))
 
 
 def load_quality():
@@ -366,8 +385,7 @@ def tab_smoothing(q, out, ref_kind="raw", name="07_tab_smoothing_effect", label=
     cap = (f"Effect of spatial refinement (\\texttt{{refine\\_domains}}: none, majority vote, SpaGCN rule) on the Leiden partition of "
            f"{'the transcriptomic embedding' if len(embs) == 1 else 'the embeddings'}, against the {what} label-transfer reference. "
            "Mean over folds with a reference. " + coverage_note(d.assign(slide=d.slide)))
-    write(out, f"{name}.tex", table("l" + "r" * 9, hdr, rows, "Effect of spatial refinement.", cap, label,
-                                   size=r"\scriptsize", resize=True))
+    write(out, f"{name}.tex", table("l" + "r" * 9, hdr, rows, "Effect of spatial refinement.", cap, label))
 
 
 def load_baseline(name):
@@ -440,9 +458,9 @@ def tab_baselines(q, out):
     for cfg in ALL_CONFIGS:
         v = sub[(sub.unit == cfg[0]) & (sub.variant == cfg[1])]
         if not len(v):
-            rows.append([f"Ours: {cfg_label(cfg)}", pending()] + [""] * 6)
+            rows.append([f"Genomosaic: {cfg_label(cfg)}", pending()] + [""] * 6)
             continue
-        row = [f"Ours: {cfg_label(cfg)}"]
+        row = [f"Genomosaic: {cfg_label(cfg)}"]
         for metric in ["ari_vs_label_transfer", "nmi_vs_label_transfer"]:
             row += [f3(v[v.label_kind == "raw"][metric].mean()), f3(v[v.label_kind == "hard"][metric].mean()),
                     f3(v[v.label_kind == "spagcn"][metric].mean())]
@@ -497,15 +515,19 @@ def tab_expression(out):
 
 def tab_disease(out):
     d = pd.read_csv(BASE / "final_loso_disease_signal.csv")
-    hdr = [head(["Configuration", "Folds", "Train LOSO acc.", "Train LOSO F1", "Tumor slides", "Normal\\_P3", "Normal\\_P5"])]
+    hdr = [r"\textcolor{rwthblau100}{\textbf{Configuration}} & \textcolor{rwthblau100}{\textbf{Folds}} & "
+           r"\multicolumn{2}{c}{\textcolor{rwthblau100}{\textbf{Train LOSO}}} & \textcolor{rwthblau100}{\textbf{Tumor}} & "
+           r"\textcolor{rwthblau100}{\textbf{Normal\_P3}} & \textcolor{rwthblau100}{\textbf{Normal\_P5}} \\",
+           r"\textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{Acc.} & \textcolor{rwthblau100}{F1} & "
+           r"\textcolor{rwthblau100}{slides} & \textcolor{rwthblau100}{} & \textcolor{rwthblau100}{} \\"]
     rows = []
     for cfg in ALL_CONFIGS:
         v = d[(d.unit == cfg[0]) & (d.variant == cfg[1])]
         if not len(v):
-            rows.append([cfg_label(cfg), "0", pending(), "", "", "", ""])
+            rows.append([cfg_label_short(cfg), "0", pending(), "", "", "", ""])
             continue
         tumor = v[v.held_out_true_label == 1]
-        row = [cfg_label(cfg), str(len(v)), f3(v.train_loso_acc.mean()), f3(v.train_loso_f1.mean()), f3(tumor.held_out_acc.mean())]
+        row = [cfg_label_short(cfg), str(len(v)), f3(v.train_loso_acc.mean()), f3(v.train_loso_f1.mean()), f3(tumor.held_out_acc.mean())]
         for s in NORMAL_SLIDES:
             x = v[v.held_out_slide == s]
             row.append(f3(x.held_out_acc.iloc[0]) if len(x) else "--")
@@ -517,13 +539,14 @@ def tab_disease(out):
             x = v[v.held_out_slide == s]
             if len(x):
                 macro(f"Res{key}Disease{'NormalThree' if s == 'Normal_P3' else 'NormalFive'}", f3(x.held_out_acc.iloc[0]))
-    cap = ("Tumor-versus-normal signal in the frozen $\\mathbf{z}^{\\mathrm{trans}}$ (logistic regression). Train \\gls{loso}: "
+    cap = ("Tumor-versus-normal signal in the frozen $\\mathbf{z}^{\\mathrm{trans}}$ (logistic regression). Nuc/Bin: nuclei/bins; "
+           "excl.: semantic exclusion. Train \\gls{loso}: "
            "leave-one-training-slide-out accuracy and macro F1. Held-out columns: fraction of the held-out slide's units classified as "
            "its true class -- mean over tumor folds, and the two normal slides individually (single slides, so read differences of a "
            "few hundredths as noise; macro F1 is capped near 0.5 here since each left-out training slide has only one class). "
            + coverage_note(d.rename(columns={"held_out_slide": "slide"})))
     write(out, "07_tab_disease_signal.tex",
-          table("lrrrrrr", hdr, rows, "Disease signal in the embeddings.", cap, "tab:07_disease_signal", resize=True))
+          table("lrrrrrr", hdr, rows, "Disease signal in the embeddings.", cap, "tab:07_disease_signal"))
 
 
 def tab_annotation(out):
@@ -540,14 +563,14 @@ def tab_annotation(out):
     # two header rows (unit, then variant) instead of one wide "Nuclei, SVG + semantic excl."-style column
     # header per config -- with up to 6 config columns and only 1-2-digit percentages in the body, a single
     # combined header row was what pushed this table off the page width.
-    hdr = [head(["Assigned cell type"] + [c[0].capitalize() for c in cfgs]),
-           head([""] + [LABEL[c[1]] for c in cfgs])]
-    rows = [[tex(t)] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in order]
+    hdr = [head(["Assigned cell type"] + [UNIT_SHORT[c[0]] for c in cfgs]),
+           head([""] + [LABEL_SHORT[c[1]] for c in cfgs])]
+    rows = [[CELLTYPE_SHORT.get(t, tex(t))] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in order]
     rows.append(r"\midrule")
     rows.append(["Folds"] + [str(d[(d.unit == c[0]) & (d.variant == c[1])].held_out_slide.nunique()) for c in cfgs])
     cap = ("Share (\\%) of units whose Leiden cluster is assigned to each canonical marker-set cell type, per held-out slide then "
            "averaged. Assignment is the arg-max of the mean marker-set score per cluster (hand-curated marker list) -- a coarse sanity "
-           "check, not a validated cell-type call.")
+           "check, not a validated cell-type call. Nuc/Bin: nuclei/bins; excl.: semantic exclusion.")
     write(out, "07_tab_cluster_annotation.tex",
           table("l" + "r" * len(cfgs), hdr, rows, "Marker-based cluster annotation.", cap, "tab:07_cluster_annotation"))
 
@@ -589,7 +612,7 @@ def tab_umi_cutoff(out):
            "$^{\\mathrm{a}}$Its pre-filter bin count covers a smaller region than the trained model uses (Section~\\ref{sect:07_exp_umi}), "
            "so \\texttt{CRC\\_P11mm\\_2\\_cut} is omitted here.")
     write(out, "07_tab_umi_cutoff_sensitivity.tex",
-          table("llrrrrrrr", hdr, rows, "UMI-cutoff sensitivity per slide and unit.", cap, "tab:07_umi_cutoff_sensitivity", resize=True))
+          table("llrrrrrrr", hdr, rows, "UMI-cutoff sensitivity per slide and unit.", cap, "tab:07_umi_cutoff_sensitivity"))
 
 
 def tab_reference_agreement(out):

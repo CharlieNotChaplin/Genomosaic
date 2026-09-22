@@ -451,7 +451,7 @@ def run_section_8(args):
 
 def dot_size(n_units):
     """Marker area that shrinks with the number of plotted units, so dense slides do not merge into blobs."""
-    return float(np.clip(60_000 / n_units, 0.05, 1.0))
+    return float(np.clip(60_000 / n_units, 0.05, 1.0)) * (2 / 3)
 
 
 def plot_cluster_panel(ax, cell_xy, labels, title):
@@ -461,7 +461,7 @@ def plot_cluster_panel(ax, cell_xy, labels, title):
     ax.set_aspect("equal")
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title(f"{title}\n(n={len(np.unique(labels))} clusters)", fontsize=9)
+    ax.set_title(f"{title}\n(n={len(np.unique(labels))} clusters)", fontsize=13)
 
 
 def run_section_9(args):
@@ -490,13 +490,11 @@ def run_section_9(args):
             plot_cluster_panel(axes[0, col], cell_xy, raw, f"{unit} / {variant}")
             plot_cluster_panel(axes[1, col], cell_xy, smoothed, f"{unit} / {variant} (smoothed)")
 
-        axes[0, 0].set_ylabel("before smoothing", fontsize=11)
-        axes[1, 0].set_ylabel(f"after smoothing ({args.smoothing_mode})", fontsize=11)
-        fig.suptitle(f"{slide}: Leiden clustering on z_trans, before vs. after spatial smoothing "
-                     f"({args.smoothing_mode} mode)", fontsize=13)
-        plt.tight_layout()
-        out_path = args.output_dir / f"final_loso_spatial_clusters_{slide}.png"
-        plt.savefig(out_path, dpi=150)
+        axes[0, 0].set_ylabel("before smoothing", fontsize=15)
+        axes[1, 0].set_ylabel(f"after smoothing ({args.smoothing_mode})", fontsize=15)
+        plt.tight_layout(h_pad=3.0, w_pad=1.5)
+        out_path = args.output_dir / f"final_loso_spatial_clusters_{slide}.pdf"
+        plt.savefig(out_path, dpi=300)
         plt.close(fig)
         log(f"[9] saved {out_path}")
 
