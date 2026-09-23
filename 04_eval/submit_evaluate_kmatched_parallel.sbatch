@@ -45,6 +45,14 @@ conda activate autoencoder
 # "OSError: ... CXXABI_1.3.15 not found" crash at `import scanpy`. Force the env's own copy first.
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:$LD_LIBRARY_PATH"
 
+# numba (a scanpy dependency) decorates a function with @njit(cache=True) at import time and
+# tries to write its compile cache next to the source file in site-packages -- which lives on
+# beegfs, a network filesystem numba's cache locator can't handle, crashing `import scanpy`
+# immediately with "RuntimeError: cannot cache function ...: no locator available". Point the
+# cache at node-local storage instead.
+export NUMBA_CACHE_DIR="/tmp/numba_cache_${SLURM_JOB_ID:-$$}"
+mkdir -p "$NUMBA_CACHE_DIR"
+
 cd "$SLURM_SUBMIT_DIR"
 mkdir -p logs
 
