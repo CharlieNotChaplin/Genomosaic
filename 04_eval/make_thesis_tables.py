@@ -284,6 +284,16 @@ def tab_semantic_arm(ret, out):
                 macro("ResSemDeltaNuc", f"{(b[common] - a[common]).mean():+.3f}")
                 macro("ResSemPosNuc", str(int(((b[common] - a[common]) > 0).sum())))
                 macro("ResSemNNuc", str(len(common)))
+            else:
+                delta = b[common] - a[common]
+                macro("ResSemDeltaBin", f"{delta.mean():+.3f}")
+                macro("ResSemPosBin", str(int((delta > 0).sum())))
+                macro("ResSemNBin", str(len(common)))
+                if "CRC_P11mm" in common:
+                    macro("ResSemDeltaBinPEleven", f"{delta['CRC_P11mm']:+.3f}")
+                    rest = delta.drop("CRC_P11mm")
+                    macro("ResSemDeltaBinRest", f"{rest.mean():+.3f}")
+                    macro("ResSemNBinRest", str(len(rest)))
         else:
             mrow += [pending(), "", ""]
     rows.append(mrow)
