@@ -289,6 +289,8 @@ def tab_disease_weighted(dw, out):
 
 
 def tab_celltypist(ct, out):
+    """Atlas-based alternative to make_thesis_tables.py's tab_annotation(): CellTypist's gut-atlas model
+    (Elmentaite et al., Cells_Intestinal_Tract.pkl) instead of the hand-curated marker list."""
     if ct is None or not len(ct):
         return
     cfgs = [c for c in CFGS_ALL if len(ct[(ct.unit == c[0]) & (ct.variant == c[1])])]
@@ -297,12 +299,25 @@ def tab_celltypist(ct, out):
         v = ct[(ct.unit == cfg[0]) & (ct.variant == cfg[1])]
         per = v.groupby(["held_out_slide", "assigned_cell_type"]).n_cells_annotated.sum().unstack(fill_value=0)
         shares[cfg] = (per.div(per.sum(axis=1), axis=0).mean(axis=0) * 100)
-    types = sorted({t for s in shares.values() for t in s.index}, key=lambda t: -np.mean([shares[c].get(t, 0.0) for c in cfgs]))[:15]
-    hdr = [mt.head(["Assigned cell type (CellTypist)"] + [mt.cfg_label(c) for c in cfgs])]
-    rows = [[mt.tex(t)] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in types]
-    cap = ("Share (\\%) of units in clusters that CellTypist (majority vote over our Leiden clusters) assigns to each cell type, per slide, then averaged "
-           "over slides; the 15 most frequent types. Predictions on sparse nucleus-level counts are noisy; this complements, and does not replace, the marker-based annotation.")
-    mt.write(out, "07_tab_cluster_annotation_celltypist.tex", mt.table("l" + "r" * len(cfgs), hdr, rows, "CellTypist annotation.", cap,
+    all_types = sorted({t for s in shares.values() for t in s.index}, key=lambda t: -np.mean([shares[c].get(t, 0.0) for c in cfgs]))
+    top, rest = all_types[:12], all_types[12:]
+    # two header rows (unit, then variant), not one wide "Nuclei, SVG + semantic excl."-style column header --
+    # see make_thesis_tables.py's tab_annotation() for why a single combined header pushes this off the page.
+    hdr = [mt.head(["Assigned cell type (CellTypist)"] + [mt.UNIT_SHORT[c[0]] for c in cfgs]),
+           mt.head([""] + [mt.LABEL_SHORT[c[1]] for c in cfgs])]
+    rows = [[mt.tex(t)] + [f"{shares[c].get(t, 0.0):.1f}" for c in cfgs] for t in top]
+    if rest:
+        rows.append([f"Other ({len(rest)} types)"] + [f"{sum(shares[c].get(t, 0.0) for t in rest):.1f}" for c in cfgs])
+    rows.append(r"\midrule")
+    rows.append(["Folds"] + [str(ct[(ct.unit == c[0]) & (ct.variant == c[1])].held_out_slide.nunique()) for c in cfgs])
+    cap = ("Share (\\%) of units whose Leiden cluster is assigned to each cell type by CellTypist's gut-atlas model "
+           "(Cells\\_Intestinal\\_Tract.pkl, Elmentaite et al.), majority vote per cluster, per held-out slide then "
+           f"averaged; the {len(rest)} rarest types are pooled into ``Other''. A stronger alternative to the "
+           "hand-curated marker list of Table~\\ref{tab:07_cluster_annotation}, but trained on droplet single-cell "
+           "data rather than this platform, so its label vocabulary is not directly comparable to the marker list's. "
+           "Nuc/Bin: nuclei/bins; excl.: semantic exclusion.")
+    mt.write(out, "07_tab_cluster_annotation_celltypist.tex", mt.table("l" + "r" * len(cfgs), hdr, rows,
+                                                                      "Atlas-based cluster annotation (CellTypist).", cap,
                                                                       "tab:07_celltypist"))
 
 

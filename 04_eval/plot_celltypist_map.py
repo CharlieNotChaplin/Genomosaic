@@ -25,11 +25,18 @@ import evaluate_clustering_quality as ecq
 
 
 def dot_size(n_units):
-    """Marker area that shrinks with the number of plotted units -- identical to
-    evaluate_final_loso_7_9.py's own dot_size(), duplicated here rather than imported so this
-    script does not pay for that module's heavy top-level imports (torch, etc.) just for one
-    two-line helper."""
-    return float(np.clip(60_000 / n_units, 0.05, 1.0)) * (2 / 3)
+    """Marker area that shrinks with the number of plotted units. Same density-based formula as
+    evaluate_final_loso_7_9.py's own dot_size(), but *without* that function's extra 2/3 shrink and
+    with a further 5x on top: that formula was tuned for an 8-panel grid (each panel a fraction of
+    a 20x10in figure), where the same tissue is rendered much smaller and points overlap enough on
+    screen to look solid. This script draws one full-size panel (the *same* tissue, much bigger
+    canvas), so the identical marker area is stretched over ~15-20x the rendered space and ends up
+    a sub-pixel shape (~1.4px diameter at dpi=300) -- matplotlib's Agg backend then anti-aliases
+    each marker as a partial-coverage blend with the white background, which reads as pale even
+    though every point is drawn at full colour and full opacity. Confirmed by direct render tests at
+    the original size (washed out), 4x and 8x area (progressively solid); 5x is a middle point that
+    keeps individual clusters/gaps visible rather than blobbing into solid regions."""
+    return float(np.clip(60_000 / n_units, 0.05, 1.0)) * 5
 
 
 def main():
@@ -75,7 +82,7 @@ def main():
 
     fig, ax = plt.subplots(figsize=(9, 8))
     ax.scatter(cell_xy[:, 0], cell_xy[:, 1], c=codes, cmap=cmap, norm=norm,
-               s=dot_size(len(cell_xy)), linewidths=0, rasterized=True)
+               s=dot_size(len(cell_xy)), linewidths=0, rasterized=True, antialiased=False)
     ax.invert_yaxis()
     ax.set_aspect("equal")
     ax.set_xticks([])
