@@ -28,8 +28,8 @@ Output (--output-dir): final_loso_disease_signal_ground_truth.csv, one row per (
 class_weight). Folds already in the file are skipped (--overwrite to redo).
 
 Usage (from 04_eval/; CPU only):
-    python -u evaluate_disease_signal_ground_truth.py
-    python -u evaluate_disease_signal_ground_truth.py --units nuclei --variants svg --embeddings z_trans
+    python -u scripts/evaluate_disease_signal_ground_truth.py
+    python -u scripts/evaluate_disease_signal_ground_truth.py --units nuclei --variants svg --embeddings z_trans
 """
 
 import argparse
