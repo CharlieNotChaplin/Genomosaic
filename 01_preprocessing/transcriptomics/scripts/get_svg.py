@@ -1,24 +1,13 @@
-import anndata
 import gc
 import geopandas as gpd
-import math
-import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 from pathlib import Path
-import pickle
-import scanpy as sc
 import squidpy as sq
 import sys
 
-from csbdeep.utils import normalize
-from matplotlib.colors import ListedColormap
-from scipy import sparse
-from shapely.geometry import Polygon, Point
-from stardist.models import StarDist2D
-from tifffile import imread, imwrite
-
-sys.path.insert(0, str(Path("../..").resolve()))
+# repo root = first parent containing functions/ and data/
+REPO_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "functions").is_dir() and (p / "data").is_dir())
+sys.path.insert(0, str(REPO_ROOT))
 from functions.merge import read_h5ad_with_null_uns_healing, sanitize_uns
 
 
@@ -53,7 +42,7 @@ else:
 print("Working on sample ", sample, f"(unit={args.unit})")
 
 # Directories
-basedir = Path("../../data")
+basedir = REPO_ROOT / "data"
 dir_base_input = basedir / sample / "input" 
 dir_base_output = basedir / sample / f"output/binned_outputs/square_{bin_size}"
 dir_result_output = basedir / sample / "01_preprocessing" / dir_cellseg / bin_size
