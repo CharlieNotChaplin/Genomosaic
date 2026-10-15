@@ -1,8 +1,8 @@
 """
 Building blocks for training the dual autoencoder on all slides.
 
-Used by ``03_integration/autoencoders/train_autoencoder.ipynb`` and by the leave-one-slide-out
-script ``03_integration/autoencoders/scripts/run_loso.py``. All settings live in one JSON file
+Used by ``03_integration/train_autoencoder.ipynb`` and by the leave-one-slide-out
+script ``03_integration/scripts/run_loso.py``. All settings live in one JSON file
 (``CONFIG_PATH``); the key names are the ones ``functions.dual_autoencoder`` reads.
 
 Typical order:
@@ -40,7 +40,7 @@ from functions.dual_autoencoder import (
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = next((d / "data" for d in (REPO_ROOT, *REPO_ROOT.parents) if (d / "data").is_dir()), REPO_ROOT / "data")
-CONFIG_PATH = REPO_ROOT / "03_integration/autoencoders/config/training_config.json"
+CONFIG_PATH = REPO_ROOT / "03_integration/config/training_config.json"
 TUPLE_KEYS = ("num_neighbors",)
 
 UNIT_PRESETS = {

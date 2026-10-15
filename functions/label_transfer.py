@@ -64,12 +64,12 @@ EXCLUDE_DIRS = {"new", "CRC_P_Mixed", "combined", REFERENCE_SAMPLE}
 SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_002um"
 GRID_SPATIAL_DIR_TEMPLATE = "{}/output/binned_outputs/square_008um"
 TOKEN_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/WSI_patch_token_embeddings_filtered.h5ad"
-# Matches 03_integration/autoencoders/scripts/token_preprocessing.py's own TOKEN_SIZE_PX --
+# Matches 03_integration/scripts/token_preprocessing.py's own TOKEN_SIZE_PX --
 # both read the same file above, where obs/Token_X, obs/Token_Y are each raw ViT token's
 # top-left pixel corner (not its center), so a token's own box is
 # [Token_X, Token_X+TOKEN_SIZE_PX) x [Token_Y, Token_Y+TOKEN_SIZE_PX).
 TOKEN_SIZE_PX = 14.0
-# Matches 03_integration/autoencoders/scripts/token_preprocessing.py's own TOKENS_PER_SIDE --
+# Matches 03_integration/scripts/token_preprocessing.py's own TOKENS_PER_SIDE --
 # each 224px patch is tiled 16x16 by TOKEN_SIZE_PX (224/14=16).
 TOKENS_PER_SIDE = 16
 PATCH_METADATA_TEMPLATE = "{}/01_preprocessing/unimodel/metadata/filtered_WSI_patch_embeddings.h5ad"
@@ -510,7 +510,7 @@ def compute_token_positional_bias(token_h5ad_path: Path, chunk_size: int = 50_00
     unit's (cell's or bin's) footprint/halo vector. Streamed in chunks so the
     full (n_tokens x token_dim) array is never held in memory at once.
 
-    Shared by 03_integration/autoencoders/scripts/token_preprocessing.py for
+    Shared by 03_integration/scripts/token_preprocessing.py for
     both --unit nuclei (feeds compute_cell_token_features) and --unit bins
     (feeds aggregate_tokens_to_grid_footprint_halo below).
     """
@@ -562,7 +562,7 @@ def aggregate_tokens_to_grid_footprint_halo(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Footprint+halo analogue of aggregate_tokens_to_grid, mirroring
-    03_integration/autoencoders/scripts/token_preprocessing.py's per-cell exact
+    03_integration/scripts/token_preprocessing.py's per-cell exact
     area-weighted overlap (compute_cell_token_features) rather than the
     coarser circular-radius approximation aggregate_tokens_to_grid itself
     uses. A bin's footprint IS a known axis-aligned square (2*half_side_px per
