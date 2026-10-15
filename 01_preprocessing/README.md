@@ -13,18 +13,27 @@ Both modalities are linked by a `Patch_ID`: every nucleus / bin is assigned to t
 ## What is done and why
 
 **Histology**
-1. **Patch creation.** The WSI is too large to process directly. It is cropped to the Visium frame (bounds of `tissue_positions.parquet`) and cut into non-overlapping 224×224 px patches. Patch positions are stored to link them to the transcriptomics.
-2. **Embeddings.** The pretrained UNI2-h model gives one patch embedding (1536-d) and 16×16 token embeddings (14×14 px each) per patch. Tokens provide finer spatial resolution than patches.
-3. **Background removal.** Patches are clustered (PCA, UMAP, Leiden). Clusters without tissue are removed by hand, and the tokens of the remaining patches are kept.
+1. **Patch creation.** We use the WSI as the histological input foundation. 
+It is cropped to the Visium frame of recorded transcriptomics (bounds of `tissue_positions.parquet`) and cut into non-overlapping 224×224 px patches. 
+Patch positions are stored to link them to the transcriptomics.
+2. **Embeddings.** The pretrained UNI2-h model gives one patch embedding (1536-d) and 16×16 token embeddings (14×14 px each) per patch. 
+Tokens provide finer spatial resolution than patches.
+3. **Background removal.** Patches are clustered (PCA, UMAP, Leiden). 
+Clusters without tissue are removed by hand, and the tokens of the remaining patches are kept.
+This reduces overhead, even though regions where no transcriptomics are found are also excluded later on.
 
 **Transcriptomics** (two alternative units, both are produced)
-- **Cells:** nuclei are segmented on the H&E image (StarDist). 2 µm bins inside exactly one nucleus are summed per nucleus. QC removes large nuclei (area ≥ 1000 px²) and low counts (UMI ≤ 80).
-- **8 µm grid bins:** segmentation-free alternative. Native 8 µm bins are used, or aggregated 4×4 from the 2 µm bins. Bins without a patch are dropped, then UMI ≤ 80 is removed.
-- **Both:** normalize (target sum 1e4), log1p, 2000 HVGs, PCA, neighbors, Leiden (resolution 0.2). Spatially variable genes (SVG) are found with Moran's I (FDR < 0.05, I > 0.1). After merging all samples, HVG and SVG are recomputed globally (`var['gene_selection']`) for gene selection later.
+- **Cells:** nuclei are segmented on the H&E image using StarDist. 
+2 µm bins inside exactly one nucleus are summed per nucleus. 
+Quality Control (QC) removes large nuclei (area ≥ 1000 px²) and low counts (UMI ≤ 80).
+- **8 µm grid bins:** segmentation-free alternative. 
+Native 8 µm bins are used (if provided from the dataset, e.g. from the 10x Genomics sets), or aggregated 4×4 from the 2 µm bins. 
+Bins without a patch are dropped, then UMI ≤ 80 is removed.
+- **Both:** normalize (target sum 1e4), log1p, 2000 HVGs, PCA, neighbors, Leiden (resolution 0.2). 
+Spatially variable genes (SVG) are found with Moran's I (FDR < 0.05, I > 0.1). 
+After merging all samples, HVG and SVG are recomputed globally (`var['gene_selection']`) for gene selection later.
 
 ## Input data
-
-**Where from.** `download_10x_data.sh` (repo root) downloads five public 10x Genomics Visium HD human colon samples (`CRC_P1`, `CRC_P2`, `CRC_P5`, `Normal_P3`, `Normal_P5`) into `data/`. It does not extract `output/binned_outputs.tar.gz`, do that by hand. The other samples (`CRC_P6_5mm`, `CRC_P11mm`, `CRC_P11mm_2_cut`, `CRC_P3_SMAP`, `CRC_P4_SMAP`) are not covered by the script and must be placed manually in the same layout. `SMAP` samples have the H&E image as `HE.tif` and only the 2 µm output.
 
 **UNI2-h weights.** Download `pytorch_model.bin` from Hugging Face (`MahmoodLab/UNI2-h`, login token needed) to `histology/unimodel/weights/`.
 
@@ -42,9 +51,11 @@ data/
             ├── filtered_feature_bc_matrix.h5
             └── spatial/tissue_positions.parquet
 ```
-Sample folder names are used everywhere as `Slide_ID`. Folders other than samples (`combined`, `new`, `archived`) are skipped or excluded in the code.
+Sample folder names are used everywhere as `Slide_ID`. 
+Folders other than samples (e.g. `combined`, `new`, `archived`) are skipped or excluded in the code.
 
-**Environments** (`Environments/`): nuclei segmentation needs the StarDist/TensorFlow environment (`nuclei-seg` or `stardist`), everything else uses `autoencoder` (`autoencoders.yml`). UNI embeddings need a GPU in practice.
+**Environments** (`Environments/`): nuclei segmentation needs the StarDist/TensorFlow environment (`nuclei-seg` or `stardist`), everything else uses `autoencoder` (`autoencoders.yml`). 
+UNI embeddings need a GPU in practice.
 
 ## Outputs
 
