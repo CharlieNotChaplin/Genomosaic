@@ -10,7 +10,7 @@ The data has two modalities, each with its own subfolder:
 
 Both modalities are linked by a `Patch_ID`: every nucleus / bin is assigned to the histology patch it lies in.
 
-See [`Preprocessing.pdf`](Preprocessing.pdf) for an overview diagram of this pipeline.
+![Preprocessing pipeline overview](Preprocessing.png)
 
 ## What is done and why
 

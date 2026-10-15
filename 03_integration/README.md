@@ -15,7 +15,7 @@ the embeddings `04_eval` evaluates. Two kinds of run, same settings:
 | `config/training_config.json` | settings decided after the ablation studies; every script/notebook here reads it |
 | `output/` | embeddings of a new, unseen sample (`autoencoder.ipynb`, last section) |
 
-See [`Pipeline.pdf`](Pipeline.pdf) for an overview diagram of this pipeline.
+![Integration pipeline overview](Pipeline.png)
 
 ## What is done and why
 
