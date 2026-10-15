@@ -18,10 +18,10 @@ corresponding LOSO training fold lands on disk. Safe to re-run at any point;
 each run reflects whatever's finished at that moment.
 
 Usage:
-    python evaluate_clustering_quality.py
-    python evaluate_clustering_quality.py --units nuclei --variants svg colon_xenium_panel
-    python evaluate_clustering_quality.py --slides CRC_P1 CRC_P11mm --smoothing-modes hard
-    python evaluate_clustering_quality.py --smooth-reference
+    python scripts/evaluate_clustering_quality.py
+    python scripts/evaluate_clustering_quality.py --units nuclei --variants svg colon_xenium_panel
+    python scripts/evaluate_clustering_quality.py --slides CRC_P1 CRC_P11mm --smoothing-modes hard
+    python scripts/evaluate_clustering_quality.py --smooth-reference
 
 --smooth-reference additionally scores every (embedding, label_kind) against a
 spatially-smoothed copy of the label-transfer reference itself (majority-vote
@@ -45,7 +45,7 @@ import anndata as ad
 import geopandas as gpd
 import scanpy as sc
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
 from functions.dual_autoencoder import build_pairing, extract_cell_xy, build_spatial_graph, refine_domains
@@ -54,9 +54,9 @@ from functions import label_transfer as lt
 
 BASEDIR = REPO_ROOT / "data"
 
-# Mirrors submit_run_loso_final_nuclei.sbatch / submit_run_loso_final_bins.sbatch
-# EXACTLY, same as evaluate_final_loso.ipynb cell 3 -- if those scripts' VARIANT_FLAGS
-# ever change, update here too (deliberately not auto-derived from the sbatch files).
+# Mirrors submit_run_loso_final.sbatch (the shared nuclei/bins job script, launched via
+# submit_all_final_loso.sbatch) EXACTLY -- if that
+# script's VARIANT_FLAGS ever change, update here too (deliberately not auto-derived from it).
 SLIDES = ["CRC_P1", "CRC_P11mm", "CRC_P11mm_2_cut", "CRC_P2", "CRC_P3_SMAP",
           "CRC_P4_SMAP", "CRC_P5", "Normal_P3", "Normal_P5"]
 

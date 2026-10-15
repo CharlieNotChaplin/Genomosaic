@@ -48,10 +48,10 @@ Folds already in a file are skipped (--overwrite to redo), so a job that hits it
 
 Usage (from 04_eval/; CPU only. Roughly 1 ms per nucleus per embedding: ~1 min for a 50k slide, ~10-15 min for the
 785k-nucleus slide; the whole nuclei sweep (2 variants x 3 embeddings) is a few hours sequentially):
-    python -u evaluate_k_matched_ari.py --embeddings z_trans z_token z_joint --baselines
-    python -u evaluate_k_matched_ari.py --shard 0/5 ...   # ... --shard 4/5: five parallel processes (see submit_evaluate_kmatched_parallel.sbatch)
-    python -u evaluate_k_matched_ari.py --slides Normal_P3 --variants svg --embeddings z_trans
-    python -u evaluate_k_matched_ari.py --units bins --shard 0/5 ...   # bin level: about twice the units per slide
+    python -u scripts/evaluate_k_matched_ari.py --embeddings z_trans z_token z_joint --baselines
+    python -u scripts/evaluate_k_matched_ari.py --shard 0/5 ...   # ... --shard 4/5: five parallel processes (see scripts/submit_evaluate_kmatched_parallel.sbatch)
+    python -u scripts/evaluate_k_matched_ari.py --slides Normal_P3 --variants svg --embeddings z_trans
+    python -u scripts/evaluate_k_matched_ari.py --units bins --shard 0/5 ...   # bin level: about twice the units per slide
 """
 
 import argparse
