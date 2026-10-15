@@ -1,17 +1,25 @@
 #!/bin/bash
 # Driver for the final LOSO comparison. Run on the login node (it is not itself an sbatch script):
 #   bash submit_all_final_loso.sbatch
-# Submits the nucleus-level array, then the bin-level array with an afterok dependency on it, so the two never compete for GPUs.
+# Submits the nucleus-level array, then the bin-level array with an afterok dependency on it, so the two never compete
+# for GPUs. Both arrays run the same submit_run_loso_final.sbatch -- nuclei and bins only differ in --mem/--time
+# (bins needs much more of both) and are told apart via --export=UNIT=..., passed at submission time below.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 
 echo "Submitting nuclei final LOSO (svg + colon_xenium panel + svg/semantic-excl, 27 tasks, max 3 concurrent)..."
-NUCLEI_JOBID=$(sbatch --parsable submit_run_loso_final_nuclei.sbatch)
+NUCLEI_JOBID=$(sbatch --parsable --job-name=loso_final_nuclei \
+    --output=logs/loso_final_nuclei_%a.out --error=logs/loso_final_nuclei_%a.err \
+    --mem=64G --time=02:00:00 --export=ALL,UNIT=nuclei \
+    submit_run_loso_final.sbatch)
 echo "  -> job $NUCLEI_JOBID"
 
 echo "Submitting bins final LOSO (svg + colon_xenium panel + svg/semantic-excl, 27 tasks, max 3 concurrent)," \
      "held until job $NUCLEI_JOBID completes successfully..."
-BINS_JOBID=$(sbatch --parsable --dependency=afterok:"$NUCLEI_JOBID" submit_run_loso_final_bins.sbatch)
+BINS_JOBID=$(sbatch --parsable --dependency=afterok:"$NUCLEI_JOBID" --job-name=loso_final_bins \
+    --output=logs/loso_final_bins_%a.out --error=logs/loso_final_bins_%a.err \
+    --mem=128G --time=24:00:00 --export=ALL,UNIT=bins \
+    submit_run_loso_final.sbatch)
 echo "  -> job $BINS_JOBID (queued, dependency-held)"
 
 echo
@@ -19,6 +27,7 @@ echo "Done. Track both with: squeue -u \$USER"
 echo "If ANY nuclei task fails, the bins job's dependency is never satisfied and it"
 echo "sits in squeue forever (reason: DependencyNeverSatisfied) rather than starting"
 echo "or auto-cancelling. If that happens: fix + resubmit the failed nuclei task(s)"
-echo "(sbatch --array=N submit_run_loso_final_nuclei.sbatch), then either release the"
+echo "(sbatch --array=N --job-name=loso_final_nuclei --export=ALL,UNIT=nuclei submit_run_loso_final.sbatch)," \
+     "then either release the"
 echo "held bins job (scontrol release $BINS_JOBID) once you're satisfied, or cancel"
 echo "it (scancel $BINS_JOBID) and resubmit manually."

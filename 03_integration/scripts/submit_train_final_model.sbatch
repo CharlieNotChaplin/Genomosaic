@@ -1,38 +1,30 @@
 #!/bin/bash
-#SBATCH --job-name=loso_final_bins
-#SBATCH --output=logs/loso_final_bins_%a.out
-#SBATCH --error=logs/loso_final_bins_%a.err
+#SBATCH --job-name=train_final_model
+#SBATCH --output=logs/train_final_model_%j.out
+#SBATCH --error=logs/train_final_model_%j.err
 #SBATCH --partition=gpu_node
 #SBATCH --gres=gpu:1
 #SBATCH -c 20
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
-#SBATCH --array=0-26%3
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=charlotte.wolf1@rwth-aachen.de
 
-# Final leave-one-slide-out runs at bin level: 9 held-out slides x 3 variants (27 tasks, at most 3 concurrent).
-#   tasks 0-8    SVG genes
-#   tasks 9-17   10x Xenium colon gene panel
-#   tasks 18-26  SVG genes with raw-source semantic exclusion (threshold 0.2, taken over from nuclei and not calibrated for bins)
-# The unit-specific settings come from --unit bins, all others from config/training_config.json.
-# Folds take 8-9 h, hence --time=24:00:00. Run after submit_run_loso_final_nuclei.sbatch (see submit_all_final_loso.sbatch).
+# Trains the deployable final model (all slides, no held-out fold) and writes it to
+# data/combined/03_integration/autoencoders/<bin_size>/weights/. See train_final_model.py's
+# own docstring for what "the settings we decided on" means and what gets written.
+#
+# Resources match submit_run_loso_final.sbatch's bins profile (128G/24h): the full-cohort
+# training pool here is at least as large as any single LOSO fold's (every slide, not
+# all-but-one), so this is the safer default for either unit -- override at submission time
+# if nuclei turns out to need less, the same way submit_all_final_loso.sbatch does for LOSO:
+#   sbatch --mem=64G --time=02:00:00 --export=ALL,UNIT=nuclei submit_train_final_model.sbatch
+#
+# UNIT (env, set via --export at submission): nuclei (default) or bins.
+#   sbatch --export=ALL,UNIT=nuclei submit_train_final_model.sbatch
+#   sbatch --export=ALL,UNIT=bins   submit_train_final_model.sbatch
 
-SLIDES=(CRC_P1 CRC_P11mm CRC_P11mm_2_cut CRC_P2 CRC_P3_SMAP CRC_P4_SMAP CRC_P5 Normal_P3 Normal_P5)
-N_SLIDES=${#SLIDES[@]}
-HELD_OUT_SLIDE="${SLIDES[$((SLURM_ARRAY_TASK_ID % N_SLIDES))]}"
-VARIANT_IDX=$((SLURM_ARRAY_TASK_ID / N_SLIDES))
-
-if [ "$VARIANT_IDX" -eq 0 ]; then
-    VARIANT_FLAGS=""
-    VARIANT_LABEL="svg"
-elif [ "$VARIANT_IDX" -eq 1 ]; then
-    VARIANT_FLAGS="--gene-panel colon_xenium"
-    VARIANT_LABEL="colon_xenium_panel"
-else
-    VARIANT_FLAGS="--local-anchor-sim-threshold 0.2 --local-anchor-sim-source raw --local-positive-mode exclude"
-    VARIANT_LABEL="svg_semantic_excl_raw_0.2"
-fi
+UNIT="${UNIT:-nuclei}"
 
 source /beegfs/home/cwolf/miniconda3/etc/profile.d/conda.sh
 conda activate autoencoder
@@ -56,12 +48,11 @@ mkdir -p logs
 echo "=================================================="
 echo "Job started at: $(date)"
 echo "Running on node: $(hostname)"
-echo "Array task: $SLURM_ARRAY_TASK_ID -> variant: $VARIANT_LABEL, held-out slide: $HELD_OUT_SLIDE"
-echo "Variant flags: $VARIANT_FLAGS"
+echo "Unit: $UNIT"
 echo "CUDA Available Devices: $CUDA_VISIBLE_DEVICES"
 echo "=================================================="
 
-python run_loso.py --held_out_slide "$HELD_OUT_SLIDE" --unit bins $VARIANT_FLAGS
+python -u train_final_model.py --unit "$UNIT"
 status=$?
 
 echo "=================================================="
