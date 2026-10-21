@@ -18,10 +18,21 @@ Four stages, run in order, each with its own README:
 
 ## Data
 
-Not part of this repository (`data/` is gitignored). One folder per sample under `data/<sample>/`
-(raw input, then each stage's own output subfolder); `data/combined/` holds the cohort-merged files
-every later stage actually reads. The exact raw layout each sample needs, and where to get the public
+Not part of this repository. One folder per sample under `data/<sample>/`
+(raw input, then each stage's own output subfolder); `data/combined/` holds the cohort-merged files every later stage actually reads. 
+The exact raw layout each sample needs, and where to get the public
 Visium HD data, is in [01_preprocessing/README.md](01_preprocessing/README.md#input-data).
+
+The data is sourced from public repositories, nameley:
+- 10x Genomics
+   - https://www.10xgenomics.com/datasets?sort=publishedAt+DESC
+   - https://www.10xgenomics.com/platforms/visium/product-family/dataset-human-crc
+- SPATCH
+   - https://spatch.pku-genomics.org/#/dataset/visium
+   - https://spatch.pku-genomics.org/#/dataset/visiumff
+
+The ground truth can be found on Zenodo:
+- https://zenodo.org/records/11402686?utm_source=chatgpt.com
 
 ## How to proceed
 
